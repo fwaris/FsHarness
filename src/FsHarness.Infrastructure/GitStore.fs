@@ -187,8 +187,6 @@ module GitStore =
         }
 
     let private repoPath store runId = DataPaths.repository store.Root runId
-    let private worktreeRoot store runId = DataPaths.worktrees store.Root runId
-
     let private runRef runId suffix =
         $"refs/fsharness/runs/{RunId.text runId}/{suffix}"
 
@@ -308,7 +306,7 @@ module GitStore =
             let repository = repoPath store runId
 
             let generation =
-                Path.Combine(worktreeRoot store runId, ExperimentId.text experimentId, "generation")
+                Path.Combine(DataPaths.experiment store.Root runId experimentId, "generation")
 
             Directory.CreateDirectory(Path.GetDirectoryName generation) |> ignore
 
@@ -427,7 +425,7 @@ module GitStore =
                 let editable, initiallyProtected = PathPolicy.partition editableGlobs changed
 
                 let experimentRoot =
-                    Path.Combine(worktreeRoot store runId, ExperimentId.text workspace.ExperimentId)
+                    DataPaths.experiment store.Root runId workspace.ExperimentId
 
                 let assembly = Path.Combine(experimentRoot, "assembly")
                 let evaluation = Path.Combine(experimentRoot, "evaluation")
