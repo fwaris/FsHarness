@@ -33,6 +33,15 @@ module AdapterFixture =
         let root = findRepositoryRoot (DirectoryInfo AppContext.BaseDirectory)
         Path.Combine(root, "tests", project, "bin", configuration, "net10.0", executableName name)
 
+module SanitizedEnvironmentTests =
+    [<Fact>]
+    let ``Windows dotnet profile paths survive evaluator sanitization`` () =
+        let environment = SanitizedEnvironment.core ()
+
+        if OperatingSystem.IsWindows() then
+            Assert.Equal(Environment.GetEnvironmentVariable("APPDATA"), environment["APPDATA"])
+            Assert.Equal(Environment.GetEnvironmentVariable("LOCALAPPDATA"), environment["LOCALAPPDATA"])
+
 module AdapterIntegrationTests =
     [<Fact>]
     let ``Codex discovery falls back to the newest VS Code extension`` () =

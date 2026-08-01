@@ -27,10 +27,14 @@ module SanitizedEnvironment =
     let core () =
         [ "PATH"
           "HOME"
+          "APPDATA"
+          "LOCALAPPDATA"
           "TMPDIR"
           "TEMP"
           "TMP"
           "DOTNET_ROOT"
+          "DOTNET_CLI_HOME"
+          "NUGET_PACKAGES"
           "USERPROFILE"
           "SystemRoot" ]
         |> List.choose (fun name ->
