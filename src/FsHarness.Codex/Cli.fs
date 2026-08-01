@@ -355,6 +355,13 @@ module Cli =
         }
 
     let private codexArguments (request: CodexRequest) =
+        let writePolicy =
+            match Environment.GetEnvironmentVariable "FSHARNESS_CODEX_WRITE_POLICY" with
+            | value when String.Equals(value, "unrestricted", StringComparison.OrdinalIgnoreCase) ->
+                [ "--dangerously-bypass-approvals-and-sandbox" ]
+            | _ ->
+                [ "--sandbox"; "workspace-write" ]
+
         [ "exec"
           "--json"
           "--color"
@@ -364,8 +371,7 @@ module Cli =
           "--strict-config"
           "--model"
           request.Model.Id
-          "--sandbox"
-          "workspace-write"
+          yield! writePolicy
           "-C"
           request.WorkingDirectory
           "--output-schema"
