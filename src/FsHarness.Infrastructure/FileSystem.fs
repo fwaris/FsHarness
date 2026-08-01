@@ -14,7 +14,8 @@ module DataPaths =
 
     let private runKey runId = RunId.text runId |> compactIdentifier
 
-    let private experimentKey experimentId = ExperimentId.text experimentId |> compactIdentifier
+    let private experimentKey experimentId =
+        ExperimentId.text experimentId |> compactIdentifier
 
     let root () =
         match Environment.GetEnvironmentVariable "FSHARNESS_DATA_DIR" with
@@ -22,7 +23,13 @@ module DataPaths =
         | _ -> Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FsHarness")
 
     let runRoot root runId =
-        Path.Combine(root, "runs", runKey runId)
+        let compact = Path.Combine(root, "runs", runKey runId)
+        let legacy = Path.Combine(root, "runs", RunId.text runId)
+
+        if Directory.Exists compact || not (Directory.Exists legacy) then
+            compact
+        else
+            legacy
 
     let repository root runId =
         Path.Combine(runRoot root runId, "repo.git")
@@ -34,7 +41,13 @@ module DataPaths =
         Path.Combine(runRoot root runId, "artifacts")
 
     let experiment root runId experimentId =
-        Path.Combine(worktrees root runId, experimentKey experimentId)
+        let compact = Path.Combine(worktrees root runId, experimentKey experimentId)
+        let legacy = Path.Combine(worktrees root runId, ExperimentId.text experimentId)
+
+        if Directory.Exists compact || not (Directory.Exists legacy) then
+            compact
+        else
+            legacy
 
     let projectLock root sourcePath =
         let canonical = Path.GetFullPath(sourcePath)
