@@ -165,10 +165,16 @@ module AdapterIntegrationTests =
                   Arguments = []
                   WorkingDirectory = "."
                   Timeout = TimeSpan.FromSeconds 10.0
-                  RequiredConstraints = [ "build"; "tests" ] }
+                  RequiredConstraints = [ "build"; "tests" ]
+                  MaxInconclusiveRetries = 2 }
 
             let result =
-                Evaluator.run spec workspace (Path.Combine(root, "artifacts", "evaluation.json")) CancellationToken.None
+                Evaluator.run
+                    spec
+                    workspace
+                    workspace
+                    (Path.Combine(root, "artifacts", "evaluation.json"))
+                    CancellationToken.None
                 |> Async.RunSynchronously
 
             match result with

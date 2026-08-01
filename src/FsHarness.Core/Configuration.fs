@@ -8,13 +8,19 @@ type EvaluatorSpec =
       Arguments: string list
       WorkingDirectory: string
       Timeout: TimeSpan
-      RequiredConstraints: string list }
+      RequiredConstraints: string list
+      MaxInconclusiveRetries: int }
+
+type MetricComparison =
+    | RetainedScore
+    | EvaluationMetric of string
 
 type MetricSpec =
     { Name: string
       Direction: MetricDirection
       MinDelta: decimal
-      Target: decimal option }
+      Target: decimal option
+      Comparison: MetricComparison }
 
 type ModelSpec = { Id: string; Effort: ReasoningEffort }
 
@@ -32,6 +38,7 @@ type HarnessConfig =
       BaseCommit: CommitOid
       Objective: string
       EditablePaths: string list
+      SeedPatches: string list
       Evaluator: EvaluatorSpec
       Metric: MetricSpec
       Model: ModelSpec
@@ -54,7 +61,7 @@ module Defaults =
 
 [<RequireQualifiedAccess>]
 module HarnessConfig =
-    let currentSchemaVersion = 1
+    let currentSchemaVersion = 2
 
     let private validateEditablePath (path: string) =
         let normalized = path.Replace('\\', '/')
@@ -75,10 +82,24 @@ module HarnessConfig =
         else
             Ok normalized
 
+    let private validateSeedPatch (path: string) =
+        let normalized = path.Replace('\\', '/')
+
+        if String.IsNullOrWhiteSpace normalized then
+            Error "Seed patch paths cannot be empty."
+        elif Path.IsPathRooted normalized || normalized.Split('/') |> Array.contains ".." then
+            Error $"Seed patch '{path}' must be a repository-relative path."
+        elif not (normalized.StartsWith(".fsharness/seeds/", StringComparison.Ordinal)) then
+            Error $"Seed patch '{path}' must be stored below .fsharness/seeds/."
+        elif not (normalized.EndsWith(".patch", StringComparison.OrdinalIgnoreCase)) then
+            Error $"Seed patch '{path}' must use the .patch extension."
+        else
+            Ok normalized
+
     let validate config =
         let errors = ResizeArray<string>()
 
-        if config.SchemaVersion <> currentSchemaVersion then
+        if config.SchemaVersion < 1 || config.SchemaVersion > currentSchemaVersion then
             errors.Add $"Unsupported configuration schema {config.SchemaVersion}."
 
         if String.IsNullOrWhiteSpace config.SourcePath then
@@ -96,6 +117,12 @@ module HarnessConfig =
             | Ok _ -> ()
             | Error error -> errors.Add error)
 
+        config.SeedPatches
+        |> List.iter (fun path ->
+            match validateSeedPatch path with
+            | Ok _ -> ()
+            | Error error -> errors.Add error)
+
         if String.IsNullOrWhiteSpace config.Evaluator.Executable then
             errors.Add "An evaluator executable is required."
 
@@ -105,8 +132,16 @@ module HarnessConfig =
         if config.Evaluator.Timeout <= TimeSpan.Zero then
             errors.Add "The evaluator timeout must be positive."
 
+        if config.Evaluator.MaxInconclusiveRetries < 0 then
+            errors.Add "Evaluator inconclusive retries cannot be negative."
+
         if String.IsNullOrWhiteSpace config.Metric.Name then
             errors.Add "A primary metric name is required."
+
+        match config.Metric.Comparison with
+        | EvaluationMetric name when String.IsNullOrWhiteSpace name ->
+            errors.Add "The evaluator-provided comparison metric cannot be empty."
+        | _ -> ()
 
         if config.Metric.MinDelta < 0M then
             errors.Add "Metric minDelta cannot be negative."

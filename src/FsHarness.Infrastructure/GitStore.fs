@@ -431,6 +431,7 @@ module GitStore =
 
                 let assembly = Path.Combine(experimentRoot, "assembly")
                 let evaluation = Path.Combine(experimentRoot, "evaluation")
+                let frontierEvaluation = Path.Combine(experimentRoot, "frontier-evaluation")
 
                 let! assemblyResult =
                     requireSuccess
@@ -584,6 +585,25 @@ module GitStore =
                                             Map.empty
                                             cancellationToken
 
+                                    let! frontierEvaluationResult =
+                                        match evaluationResult with
+                                        | Error error -> async { return Error error }
+                                        | Ok _ ->
+                                            requireSuccess
+                                                store
+                                                "prepare_frontier_evaluation"
+                                                None
+                                                [ "--git-dir"
+                                                  repository
+                                                  "worktree"
+                                                  "add"
+                                                  "--detach"
+                                                  frontierEvaluation
+                                                  parentText ]
+                                                None
+                                                Map.empty
+                                                cancellationToken
+
                                     let! _ =
                                         execute
                                             store
@@ -594,12 +614,13 @@ module GitStore =
                                             cancellationToken
 
                                     return
-                                        evaluationResult
+                                        frontierEvaluationResult
                                         |> Result.map (fun _ ->
                                             { Commit = CommitOid.create candidateText
                                               ChangedPaths = changed
                                               ProtectedPaths = protectedPaths |> List.distinct
-                                              EvaluationPath = evaluation })
+                                              EvaluationPath = evaluation
+                                              FrontierEvaluationPath = frontierEvaluation })
             | Error error, _
             | _, Error error -> return Error error
         }
@@ -622,6 +643,47 @@ module GitStore =
                     cancellationToken
 
             return result |> Result.map ignore
+        }
+
+    let applySeedPatch store (workspace: CandidateWorkspace) (patchPath: string) cancellationToken =
+        async {
+            let normalized = patchPath.Replace('\\', '/')
+
+            let fullPatchPath =
+                Path.GetFullPath(Path.Combine(workspace.GenerationPath, normalized))
+
+            let seedRoot =
+                Path.GetFullPath(Path.Combine(workspace.GenerationPath, ".fsharness", "seeds"))
+
+            if
+                not (
+                    fullPatchPath.StartsWith(
+                        seedRoot + string Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase
+                    )
+                )
+                || not (File.Exists fullPatchPath)
+            then
+                return
+                    Error(
+                        HarnessError.create
+                            "git.seed_patch_missing"
+                            HarnessErrorCategory.Git
+                            "Protected seed patch was not found below .fsharness/seeds/."
+                        |> HarnessError.withDetail normalized
+                    )
+            else
+                let! result =
+                    requireSuccess
+                        store
+                        "apply_seed"
+                        (Some workspace.GenerationPath)
+                        [ "apply"; "--whitespace=nowarn"; "--"; normalized ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                return result |> Result.map ignore
         }
 
     let exportPatch store runId candidate destination cancellationToken =
@@ -663,6 +725,7 @@ module GitStore =
         { InspectSource = inspectSource store
           CreateRun = createRun store
           PrepareCandidate = prepareCandidate store
+          ApplySeedPatch = applySeedPatch store
           CaptureCandidate = captureCandidate store
           AdvanceFrontier = advanceFrontier store
           ExportPatch = exportPatch store }

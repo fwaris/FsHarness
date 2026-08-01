@@ -10,13 +10,15 @@ module private Fixtures =
           Arguments = []
           WorkingDirectory = "."
           Timeout = TimeSpan.FromSeconds 5.0
-          RequiredConstraints = [ "build"; "tests" ] }
+          RequiredConstraints = [ "build"; "tests" ]
+          MaxInconclusiveRetries = 2 }
 
     let metric =
         { Name = "primary"
           Direction = Maximize
           MinDelta = 0.5M
-          Target = None }
+          Target = None
+          Comparison = RetainedScore }
 
     let config =
         { SchemaVersion = HarnessConfig.currentSchemaVersion
@@ -24,6 +26,7 @@ module private Fixtures =
           BaseCommit = CommitOid.create (String('a', 40))
           Objective = "Improve the fixture."
           EditablePaths = [ "src/**" ]
+          SeedPatches = []
           Evaluator = evaluator
           Metric = metric
           Model = Defaults.model
@@ -66,6 +69,7 @@ module TokenUsageTests =
 module EvaluationTests =
     let private result score constraints =
         { SchemaVersion = 1
+          Status = EvaluationStatus.Complete
           Constraints = constraints
           Metrics = Map [ "primary", score ]
           Summary = "fixture"
@@ -103,6 +107,25 @@ module EvaluationTests =
                 (result 99M (Map [ "build", true; "tests", false ]))
 
         Assert.Equal(Rejected(ConstraintFailed [ "tests" ]), decision)
+
+    [<Fact>]
+    let ``paired metric compares candidate against evaluator frontier from same cycle`` () =
+        let pairedMetric =
+            { Fixtures.metric with
+                Name = "candidate_speed_index"
+                MinDelta = 2M
+                Comparison = EvaluationMetric "frontier_speed_index" }
+
+        let evaluation =
+            { SchemaVersion = 2
+              Status = EvaluationStatus.Complete
+              Constraints = Map [ "build", true; "tests", true ]
+              Metrics = Map [ "candidate_speed_index", 102.25M; "frontier_speed_index", 100M ]
+              Summary = "paired"
+              Evidence = [] }
+
+        let decision = Evaluation.decide pairedMetric [ "build"; "tests" ] 999M evaluation
+        Assert.Equal(StrictImprovement 102.25M, decision)
 
 module PromptTests =
     [<Fact>]
@@ -152,6 +175,7 @@ module StateMachineTests =
 
         let evaluation =
             { SchemaVersion = 1
+              Status = EvaluationStatus.Complete
               Constraints = Map [ "build", true; "tests", true ]
               Metrics = Map [ "primary", 11M ]
               Summary = "ok"

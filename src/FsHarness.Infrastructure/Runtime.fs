@@ -20,6 +20,24 @@ type RuntimeActivity =
       ExperimentId: ExperimentId option
       Message: string }
 
+type CampaignSummary =
+    { SchemaVersion: int
+      RunId: string
+      Status: string
+      InputTokens: int64
+      CachedInputTokens: int64
+      UncachedInputTokens: int64
+      OutputTokens: int64
+      ReasoningTokens: int64
+      RawTokens: int64
+      Attempts: int
+      AcceptedCandidates: int
+      EvaluatorRetries: int
+      DuplicateHypotheses: int
+      TokensToFirstQualifiedImprovement: int64 option
+      AcceptedPercentImprovement: decimal
+      TokensPerAcceptedOnePercentSpeedup: decimal option }
+
 type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     let root = Path.GetFullPath dataRoot
     let gitStore = GitStore.create root
@@ -37,6 +55,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     let mutable runCancellation: CancellationTokenSource option = None
     let mutable activeLock: IDisposable option = None
     let mutable worker: Task option = None
+    let mutable evaluatorRetryCount = 0
 
     let releaseRunLock () =
         activeLock |> Option.iter _.Dispose()
@@ -135,6 +154,148 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
               Metric = metricValue
               Summary = summary }
             cancellationToken
+
+    let runEvaluatorWithRetries (spec: EvaluatorSpec) frontierPath candidatePath resultPath cancellationToken =
+        let rec loop attempt =
+            async {
+                let! result = evaluator.Run spec frontierPath candidatePath resultPath cancellationToken
+
+                match result with
+                | Ok evaluation when
+                    evaluation.Status = EvaluationStatus.Inconclusive
+                    && attempt < spec.MaxInconclusiveRetries
+                    ->
+                    evaluatorRetryCount <- evaluatorRetryCount + 1
+
+                    publish
+                        $"Evaluator was inconclusive; retrying the same candidate ({attempt + 1}/{spec.MaxInconclusiveRetries})."
+                        None
+
+                    return! loop (attempt + 1)
+                | _ -> return result
+            }
+
+        loop 0
+
+    let evaluateSeedPatches runId (config: HarnessConfig) initialFrontier initialScore cancellationToken =
+        let rec loop index frontier score remaining =
+            async {
+                match remaining with
+                | [] -> return Ok(frontier, score)
+                | patchPath :: rest ->
+                    let experimentId = ExperimentId.create ()
+
+                    publish
+                        $"Evaluating protected seed candidate '{patchPath}' at zero Codex-token cost."
+                        (Some experimentId)
+
+                    match! git.PrepareCandidate runId experimentId frontier cancellationToken with
+                    | Error error -> return Error error
+                    | Ok workspace ->
+                        match! git.ApplySeedPatch workspace patchPath cancellationToken with
+                        | Error error -> return Error error
+                        | Ok() ->
+                            match! git.CaptureCandidate runId workspace config.EditablePaths cancellationToken with
+                            | Error error -> return Error error
+                            | Ok snapshot when not (List.isEmpty snapshot.ProtectedPaths) ->
+                                return
+                                    Error(
+                                        HarnessError.create
+                                            "git.seed_protected_path"
+                                            HarnessErrorCategory.Git
+                                            "A protected seed patch modified files outside the configured editable paths."
+                                        |> HarnessError.withDetail (String.concat ", " snapshot.ProtectedPaths)
+                                    )
+                            | Ok snapshot ->
+                                let resultPath =
+                                    Path.Combine(
+                                        DataPaths.artifacts root runId,
+                                        "seeds",
+                                        $"{index:D2}",
+                                        "evaluation.json"
+                                    )
+
+                                match!
+                                    runEvaluatorWithRetries
+                                        config.Evaluator
+                                        snapshot.FrontierEvaluationPath
+                                        snapshot.EvaluationPath
+                                        resultPath
+                                        cancellationToken
+                                with
+                                | Error error -> return Error error
+                                | Ok evaluation ->
+                                    do!
+                                        recordArtifact
+                                            runId
+                                            (Some experimentId)
+                                            "seed-evaluation"
+                                            resultPath
+                                            cancellationToken
+
+                                    match!
+                                        SqliteStore.saveEvaluation
+                                            sqlite
+                                            runId
+                                            experimentId
+                                            evaluation
+                                            cancellationToken
+                                    with
+                                    | Error error ->
+                                        publish $"Seed journal warning: {error.Summary}" (Some experimentId)
+                                    | Ok() -> ()
+
+                                    match evaluation.Status with
+                                    | EvaluationStatus.Inconclusive ->
+                                        do!
+                                            journalEvent
+                                                runId
+                                                (Some experimentId)
+                                                "SeedInconclusive"
+                                                patchPath
+                                                cancellationToken
+
+                                        return! loop (index + 1) frontier score rest
+                                    | EvaluationStatus.Complete ->
+                                        match
+                                            Evaluation.decide
+                                                config.Metric
+                                                config.Evaluator.RequiredConstraints
+                                                score
+                                                evaluation
+                                        with
+                                        | Rejected reason ->
+                                            do!
+                                                journalEvent
+                                                    runId
+                                                    (Some experimentId)
+                                                    "SeedRejected"
+                                                    (string reason)
+                                                    cancellationToken
+
+                                            return! loop (index + 1) frontier score rest
+                                        | StrictImprovement candidateScore ->
+                                            match!
+                                                git.AdvanceFrontier runId frontier snapshot.Commit cancellationToken
+                                            with
+                                            | Error error -> return Error error
+                                            | Ok() ->
+                                                do!
+                                                    journalEvent
+                                                        runId
+                                                        (Some experimentId)
+                                                        "SeedAccepted"
+                                                        (string candidateScore)
+                                                        cancellationToken
+
+                                                publish
+                                                    $"Accepted protected seed candidate at score {candidateScore}."
+                                                    (Some experimentId)
+
+                                                return! loop (index + 1) snapshot.Commit candidateScore rest
+            }
+
+        loop 0 initialFrontier initialScore config.SeedPatches
 
     let rec runLoop (cancellationToken: CancellationToken) =
         async {
@@ -350,8 +511,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                 let evaluatorPath = Path.Combine(artifactRoot, "evaluation.json")
 
                                 match!
-                                    evaluator.Run
+                                    runEvaluatorWithRetries
                                         startedState.Config.Evaluator
+                                        snapshot.FrontierEvaluationPath
                                         snapshot.EvaluationPath
                                         evaluatorPath
                                         CancellationToken.None
@@ -376,6 +538,24 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             result.Summary
                                             CancellationToken.None
                                         |> Async.Ignore
+                                | Ok evaluation when evaluation.Status = EvaluationStatus.Inconclusive ->
+                                    let reason =
+                                        if String.IsNullOrWhiteSpace evaluation.Summary then
+                                            "Evaluator remained inconclusive after bounded retries."
+                                        else
+                                            evaluation.Summary
+
+                                    dispatch (EvaluationInconclusive reason) |> ignore
+
+                                    do!
+                                        journalEvent
+                                            startedState.Id
+                                            (Some experimentId)
+                                            "EvaluationInconclusive"
+                                            reason
+                                            CancellationToken.None
+
+                                    publish reason (Some experimentId)
                                 | Ok evaluation ->
                                     do!
                                         recordArtifact
@@ -637,8 +817,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                 )
 
                                             match!
-                                                evaluator.Run
+                                                runEvaluatorWithRetries
                                                     validated.Evaluator
+                                                    baselineWorkspace.GenerationPath
                                                     baselineWorkspace.GenerationPath
                                                     baselineResultPath
                                                     cancellationToken
@@ -646,6 +827,16 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             | Error error ->
                                                 releaseRunLock ()
                                                 return Error error
+                                            | Ok baseline when baseline.Status = EvaluationStatus.Inconclusive ->
+                                                releaseRunLock ()
+
+                                                return
+                                                    Error(
+                                                        HarnessError.create
+                                                            "evaluator.baseline_inconclusive"
+                                                            HarnessErrorCategory.Evaluation
+                                                            "Baseline evaluation remained inconclusive after bounded retries."
+                                                    )
                                             | Ok baseline ->
                                                 do!
                                                     recordArtifact
@@ -697,45 +888,57 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                         )
                                                 | [], Some baselineScore ->
                                                     match!
-                                                        SqliteStore.updateRunStatus
-                                                            sqlite
-                                                            runId
-                                                            "Ready"
-                                                            cancellationToken
-                                                    with
-                                                    | Error error ->
-                                                        publish $"Run-status journal warning: {error.Summary}" None
-                                                    | Ok() -> ()
-
-                                                    let report =
-                                                        { RunId = runId
-                                                          Repository = repository
-                                                          Codex = codexReport
-                                                          Baseline = baseline
-                                                          BaselineScore = baselineScore
-                                                          DataDirectory = runRoot }
-
-                                                    prepared <- Some report
-
-                                                    setState (
-                                                        RunState.create
+                                                        evaluateSeedPatches
                                                             runId
                                                             validated
                                                             validated.BaseCommit
                                                             baselineScore
-                                                            DateTimeOffset.UtcNow
-                                                    )
-
-                                                    do!
-                                                        journalEvent
-                                                            runId
-                                                            None
-                                                            "RunPrepared"
-                                                            (string baselineScore)
                                                             cancellationToken
+                                                    with
+                                                    | Error error ->
+                                                        releaseRunLock ()
+                                                        return Error error
+                                                    | Ok(frontier, frontierScore) ->
+                                                        match!
+                                                            SqliteStore.updateRunStatus
+                                                                sqlite
+                                                                runId
+                                                                "Ready"
+                                                                cancellationToken
+                                                        with
+                                                        | Error error ->
+                                                            publish $"Run-status journal warning: {error.Summary}" None
+                                                        | Ok() -> ()
 
-                                                    publish "Preflight and baseline evaluation passed." None
-                                                    return Ok report
+                                                        let report =
+                                                            { RunId = runId
+                                                              Repository = repository
+                                                              Codex = codexReport
+                                                              Baseline = baseline
+                                                              BaselineScore = frontierScore
+                                                              DataDirectory = runRoot }
+
+                                                        prepared <- Some report
+
+                                                        setState (
+                                                            RunState.create
+                                                                runId
+                                                                validated
+                                                                frontier
+                                                                frontierScore
+                                                                DateTimeOffset.UtcNow
+                                                        )
+
+                                                        do!
+                                                            journalEvent
+                                                                runId
+                                                                None
+                                                                "RunPrepared"
+                                                                (string frontierScore)
+                                                                cancellationToken
+
+                                                        publish "Preflight, baseline, and protected seeds passed." None
+                                                        return Ok report
         }
 
     member _.Start() =
@@ -892,6 +1095,54 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         }
 
     member _.History(limit: int) = SqliteStore.loadEvents sqlite limit
+
+    member _.CampaignSummary() =
+        match prepared, tryCurrent () with
+        | Some report, Some current ->
+            match SqliteStore.countDuplicateHypotheses sqlite current.Id with
+            | Error error -> Error error
+            | Ok duplicates ->
+                let percentImprovement =
+                    match report.BaselineScore with
+                    | 0M -> 0M
+                    | value ->
+                        match current.Config.Metric.Direction with
+                        | Maximize -> (current.FrontierScore - value) / abs value * 100M
+                        | Minimize -> (value - current.FrontierScore) / abs value * 100M
+
+                let raw = TokenUsage.rawTotal current.Usage
+
+                let tokensPerPercent =
+                    if current.AcceptedCount > 0 && percentImprovement > 0M then
+                        Some(decimal raw / percentImprovement)
+                    else
+                        None
+
+                Ok
+                    { SchemaVersion = 1
+                      RunId = RunId.text current.Id
+                      Status = string current.Status
+                      InputTokens = current.Usage.InputTokens
+                      CachedInputTokens = current.Usage.CachedInputTokens
+                      UncachedInputTokens = max 0L (current.Usage.InputTokens - current.Usage.CachedInputTokens)
+                      OutputTokens = current.Usage.OutputTokens
+                      ReasoningTokens = current.Usage.ReasoningOutputTokens
+                      RawTokens = raw
+                      Attempts = current.Attempted
+                      AcceptedCandidates = current.AcceptedCount
+                      EvaluatorRetries = evaluatorRetryCount
+                      DuplicateHypotheses = duplicates
+                      TokensToFirstQualifiedImprovement =
+                        current.UsageAtFirstAcceptance |> Option.map TokenUsage.rawTotal
+                      AcceptedPercentImprovement = percentImprovement
+                      TokensPerAcceptedOnePercentSpeedup = tokensPerPercent }
+        | _ ->
+            Error(
+                HarnessError.create
+                    "runtime.summary_unavailable"
+                    HarnessErrorCategory.Configuration
+                    "No prepared campaign is available to summarize."
+            )
 
     interface IDisposable with
         member _.Dispose() =

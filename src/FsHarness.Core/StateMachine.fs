@@ -17,6 +17,7 @@ type ExperimentOutcome =
     | RejectedByUser
     | Failed of HarnessError
     | InvalidProtectedPath of string list
+    | InconclusiveEvaluation of string
     | Cancelled
     | Crashed of HarnessError
 
@@ -53,6 +54,7 @@ type RunState =
       ConsecutiveNonImprovements: int
       ConsecutiveFailures: int
       Usage: TokenUsage
+      UsageAtFirstAcceptance: TokenUsage option
       UsageKnown: bool
       PreviousEvaluation: EvaluationResult option
       StartedAt: DateTimeOffset }
@@ -64,6 +66,7 @@ type RunEvent =
     | CandidateCaptured of CommitOid
     | ProtectedPathDetected of string list
     | EvaluationCompleted of EvaluationResult
+    | EvaluationInconclusive of string
     | FrontierAdvanced
     | ReviewAccepted
     | ReviewRejected
@@ -98,6 +101,7 @@ module RunState =
           ConsecutiveNonImprovements = 0
           ConsecutiveFailures = 0
           Usage = TokenUsage.zero
+          UsageAtFirstAcceptance = None
           UsageKnown = true
           PreviousEvaluation = None
           StartedAt = startedAt }
@@ -131,6 +135,7 @@ module RunState =
                 { state with
                     FrontierScore = score
                     AcceptedCount = state.AcceptedCount + 1
+                    UsageAtFirstAcceptance = state.UsageAtFirstAcceptance |> Option.orElse (Some state.Usage)
                     ConsecutiveFailures = 0
                     ConsecutiveNonImprovements = 0
                     PreviousEvaluation = previousEvaluation
@@ -148,6 +153,11 @@ module RunState =
             | Crashed _ ->
                 { state with
                     ConsecutiveFailures = state.ConsecutiveFailures + 1
+                    PreviousEvaluation = previousEvaluation
+                    Current = None }
+            | InconclusiveEvaluation _ ->
+                { state with
+                    ConsecutiveFailures = 0
                     PreviousEvaluation = previousEvaluation
                     Current = None }
 
@@ -226,6 +236,11 @@ module RunState =
         | ProtectedPathDetected paths, _, Some active ->
             finishExperiment now (InvalidProtectedPath paths) state
             |> fun (next, effects) -> next, PersistRejected(active.Id, InvalidProtectedPath paths) :: effects
+        | EvaluationInconclusive reason, _, Some active when active.Phase = Evaluating ->
+            let next, _ = finishExperiment now (InconclusiveEvaluation reason) state
+
+            { next with Status = Paused reason },
+            [ PersistRejected(active.Id, InconclusiveEvaluation reason); PublishState ]
         | EvaluationCompleted evaluation, (Running | PauseAfterCurrent), Some active when active.Phase = Evaluating ->
             let evaluatedState =
                 { state with

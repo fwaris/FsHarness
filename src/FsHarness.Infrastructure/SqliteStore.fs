@@ -28,6 +28,7 @@ module SqliteStore =
         builder.DataSource <- store.DatabasePath
         builder.Mode <- SqliteOpenMode.ReadWriteCreate
         builder.Cache <- SqliteCacheMode.Shared
+        builder.Pooling <- false
         new SqliteConnection(builder.ToString())
 
     let private persistenceError code summary (exceptionValue: exn) =
@@ -149,17 +150,20 @@ module SqliteStore =
                baseCommit = CommitOid.value config.BaseCommit
                objective = config.Objective
                editablePaths = List.toArray config.EditablePaths
+               seedPatches = List.toArray config.SeedPatches
                evaluator =
                 {| executable = config.Evaluator.Executable
                    arguments = List.toArray config.Evaluator.Arguments
                    workingDirectory = config.Evaluator.WorkingDirectory
                    timeoutSeconds = config.Evaluator.Timeout.TotalSeconds
-                   requiredConstraints = List.toArray config.Evaluator.RequiredConstraints |}
+                   requiredConstraints = List.toArray config.Evaluator.RequiredConstraints
+                   maxInconclusiveRetries = config.Evaluator.MaxInconclusiveRetries |}
                metric =
                 {| name = config.Metric.Name
                    direction = string config.Metric.Direction
                    minDelta = config.Metric.MinDelta
-                   target = config.Metric.Target |> Option.map box |> Option.defaultValue null |}
+                   target = config.Metric.Target |> Option.map box |> Option.defaultValue null
+                   comparison = string config.Metric.Comparison |}
                model =
                 {| id = config.Model.Id
                    reasoningEffort = ReasoningEffort.toConfigValue config.Model.Effort |}
@@ -239,6 +243,10 @@ module SqliteStore =
                 let resultJson =
                     JsonSerializer.Serialize
                         {| schemaVersion = evaluation.SchemaVersion
+                           status =
+                            match evaluation.Status with
+                            | EvaluationStatus.Complete -> "complete"
+                            | EvaluationStatus.Inconclusive -> "inconclusive"
                            constraints = evaluation.Constraints |> Map.toArray |> dict
                            metrics = evaluation.Metrics |> Map.toArray |> dict
                            summary = evaluation.Summary
@@ -516,6 +524,25 @@ module SqliteStore =
             Ok(List.ofSeq events)
         with exceptionValue ->
             Error(persistenceError "sqlite.history_failed" "Could not load run history." exceptionValue)
+
+    let countDuplicateHypotheses store runId =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                "SELECT COUNT(*) - COUNT(DISTINCT lower(trim(hypothesis))) FROM memories WHERE run_id = $run;"
+
+            addParameter command "$run" (RunId.text runId)
+            Ok(command.ExecuteScalar() |> Convert.ToInt32)
+        with exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.duplicate_hypotheses_failed"
+                    "Could not count duplicate hypotheses."
+                    exceptionValue
+            )
 
     let journalPort store =
         { Initialize = initialize store

@@ -5,6 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="CoreTests.fs" />
+    <Compile Include="ConfigTests.fs" />
     <Compile Include="ProtocolTests.fs" />
     <Compile Include="StorageTests.fs" />
     <Compile Include="GitStoreTests.fs" />
@@ -25,6 +26,7 @@
     <ProjectReference Include="../../src/FsHarness.Core/FsHarness.Core.fsproj" />
     <ProjectReference Include="../../src/FsHarness.Codex/FsHarness.Codex.fsproj" />
     <ProjectReference Include="../../src/FsHarness.Infrastructure/FsHarness.Infrastructure.fsproj" />
+    <ProjectReference Include="../../src/FsHarness.Cli/FsHarness.Cli.fsproj" />
     <ProjectReference Include="../../src/FsHarness.App/FsHarness.App.fsproj" />
     <ProjectReference Include="../FsHarness.FakeCodex/FsHarness.FakeCodex.fsproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../FsHarness.FakeEvaluator/FsHarness.FakeEvaluator.fsproj" ReferenceOutputAssembly="false" />

@@ -178,11 +178,47 @@ module CliDiscovery =
                     { Executable = executableName
                       Source = CodexExecutableSource.ProcessLookup }
 
+    let preferUsable primary fallback canRun =
+        if canRun primary.Executable then primary
+        elif canRun fallback.Executable then fallback
+        else primary
+
+    let private canLaunchVersion executable =
+        try
+            let startInfo = ProcessStartInfo()
+            startInfo.FileName <- executable
+            startInfo.UseShellExecute <- false
+            startInfo.RedirectStandardOutput <- true
+            startInfo.RedirectStandardError <- true
+            startInfo.CreateNoWindow <- true
+            startInfo.ArgumentList.Add "--version"
+
+            use processValue = new Process(StartInfo = startInfo)
+
+            if not (processValue.Start()) then
+                false
+            elif processValue.WaitForExit(5_000) then
+                processValue.ExitCode = 0
+            else
+                try
+                    processValue.Kill(true)
+                with _ ->
+                    ()
+
+                false
+        with _ ->
+            false
+
     let resolve configuredPath =
-        resolveFrom
-            configuredPath
-            (Environment.GetEnvironmentVariable("PATH") |> Option.ofObj)
-            (Environment.GetFolderPath Environment.SpecialFolder.UserProfile)
+        let pathValue = Environment.GetEnvironmentVariable("PATH") |> Option.ofObj
+        let userProfile = Environment.GetFolderPath Environment.SpecialFolder.UserProfile
+        let primary = resolveFrom configuredPath pathValue userProfile
+
+        match configuredPath with
+        | Some _ -> primary
+        | None ->
+            let extensionFallback = resolveFrom None None userProfile
+            preferUsable primary extensionFallback canLaunchVersion
 
 [<RequireQualifiedAccess>]
 module Cli =

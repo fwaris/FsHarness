@@ -9,6 +9,18 @@ open FsHarness.Infrastructure
 open Xunit
 
 module RuntimeIntegrationTests =
+    let private deleteTree path =
+        if Directory.Exists path then
+            Directory.EnumerateFileSystemEntries(path, "*", SearchOption.AllDirectories)
+            |> Seq.iter (fun entry ->
+                try
+                    File.SetAttributes(entry, FileAttributes.Normal)
+                with _ ->
+                    ())
+
+            File.SetAttributes(path, FileAttributes.Normal)
+            Directory.Delete(path, true)
+
     let private getResult result =
         match result with
         | Ok value -> value
@@ -77,17 +89,20 @@ module RuntimeIntegrationTests =
                   BaseCommit = inspection.Head
                   Objective = "Increase the deterministic score."
                   EditablePaths = [ "src/**" ]
+                  SeedPatches = []
                   Evaluator =
                     { Executable = evaluator
                       Arguments = []
                       WorkingDirectory = "."
                       Timeout = TimeSpan.FromSeconds 10.0
-                      RequiredConstraints = [ "build"; "tests" ] }
+                      RequiredConstraints = [ "build"; "tests" ]
+                      MaxInconclusiveRetries = 2 }
                   Metric =
                     { Name = "primary"
                       Direction = Maximize
                       MinDelta = 0M
-                      Target = None }
+                      Target = None
+                      Comparison = RetainedScore }
                   Model = Defaults.model
                   Budgets =
                     { Defaults.budgets with
@@ -128,4 +143,4 @@ module RuntimeIntegrationTests =
             let accepted = history |> List.findIndex (fun event -> event.Kind = "Accepted")
             Assert.True(pending < accepted)
         finally
-            Directory.Delete(temporary, true)
+            deleteTree temporary

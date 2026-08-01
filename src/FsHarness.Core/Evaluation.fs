@@ -1,7 +1,13 @@
 namespace FsHarness.Core
 
+[<RequireQualifiedAccess>]
+type EvaluationStatus =
+    | Complete
+    | Inconclusive
+
 type EvaluationResult =
     { SchemaVersion: int
+      Status: EvaluationStatus
       Constraints: Map<string, bool>
       Metrics: Map<string, decimal>
       Summary: string
@@ -28,13 +34,22 @@ module Evaluation =
             requiredConstraints
             |> List.filter (fun name -> result.Constraints |> Map.tryFind name <> Some true)
 
+        let comparisonScore =
+            match metric.Comparison with
+            | RetainedScore -> Some frontier
+            | EvaluationMetric name -> result.Metrics |> Map.tryFind name
+
         match failedConstraints with
         | _ :: _ -> Rejected(ConstraintFailed failedConstraints)
         | [] ->
-            match result.Metrics |> Map.tryFind metric.Name with
-            | None -> Rejected(MetricMissing metric.Name)
-            | Some candidate when improves metric frontier candidate -> StrictImprovement candidate
-            | Some candidate -> Rejected(NotStrictlyBetter(frontier, candidate, metric.MinDelta))
+            match comparisonScore, result.Metrics |> Map.tryFind metric.Name with
+            | None, _ ->
+                match metric.Comparison with
+                | RetainedScore -> Rejected(MetricMissing metric.Name)
+                | EvaluationMetric name -> Rejected(MetricMissing name)
+            | Some _, None -> Rejected(MetricMissing metric.Name)
+            | Some comparison, Some candidate when improves metric comparison candidate -> StrictImprovement candidate
+            | Some comparison, Some candidate -> Rejected(NotStrictlyBetter(comparison, candidate, metric.MinDelta))
 
     let targetReached metric score =
         match metric.Target with

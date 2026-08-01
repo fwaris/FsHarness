@@ -49,7 +49,8 @@ type CandidateSnapshot =
     { Commit: CommitOid
       ChangedPaths: string list
       ProtectedPaths: string list
-      EvaluationPath: string }
+      EvaluationPath: string
+      FrontierEvaluationPath: string }
 
 type CodexPort =
     { Preflight: string -> CancellationToken -> Async<Result<CodexPreflight, HarnessError>>
@@ -60,6 +61,7 @@ type GitPort =
       CreateRun: RunId -> RepositoryInspection -> CancellationToken -> Async<Result<unit, HarnessError>>
       PrepareCandidate:
           RunId -> ExperimentId -> CommitOid -> CancellationToken -> Async<Result<CandidateWorkspace, HarnessError>>
+      ApplySeedPatch: CandidateWorkspace -> string -> CancellationToken -> Async<Result<unit, HarnessError>>
       CaptureCandidate:
           RunId
               -> CandidateWorkspace
@@ -70,7 +72,13 @@ type GitPort =
       ExportPatch: RunId -> CommitOid -> string -> CancellationToken -> Async<Result<string, HarnessError>> }
 
 type EvaluatorPort =
-    { Run: EvaluatorSpec -> string -> string -> CancellationToken -> Async<Result<EvaluationResult, HarnessError>> }
+    { Run:
+        EvaluatorSpec
+            -> string
+            -> string
+            -> string
+            -> CancellationToken
+            -> Async<Result<EvaluationResult, HarnessError>> }
 
 type JournalPort =
     { Initialize: CancellationToken -> Async<Result<unit, HarnessError>>
