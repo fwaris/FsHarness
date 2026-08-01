@@ -36,6 +36,7 @@ module SanitizedEnvironment =
           "DOTNET_CLI_HOME"
           "NUGET_PACKAGES"
           "USERPROFILE"
+          "SystemDrive"
           "SystemRoot" ]
         |> List.choose (fun name ->
             match Environment.GetEnvironmentVariable name with

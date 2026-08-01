@@ -41,6 +41,7 @@ module SanitizedEnvironmentTests =
         if OperatingSystem.IsWindows() then
             Assert.Equal(Environment.GetEnvironmentVariable("APPDATA"), environment["APPDATA"])
             Assert.Equal(Environment.GetEnvironmentVariable("LOCALAPPDATA"), environment["LOCALAPPDATA"])
+            Assert.Equal(Environment.GetEnvironmentVariable("SystemDrive"), environment["SystemDrive"])
 
 module AdapterIntegrationTests =
     [<Fact>]
