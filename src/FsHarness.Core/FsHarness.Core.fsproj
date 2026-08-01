@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Domain.fs" />
+    <Compile Include="Configuration.fs" />
+    <Compile Include="Benchmark.fs" />
+    <Compile Include="Evaluation.fs" />
+    <Compile Include="Prompt.fs" />
+    <Compile Include="StateMachine.fs" />
+    <Compile Include="Ports.fs" />
+  </ItemGroup>
+</Project>

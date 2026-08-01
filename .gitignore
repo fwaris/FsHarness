@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+.DS_Store
+.idea/
+.vscode/
+.fsharness-data/
+TestResults/
+
+
+.fake

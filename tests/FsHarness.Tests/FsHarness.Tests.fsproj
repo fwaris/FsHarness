@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="CoreTests.fs" />
+    <Compile Include="ProtocolTests.fs" />
+    <Compile Include="StorageTests.fs" />
+    <Compile Include="GitStoreTests.fs" />
+    <Compile Include="AdapterIntegrationTests.fs" />
+    <Compile Include="RuntimeIntegrationTests.fs" />
+    <Compile Include="UiTests.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Avalonia.Headless" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/FsHarness.Core/FsHarness.Core.fsproj" />
+    <ProjectReference Include="../../src/FsHarness.Codex/FsHarness.Codex.fsproj" />
+    <ProjectReference Include="../../src/FsHarness.Infrastructure/FsHarness.Infrastructure.fsproj" />
+    <ProjectReference Include="../../src/FsHarness.App/FsHarness.App.fsproj" />
+    <ProjectReference Include="../FsHarness.FakeCodex/FsHarness.FakeCodex.fsproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../FsHarness.FakeEvaluator/FsHarness.FakeEvaluator.fsproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+</Project>

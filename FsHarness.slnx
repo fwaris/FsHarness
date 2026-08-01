@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="src/FsHarness.Core/FsHarness.Core.fsproj" />
+  <Project Path="src/FsHarness.Codex/FsHarness.Codex.fsproj" />
+  <Project Path="src/FsHarness.Infrastructure/FsHarness.Infrastructure.fsproj" />
+  <Project Path="src/FsHarness.App/FsHarness.App.fsproj" />
+  <Project Path="tests/FsHarness.FakeCodex/FsHarness.FakeCodex.fsproj" />
+  <Project Path="tests/FsHarness.FakeEvaluator/FsHarness.FakeEvaluator.fsproj" />
+  <Project Path="tests/FsHarness.Tests/FsHarness.Tests.fsproj" />
+</Solution>

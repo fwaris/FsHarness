@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="FileSystem.fs" />
+    <Compile Include="ProcessRunner.fs" />
+    <Compile Include="GitStore.fs" />
+    <Compile Include="Evaluator.fs" />
+    <Compile Include="SqliteStore.fs" />
+    <Compile Include="Runtime.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../FsHarness.Core/FsHarness.Core.fsproj" />
+    <ProjectReference Include="../FsHarness.Codex/FsHarness.Codex.fsproj" />
+  </ItemGroup>
+</Project>
