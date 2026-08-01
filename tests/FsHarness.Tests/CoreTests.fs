@@ -150,6 +150,7 @@ module PromptTests =
                   Memories = memories }
 
         Assert.True(prompt.Length < 8_500, $"Prompt was unexpectedly large: {prompt.Length}")
+        Assert.Contains("Keep tool output bounded", prompt)
 
     [<Fact>]
     let ``compact profile limits memories and evaluator findings`` () =

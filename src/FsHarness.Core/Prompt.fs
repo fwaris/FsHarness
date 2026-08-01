@@ -91,6 +91,11 @@ module Prompt =
         builder.AppendLine("Do not broaden scope, modify protected files, use network access, or spawn other agents.")
         |> ignore
 
+        builder.AppendLine(
+            "Keep tool output bounded: inspect focused snippets, use rg -m or Select-Object -First, and avoid dumping generated logs, JSON, bin, or obj trees. Stop exploring once one evidence-backed change is validated."
+        )
+        |> ignore
+
         builder.AppendLine() |> ignore
         builder.AppendLine("Objective:") |> ignore
         builder.AppendLine(context.Objective) |> ignore
