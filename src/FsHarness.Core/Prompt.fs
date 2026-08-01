@@ -8,17 +8,12 @@ type PromptContext =
       EditablePaths: string list
       FrontierScore: decimal
       Metric: MetricSpec
+      Profile: PromptProfile
       PreviousEvaluation: EvaluationResult option
       Memories: MemorySummary list }
 
 [<RequireQualifiedAccess>]
 module Prompt =
-    [<Literal>]
-    let MaxMemoryCount = 5
-
-    [<Literal>]
-    let MaxMemoryCharacters = 6_000
-
     let private truncate length (text: string) =
         if String.IsNullOrEmpty text || text.Length <= length then
             text
@@ -30,7 +25,7 @@ module Prompt =
 
         $"Outcome: {memory.Outcome}; metric: {metric}\nHypothesis: {memory.Summary.Hypothesis}\nChange: {memory.Summary.ChangeSummary}\nLesson: {memory.Summary.ReusableLesson}"
 
-    let private renderEvaluation (evaluation: EvaluationResult) =
+    let private renderEvaluation profile (evaluation: EvaluationResult) =
         let constraints =
             evaluation.Constraints
             |> Map.toList
@@ -44,11 +39,29 @@ module Prompt =
             |> String.concat ", "
 
         let evidence = String.concat "; " evaluation.Evidence
-        $"Constraints: {constraints}\nMetrics: {metrics}\nSummary: {evaluation.Summary}\nEvidence: {evidence}"
 
-    let private boundedMemories (memories: MemorySummary list) =
-        let selected = memories |> List.truncate MaxMemoryCount
-        let mutable remaining = MaxMemoryCharacters
+        if profile.MaxEvaluationFindings = Int32.MaxValue then
+            $"Constraints: {constraints}\nMetrics: {metrics}\nSummary: {evaluation.Summary}\nEvidence: {evidence}"
+        else
+            let findings =
+                [ yield!
+                      evaluation.Constraints
+                      |> Map.toList
+                      |> List.sortBy (fun (_, passed) -> passed)
+                      |> List.map (fun (name, passed) -> $"constraint {name}={passed}")
+
+                  yield!
+                      evaluation.Metrics
+                      |> Map.toList
+                      |> List.map (fun (name, value) -> $"metric {name}={value}") ]
+                |> List.truncate profile.MaxEvaluationFindings
+                |> String.concat "; "
+
+            $"Findings: {findings}\nSummary: {evaluation.Summary}\nEvidence: {evidence}"
+
+    let private boundedMemories profile (memories: MemorySummary list) =
+        let selected = memories |> List.truncate profile.MaxMemoryCount
+        let mutable remaining = profile.MaxMemoryCharacters
 
         selected
         |> List.choose (fun memory ->
@@ -95,9 +108,15 @@ module Prompt =
         |> Option.iter (fun evaluation ->
             builder.AppendLine() |> ignore
             builder.AppendLine("Most recent evaluator feedback:") |> ignore
-            builder.AppendLine(evaluation |> renderEvaluation |> truncate 2_000) |> ignore)
 
-        let memories = boundedMemories context.Memories
+            builder.AppendLine(
+                evaluation
+                |> renderEvaluation context.Profile
+                |> truncate context.Profile.MaxEvaluationCharacters
+            )
+            |> ignore)
+
+        let memories = boundedMemories context.Profile context.Memories
 
         if not (List.isEmpty memories) then
             builder.AppendLine() |> ignore

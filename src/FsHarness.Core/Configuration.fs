@@ -24,6 +24,12 @@ type MetricSpec =
 
 type ModelSpec = { Id: string; Effort: ReasoningEffort }
 
+type PromptProfile =
+    { MaxMemoryCount: int
+      MaxMemoryCharacters: int
+      MaxEvaluationFindings: int
+      MaxEvaluationCharacters: int }
+
 type RunBudgets =
     { MaxExperiments: int
       MaxRawTokens: int64
@@ -42,11 +48,18 @@ type HarnessConfig =
       Evaluator: EvaluatorSpec
       Metric: MetricSpec
       Model: ModelSpec
+      PromptProfile: PromptProfile
       Budgets: RunBudgets
       PromotionMode: PromotionMode }
 
 [<RequireQualifiedAccess>]
 module Defaults =
+    let promptProfile =
+        { MaxMemoryCount = 5
+          MaxMemoryCharacters = 6_000
+          MaxEvaluationFindings = Int32.MaxValue
+          MaxEvaluationCharacters = 2_000 }
+
     let budgets =
         { MaxExperiments = 10
           MaxRawTokens = 200_000L
@@ -148,6 +161,14 @@ module HarnessConfig =
 
         if String.IsNullOrWhiteSpace config.Model.Id then
             errors.Add "A model ID is required."
+
+        if
+            config.PromptProfile.MaxMemoryCount <= 0
+            || config.PromptProfile.MaxMemoryCharacters <= 0
+            || config.PromptProfile.MaxEvaluationFindings <= 0
+            || config.PromptProfile.MaxEvaluationCharacters <= 0
+        then
+            errors.Add "Prompt-profile limits must be positive."
 
         if config.Budgets.MaxExperiments <= 0 then
             errors.Add "The experiment budget must be positive."

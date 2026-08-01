@@ -337,8 +337,8 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         let! memoryResult =
                             memory.Select
                                 startedState.Id
-                                Prompt.MaxMemoryCount
-                                Prompt.MaxMemoryCharacters
+                                startedState.Config.PromptProfile.MaxMemoryCount
+                                startedState.Config.PromptProfile.MaxMemoryCharacters
                                 cancellationToken
 
                         let memories =
@@ -354,6 +354,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                   EditablePaths = startedState.Config.EditablePaths
                                   FrontierScore = startedState.FrontierScore
                                   Metric = startedState.Config.Metric
+                                  Profile = startedState.Config.PromptProfile
                                   PreviousEvaluation = startedState.PreviousEvaluation
                                   Memories = memories }
 

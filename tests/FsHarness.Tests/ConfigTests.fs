@@ -7,7 +7,7 @@ open FsHarness.Core
 open Xunit
 
 module ConfigTests =
-    let private writeConfig schemaVersion comparison retries seeds =
+    let private writeConfig schemaVersion comparison retries seeds promptProfile =
         let path =
             Path.Combine(Path.GetTempPath(), $"fsharness-config-{Guid.NewGuid():N}.json")
 
@@ -35,6 +35,7 @@ module ConfigTests =
                 "minDelta": 2{{comparison}}
               },
               "model": { "id": "gpt-5.6-luna", "reasoningEffort": "max" },
+              {{promptProfile}}
               "budgets": {
                 "maxExperiments": 3,
                 "maxRawTokens": 50000,
@@ -52,7 +53,7 @@ module ConfigTests =
 
     [<Fact>]
     let ``schema v1 defaults to retained score and no seeds`` () =
-        let path = writeConfig 1 "" 0 "[]"
+        let path = writeConfig 1 "" 0 "[]" ""
 
         try
             match ConfigFile.read path with
@@ -71,6 +72,7 @@ module ConfigTests =
                 ", \"comparison\": { \"evaluationMetric\": \"frontier_speed_index\" }"
                 2
                 "[\".fsharness/seeds/seed.patch\"]"
+                ""
 
         try
             match ConfigFile.read path with
@@ -79,5 +81,26 @@ module ConfigTests =
                 Assert.Equal(EvaluationMetric "frontier_speed_index", config.Metric.Comparison)
                 Assert.Equal(2, config.Evaluator.MaxInconclusiveRetries)
                 Assert.Equal<string list>([ ".fsharness/seeds/seed.patch" ], config.SeedPatches)
+        finally
+            File.Delete path
+
+    [<Fact>]
+    let ``prompt profile reads compact memory and evaluator limits`` () =
+        let path =
+            writeConfig
+                2
+                ", \"comparison\": { \"evaluationMetric\": \"frontier_speed_index\" }"
+                2
+                "[]"
+                "\"promptProfile\": { \"maxMemoryCount\": 2, \"maxMemoryCharacters\": 2000, \"maxEvaluationFindings\": 3, \"maxEvaluationCharacters\": 1000 },"
+
+        try
+            match ConfigFile.read path with
+            | Error errors -> Assert.Fail(String.concat " " errors)
+            | Ok config ->
+                Assert.Equal(2, config.PromptProfile.MaxMemoryCount)
+                Assert.Equal(2_000, config.PromptProfile.MaxMemoryCharacters)
+                Assert.Equal(3, config.PromptProfile.MaxEvaluationFindings)
+                Assert.Equal(1_000, config.PromptProfile.MaxEvaluationCharacters)
         finally
             File.Delete path

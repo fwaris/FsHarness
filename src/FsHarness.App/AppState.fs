@@ -186,6 +186,7 @@ module AppState =
                       Model =
                         { Id = model.Draft.ModelId
                           Effort = model.Draft.ReasoningEffort }
+                      PromptProfile = Defaults.promptProfile
                       Budgets =
                         { Defaults.budgets with
                             MaxExperiments = maxExperiments

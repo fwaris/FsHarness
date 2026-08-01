@@ -104,6 +104,7 @@ module RuntimeIntegrationTests =
                       Target = None
                       Comparison = RetainedScore }
                   Model = Defaults.model
+                  PromptProfile = Defaults.promptProfile
                   Budgets =
                     { Defaults.budgets with
                         MaxExperiments = 1

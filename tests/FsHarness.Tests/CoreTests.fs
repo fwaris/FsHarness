@@ -30,6 +30,7 @@ module private Fixtures =
           Evaluator = evaluator
           Metric = metric
           Model = Defaults.model
+          PromptProfile = Defaults.promptProfile
           Budgets = Defaults.budgets
           PromotionMode = AutoWhenStrictlyBetter }
 
@@ -144,10 +145,54 @@ module PromptTests =
                   EditablePaths = [ "src/**" ]
                   FrontierScore = 1M
                   Metric = Fixtures.metric
+                  Profile = Defaults.promptProfile
                   PreviousEvaluation = None
                   Memories = memories }
 
         Assert.True(prompt.Length < 8_500, $"Prompt was unexpectedly large: {prompt.Length}")
+
+    [<Fact>]
+    let ``compact profile limits memories and evaluator findings`` () =
+        let profile =
+            { MaxMemoryCount = 2
+              MaxMemoryCharacters = 2_000
+              MaxEvaluationFindings = 3
+              MaxEvaluationCharacters = 1_000 }
+
+        let memories =
+            [ 1..4 ]
+            |> List.map (fun index ->
+                { ExperimentId = ExperimentId.create ()
+                  Outcome = $"memory-{index}"
+                  Metric = Some(decimal index)
+                  Summary = Fixtures.summary })
+
+        let evaluation =
+            { SchemaVersion = 2
+              Status = EvaluationStatus.Complete
+              Constraints = Map [ "a", false; "b", false; "c", true; "d", true ]
+              Metrics = Map [ "one", 1M; "two", 2M ]
+              Summary = "compact"
+              Evidence = [] }
+
+        let prompt =
+            Prompt.build
+                { Objective = "Improve"
+                  EditablePaths = [ "src/**" ]
+                  FrontierScore = 1M
+                  Metric = Fixtures.metric
+                  Profile = profile
+                  PreviousEvaluation = Some evaluation
+                  Memories = memories }
+
+        Assert.Contains("memory-1", prompt)
+        Assert.Contains("memory-2", prompt)
+        Assert.DoesNotContain("memory-3", prompt)
+        Assert.Contains("constraint a=False", prompt)
+        Assert.Contains("constraint b=False", prompt)
+        Assert.Contains("constraint c=True", prompt)
+        Assert.DoesNotContain("constraint d=True", prompt)
+        Assert.DoesNotContain("metric one=1", prompt)
 
 module StateMachineTests =
     [<Fact>]

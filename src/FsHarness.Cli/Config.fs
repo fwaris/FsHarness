@@ -92,6 +92,16 @@ module ConfigFile =
             EvaluationMetric(requiredString "evaluationMetric" value)
         | _ -> raise (InvalidDataException "metric.comparison must be a string or object.")
 
+    let private parsePromptProfile (root: JsonElement) =
+        match tryProperty "promptProfile" root with
+        | None -> Defaults.promptProfile
+        | Some profile when profile.ValueKind = JsonValueKind.Object ->
+            { MaxMemoryCount = requiredInt "maxMemoryCount" profile
+              MaxMemoryCharacters = requiredInt "maxMemoryCharacters" profile
+              MaxEvaluationFindings = requiredInt "maxEvaluationFindings" profile
+              MaxEvaluationCharacters = requiredInt "maxEvaluationCharacters" profile }
+        | _ -> raise (InvalidDataException "promptProfile must be an object.")
+
     let read (path: string) =
         try
             use document = JsonDocument.Parse(File.ReadAllText path)
@@ -133,6 +143,7 @@ module ConfigFile =
                   Model =
                     { Id = requiredString "id" model
                       Effort = requiredString "reasoningEffort" model |> parseEffort }
+                  PromptProfile = parsePromptProfile root
                   Budgets =
                     { MaxExperiments = requiredInt "maxExperiments" budgets
                       MaxRawTokens = requiredInt64 "maxRawTokens" budgets
