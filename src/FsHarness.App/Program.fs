@@ -5,6 +5,7 @@ open Avalonia
 open Avalonia.Controls.ApplicationLifetimes
 open Avalonia.FuncUI.Elmish
 open Avalonia.FuncUI.Hosts
+open Avalonia.Platform.Storage
 open Avalonia.Themes.Fluent
 open Elmish
 open FsHarness.Codex
@@ -22,6 +23,19 @@ type MainWindow() as this =
 
     let runtime = new HarnessRuntime(codexExecutable)
 
+    let pickRepositoryFolder () =
+        async {
+            try
+                let options =
+                    FolderPickerOpenOptions(Title = "Select a source repository", AllowMultiple = false)
+
+                let! folders = this.StorageProvider.OpenFolderPickerAsync options |> Async.AwaitTask
+
+                return folders |> Seq.tryHead |> Option.map (fun folder -> folder.Path.LocalPath) |> Ok
+            with error ->
+                return Error $"Unable to open the repository folder picker: {error.Message}"
+        }
+
     do
         base.Title <- "FsHarness · Token-Efficient Experiment Ratchet"
         base.Width <- 1280.0
@@ -31,7 +45,7 @@ type MainWindow() as this =
 
         this.Closed.Add(fun _ -> (runtime :> IDisposable).Dispose())
 
-        Program.mkProgram (fun () -> AppState.init runtime) (AppState.update runtime) Views.view
+        Program.mkProgram (fun () -> AppState.init runtime) (AppState.update runtime pickRepositoryFolder) Views.view
         |> Program.withHost this
         |> Program.run
 

@@ -59,6 +59,8 @@ type DraftField =
 type Msg =
     | Navigate of Page
     | DraftChanged of DraftField * string
+    | BrowseRepository
+    | RepositoryFolderSelected of Result<string option, string>
     | ToggleMetricDirection
     | TogglePromotionMode
     | InspectRepository
@@ -198,7 +200,12 @@ module AppState =
                 | Error errors -> Error(String.concat " " errors)
             | _ -> Error "Min delta, maximum experiments, and raw-token budget must be valid numbers."
 
-    let update (runtime: HarnessRuntime) (message: Msg) (model: Model) =
+    let update
+        (runtime: HarnessRuntime)
+        (pickRepositoryFolder: unit -> Async<Result<string option, string>>)
+        (message: Msg)
+        (model: Model)
+        =
         match message with
         | Navigate page ->
             let command =
@@ -209,11 +216,29 @@ module AppState =
 
             { model with Page = page }, command
         | DraftChanged(field, value) ->
-            { model with
-                Draft = updateDraft field value model.Draft
-                Prepared = None
-                Error = None },
-            Cmd.none
+            let updated =
+                { model with
+                    Draft = updateDraft field value model.Draft
+                    Prepared = None
+                    Error = None }
+
+            match field with
+            | DraftField.SourcePath -> { updated with Repository = None }, Cmd.none
+            | _ -> updated, Cmd.none
+        | BrowseRepository ->
+            { model with Error = None },
+            Cmd.OfAsync.perform (fun () -> pickRepositoryFolder ()) () RepositoryFolderSelected
+        | RepositoryFolderSelected result ->
+            match result with
+            | Ok(Some path) ->
+                { model with
+                    Draft = { model.Draft with SourcePath = path }
+                    Repository = None
+                    Prepared = None
+                    Error = None },
+                Cmd.none
+            | Ok None -> model, Cmd.none
+            | Error error -> { model with Error = Some error }, Cmd.none
         | ToggleMetricDirection ->
             let direction =
                 match model.Draft.MetricDirection with

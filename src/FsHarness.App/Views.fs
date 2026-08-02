@@ -119,6 +119,33 @@ module Views =
               Button.padding (Thickness(15.0, 9.0))
               Button.onClick (fun _ -> dispatch message) ]
 
+    let private repositoryField (value: string) (enabled: bool) (dispatch: Msg -> unit) : IView =
+        StackPanel.create
+            [ StackPanel.spacing 5.0
+              StackPanel.children
+                  [ muted "Source repository"
+                    Grid.create
+                        [ Grid.columnDefinitions "*,Auto"
+                          Grid.columnSpacing 8.0
+                          Grid.children
+                              [ TextBox.create
+                                    [ TextBox.text value
+                                      TextBox.foreground Theme.text
+                                      TextBox.background Theme.surfaceRaised
+                                      TextBox.borderBrush Theme.border
+                                      TextBox.onTextChanged (fun next ->
+                                          dispatch (DraftChanged(DraftField.SourcePath, next))) ]
+                                Button.create
+                                    [ Grid.column 1
+                                      Button.content "Browse…"
+                                      Button.isEnabled enabled
+                                      Button.background Theme.surfaceRaised
+                                      Button.foreground Theme.text
+                                      Button.borderBrush Theme.border
+                                      Button.borderThickness 1.0
+                                      Button.padding (Thickness(15.0, 9.0))
+                                      Button.onClick (fun _ -> dispatch BrowseRepository) ] ] ] ] ]
+
     let private errorBanner (error: string) (dispatch: Msg -> unit) : IView =
         Border.create
             [ Border.background Theme.dangerDark
@@ -143,22 +170,24 @@ module Views =
               ) ]
 
     let private repositorySummary (inspection: RepositoryInspection option) : IView =
-        match inspection with
-        | None -> muted "Not inspected. FsHarness requires a committed Git baseline."
-        | Some repository ->
-            let branch = repository.Branch |> Option.defaultValue "detached HEAD"
+        let children =
+            match inspection with
+            | None -> [ muted "Not inspected. FsHarness requires a committed Git baseline." ]
+            | Some repository ->
+                let branch = repository.Branch |> Option.defaultValue "detached HEAD"
 
-            let dirty =
-                if repository.IsDirty then
-                    repository.DirtySummary
-                else
-                    "Clean source worktree"
+                let dirty =
+                    if repository.IsDirty then
+                        repository.DirtySummary
+                    else
+                        "Clean source worktree"
 
-            StackPanel.create
-                [ StackPanel.spacing 3.0
-                  StackPanel.children
-                      [ text $"{branch} · {CommitOid.value repository.Head}" 12.0 Theme.text
-                        muted $"{dirty}. Experiments use only the committed HEAD." ] ]
+                [ text $"{branch} · {CommitOid.value repository.Head}" 12.0 Theme.text
+                  muted $"{dirty}. Experiments use only the committed HEAD." ]
+
+        // Keep the virtual-view type stable across inspection. Replacing a TextBlock
+        // with a StackPanel inside the ScrollViewer can invalidate FuncUI's patch target.
+        StackPanel.create [ StackPanel.spacing 3.0; StackPanel.children children ]
 
     let private codexSummary (report: CodexPreflight option) : IView =
         match report with
@@ -201,7 +230,7 @@ module Views =
                                   "Pin one committed baseline, one deterministic evaluator, and one bounded Codex profile. The source repository is never modified."
                               card
                                   [ overline "1 · REPOSITORY"
-                                    field "Source repository" model.Draft.SourcePath DraftField.SourcePath dispatch
+                                    repositoryField model.Draft.SourcePath (not model.Busy) dispatch
                                     repositorySummary model.Repository
                                     secondaryButton "Inspect committed HEAD" (not model.Busy) InspectRepository dispatch ]
                               card
