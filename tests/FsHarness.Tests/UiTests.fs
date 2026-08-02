@@ -51,6 +51,15 @@ module UiTests =
 
                         Assert.True(browse.IsSome, "The repository field should expose a folder picker.")
 
+                        let loadExperiment =
+                            window.GetVisualDescendants()
+                            |> Seq.choose (function
+                                | :? Button as button when string button.Content = "Load experiment…" -> Some button
+                                | _ -> None)
+                            |> Seq.tryExactlyOne
+
+                        Assert.True(loadExperiment.IsSome, "Setup should expose experiment loading.")
+
                         window.KeyPressQwerty(PhysicalKey.Tab, RawInputModifiers.None)
                         Assert.NotNull(window.FocusManager.GetFocusedElement())
                         window.Close()),
@@ -80,6 +89,8 @@ module UiTests =
             AppState.update
                 runtime
                 (fun () -> async { return Ok None })
+                (fun () -> async { return Ok None })
+                (fun _ -> async { return Ok None })
                 (RepositoryFolderSelected(Ok(Some selectedPath)))
                 { model with
                     Repository = Some inspected }
@@ -87,6 +98,55 @@ module UiTests =
         Assert.Equal(selectedPath, selected.Draft.SourcePath)
         Assert.True(selected.Repository.IsNone)
         Assert.NotNull(Views.view selected ignore)
+
+        let loadedConfig =
+            { SchemaVersion = HarnessConfig.currentSchemaVersion
+              SourcePath = selectedPath
+              BaseCommit = inspected.Head
+              Objective = "Loaded objective"
+              EditablePaths = [ "src/**" ]
+              SeedPatches = [ ".fsharness/seeds/zero.patch" ]
+              Evaluator =
+                { Executable = "python"
+                  Arguments = [ ".fsharness/evaluate.py" ]
+                  WorkingDirectory = "."
+                  Timeout = TimeSpan.FromHours 3.0
+                  RequiredConstraints = [ "tests" ]
+                  MaxInconclusiveRetries = 2 }
+              Metric =
+                { Name = "paired_speed_index_lcb"
+                  Direction = Maximize
+                  MinDelta = 2M
+                  Target = Some 110M
+                  Comparison = EvaluationMetric "frontier_speed_index" }
+              Model =
+                { Id = "gpt-5.6-sol"
+                  Effort = ReasoningEffort.Medium }
+              PromptProfile =
+                { MaxMemoryCount = 2
+                  MaxMemoryCharacters = 2_000
+                  MaxEvaluationFindings = 3
+                  MaxEvaluationCharacters = 1_000 }
+              Budgets =
+                { Defaults.budgets with
+                    MaxExperiments = 3
+                    MaxRawTokens = 3_000_000L }
+              PromotionMode = AutoWhenStrictlyBetter }
+
+        let loaded, _ =
+            AppState.update
+                runtime
+                (fun () -> async { return Ok None })
+                (fun () -> async { return Ok None })
+                (fun _ -> async { return Ok None })
+                (ExperimentLoaded(Ok(Some("C:\\experiment.json", loadedConfig))))
+                selected
+
+        Assert.Equal("Loaded objective", loaded.Draft.Objective)
+        Assert.Equal(EvaluationMetric "frontier_speed_index", loaded.Draft.MetricComparison)
+        Assert.Equal(TimeSpan.FromHours 3.0, loaded.Draft.EvaluatorTimeout)
+        Assert.Equal<string list>([ ".fsharness/seeds/zero.patch" ], loaded.Draft.SeedPatches)
+        Assert.True(loaded.Repository.IsNone)
 
     [<Fact>]
     let ``async command results render on the Avalonia dispatcher`` () =

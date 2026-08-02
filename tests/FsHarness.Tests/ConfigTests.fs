@@ -2,8 +2,8 @@ namespace FsHarness.Tests
 
 open System
 open System.IO
-open FsHarness.Cli
 open FsHarness.Core
+open FsHarness.Infrastructure
 open Xunit
 
 module ConfigTests =
@@ -104,3 +104,35 @@ module ConfigTests =
                 Assert.Equal(1_000, config.PromptProfile.MaxEvaluationCharacters)
         finally
             File.Delete path
+
+    [<Fact>]
+    let ``schema v2 experiment round trips through shared config file`` () =
+        let source =
+            writeConfig
+                2
+                ", \"comparison\": { \"evaluationMetric\": \"frontier_speed_index\" }, \"target\": 110"
+                2
+                "[\".fsharness/seeds/seed.patch\"]"
+                "\"promptProfile\": { \"maxMemoryCount\": 2, \"maxMemoryCharacters\": 2000, \"maxEvaluationFindings\": 3, \"maxEvaluationCharacters\": 1000 },"
+
+        let destination =
+            Path.Combine(Path.GetTempPath(), $"fsharness-config-roundtrip-{Guid.NewGuid():N}.json")
+
+        try
+            let expected =
+                match ConfigFile.read source with
+                | Ok config -> config
+                | Error errors -> failwith (String.concat " " errors)
+
+            match ConfigFile.write destination expected with
+            | Error errors -> Assert.Fail(String.concat " " errors)
+            | Ok written -> Assert.Equal(Path.GetFullPath destination, written)
+
+            match ConfigFile.read destination with
+            | Error errors -> Assert.Fail(String.concat " " errors)
+            | Ok actual -> Assert.Equal(expected, actual)
+        finally
+            File.Delete source
+
+            if File.Exists destination then
+                File.Delete destination

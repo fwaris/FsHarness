@@ -206,6 +206,9 @@ module Views =
             text $"{value.Version} · {value.LoginStatus} · {capability}" 12.0 Theme.text
 
     let private setupView (model: Model) (dispatch: Msg -> unit) : IView =
+        let canLoadExperiment = not model.Busy && model.Prepared.IsNone && model.Run.IsNone
+        let canSaveExperiment = not model.Busy && model.Repository.IsSome
+
         let directionLabel =
             match model.Draft.MetricDirection with
             | Maximize -> "Direction: maximize"
@@ -223,9 +226,31 @@ module Views =
                       [ StackPanel.spacing 16.0
                         StackPanel.margin (Thickness 24.0)
                         StackPanel.children
-                            [ heading "Configure the ratchet"
+                            [ Grid.create
+                                  [ Grid.columnDefinitions "*,Auto"
+                                    Grid.columnSpacing 12.0
+                                    Grid.children
+                                        [ heading "Configure the ratchet"
+                                          StackPanel.create
+                                              [ Grid.column 1
+                                                StackPanel.orientation Orientation.Horizontal
+                                                StackPanel.spacing 8.0
+                                                StackPanel.children
+                                                    [ secondaryButton
+                                                          "Load experiment…"
+                                                          canLoadExperiment
+                                                          LoadExperiment
+                                                          dispatch
+                                                      secondaryButton
+                                                          "Save experiment…"
+                                                          canSaveExperiment
+                                                          SaveExperiment
+                                                          dispatch ] ] ] ]
                               muted
                                   "Pin one committed baseline, one deterministic evaluator, and one bounded Codex profile. The source repository is never modified."
+                              match model.ExperimentFile with
+                              | Some path -> muted $"Experiment file: {path}"
+                              | None -> muted "Experiment configuration has not been saved."
                               card
                                   [ overline "1 · REPOSITORY"
                                     repositoryField model.Draft.SourcePath (not model.Busy) dispatch

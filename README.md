@@ -23,6 +23,8 @@ Codex discovery checks `FSHARNESS_CODEX_PATH` first, then `PATH`, then the newes
 
 Setup performs source inspection, `codex --version`, `codex login status`, `codex doctor --json`, bundled model discovery, private Git import, and baseline evaluation before Start is enabled. The default model request is `gpt-5.6-luna` with reasoning effort `max`; unsupported model/effort pairs fail closed.
 
+Setup can load and save schema-v2 experiment JSON through the native file picker. Loading restores the complete campaign configuration, including paired comparison, seed patches, evaluator timeout/retries, prompt limits, reasoning effort, and run budgets; the repository must then be inspected again so the app pins its current committed HEAD. Saving requires a successful repository inspection because `baseCommit` is part of the reproducible experiment file. Files saved by the app can be passed directly to the headless `fsharness run --config` command.
+
 ## Evaluator protocol
 
 The evaluator is launched directly, without a shell and without inherited secret environment variables. Its working directory is relative to the clean candidate worktree. `FSHARNESS_RESULT_PATH` is the only result destination. Exit zero means evaluation completed, even if quality constraints failed. The evaluator must atomically write:

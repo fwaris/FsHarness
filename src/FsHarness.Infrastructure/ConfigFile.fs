@@ -1,4 +1,4 @@
-namespace FsHarness.Cli
+namespace FsHarness.Infrastructure
 
 open System
 open System.IO
@@ -21,7 +21,7 @@ module ConfigFile =
         tryProperty name element
         |> Option.bind (fun value ->
             if value.ValueKind = JsonValueKind.String then
-                Some(value.GetString())
+                value.GetString() |> Option.ofObj
             else
                 None)
 
@@ -62,6 +62,11 @@ module ConfigFile =
         | "minimize" -> Minimize
         | _ -> raise (InvalidDataException $"Unknown metric direction '{value}'.")
 
+    let private directionText direction =
+        match direction with
+        | Maximize -> "maximize"
+        | Minimize -> "minimize"
+
     let private parseEffort (value: string) =
         match value.Trim().ToLowerInvariant() with
         | "low" -> ReasoningEffort.Low
@@ -71,6 +76,14 @@ module ConfigFile =
         | "max" -> ReasoningEffort.Max
         | _ -> raise (InvalidDataException $"Unknown reasoning effort '{value}'.")
 
+    let private effortText effort =
+        match effort with
+        | ReasoningEffort.Low -> "low"
+        | ReasoningEffort.Medium -> "medium"
+        | ReasoningEffort.High -> "high"
+        | ReasoningEffort.XHigh -> "xhigh"
+        | ReasoningEffort.Max -> "max"
+
     let private parsePromotion (value: string) =
         match value.Trim().ToLowerInvariant() with
         | "auto"
@@ -78,6 +91,11 @@ module ConfigFile =
         | "review"
         | "reviewstrictwinners" -> ReviewStrictWinners
         | _ -> raise (InvalidDataException $"Unknown promotion mode '{value}'.")
+
+    let private promotionText promotion =
+        match promotion with
+        | AutoWhenStrictlyBetter -> "auto"
+        | ReviewStrictWinners -> "review"
 
     let private parseComparison schemaVersion (metric: JsonElement) =
         match tryProperty "comparison" metric with
@@ -91,6 +109,11 @@ module ConfigFile =
         | Some value when value.ValueKind = JsonValueKind.Object ->
             EvaluationMetric(requiredString "evaluationMetric" value)
         | _ -> raise (InvalidDataException "metric.comparison must be a string or object.")
+
+    let private comparisonValue comparison : obj =
+        match comparison with
+        | RetainedScore -> box "retainedScore"
+        | EvaluationMetric name -> box {| evaluationMetric = name |}
 
     let private parsePromptProfile (root: JsonElement) =
         match tryProperty "promptProfile" root with
@@ -159,3 +182,57 @@ module ConfigFile =
             HarnessConfig.validate config
         with error ->
             Error [ error.Message ]
+
+    let write (path: string) (config: HarnessConfig) =
+        match HarnessConfig.validate config with
+        | Error errors -> Error errors
+        | Ok validated ->
+            try
+                let target =
+                    validated.Metric.Target
+                    |> Option.map Nullable
+                    |> Option.defaultValue (Nullable())
+
+                let document =
+                    {| schemaVersion = HarnessConfig.currentSchemaVersion
+                       sourcePath = validated.SourcePath
+                       baseCommit = CommitOid.value validated.BaseCommit
+                       objective = validated.Objective
+                       editablePaths = List.toArray validated.EditablePaths
+                       seedPatches = List.toArray validated.SeedPatches
+                       evaluator =
+                        {| executable = validated.Evaluator.Executable
+                           arguments = List.toArray validated.Evaluator.Arguments
+                           workingDirectory = validated.Evaluator.WorkingDirectory
+                           timeoutSeconds = int validated.Evaluator.Timeout.TotalSeconds
+                           requiredConstraints = List.toArray validated.Evaluator.RequiredConstraints
+                           maxInconclusiveRetries = validated.Evaluator.MaxInconclusiveRetries |}
+                       metric =
+                        {| name = validated.Metric.Name
+                           direction = directionText validated.Metric.Direction
+                           minDelta = validated.Metric.MinDelta
+                           target = target
+                           comparison = comparisonValue validated.Metric.Comparison |}
+                       model =
+                        {| id = validated.Model.Id
+                           reasoningEffort = effortText validated.Model.Effort |}
+                       promptProfile =
+                        {| maxMemoryCount = validated.PromptProfile.MaxMemoryCount
+                           maxMemoryCharacters = validated.PromptProfile.MaxMemoryCharacters
+                           maxEvaluationFindings = validated.PromptProfile.MaxEvaluationFindings
+                           maxEvaluationCharacters = validated.PromptProfile.MaxEvaluationCharacters |}
+                       budgets =
+                        {| maxExperiments = validated.Budgets.MaxExperiments
+                           maxRawTokens = validated.Budgets.MaxRawTokens
+                           maxDurationSeconds = int validated.Budgets.MaxDuration.TotalSeconds
+                           codexTimeoutSeconds = int validated.Budgets.CodexTimeout.TotalSeconds
+                           maxConsecutiveNonImprovements = validated.Budgets.MaxConsecutiveNonImprovements
+                           maxConsecutiveFailures = validated.Budgets.MaxConsecutiveFailures |}
+                       promotionMode = promotionText validated.PromotionMode |}
+
+                let options = JsonSerializerOptions(WriteIndented = true)
+                let destination = Path.GetFullPath path
+                AtomicFile.writeAllText destination (JsonSerializer.Serialize(document, options))
+                Ok destination
+            with error ->
+                Error [ error.Message ]

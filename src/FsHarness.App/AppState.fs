@@ -17,17 +17,27 @@ type DraftConfig =
     { SourcePath: string
       Objective: string
       EditablePaths: string
+      SeedPatches: string list
       EvaluatorExecutable: string
       EvaluatorArguments: string
       EvaluatorWorkingDirectory: string
+      EvaluatorTimeout: TimeSpan
+      MaxInconclusiveRetries: int
       RequiredConstraints: string
       MetricName: string
       MetricDirection: MetricDirection
       MinDelta: string
+      MetricTarget: decimal option
+      MetricComparison: MetricComparison
       ModelId: string
       ReasoningEffort: ReasoningEffort
+      PromptProfile: PromptProfile
       MaxExperiments: string
       MaxRawTokens: string
+      MaxDuration: TimeSpan
+      CodexTimeout: TimeSpan
+      MaxConsecutiveNonImprovements: int
+      MaxConsecutiveFailures: int
       PromotionMode: PromotionMode }
 
 type Model =
@@ -40,6 +50,7 @@ type Model =
       Activities: RuntimeActivity list
       History: HistoryEvent list
       Busy: bool
+      ExperimentFile: string option
       Error: string option }
 
 type DraftField =
@@ -61,6 +72,10 @@ type Msg =
     | DraftChanged of DraftField * string
     | BrowseRepository
     | RepositoryFolderSelected of Result<string option, string>
+    | LoadExperiment
+    | ExperimentLoaded of Result<(string * HarnessConfig) option, string>
+    | SaveExperiment
+    | ExperimentSaved of Result<string option, string>
     | ToggleMetricDirection
     | TogglePromotionMode
     | InspectRepository
@@ -93,18 +108,55 @@ module AppState =
         { SourcePath = Directory.GetCurrentDirectory()
           Objective = "Improve the primary metric with one small, maintainable change while preserving all constraints."
           EditablePaths = "src/**;tests/**"
+          SeedPatches = []
           EvaluatorExecutable = "dotnet"
           EvaluatorArguments = "run\n--project\n.fsharness/Evaluator.fsproj\n--configuration\nRelease\n--no-restore"
           EvaluatorWorkingDirectory = "."
+          EvaluatorTimeout = TimeSpan.FromMinutes 15.0
+          MaxInconclusiveRetries = 2
           RequiredConstraints = "build;tests"
           MetricName = "primary"
           MetricDirection = Maximize
           MinDelta = "0"
+          MetricTarget = None
+          MetricComparison = RetainedScore
           ModelId = Defaults.model.Id
           ReasoningEffort = Defaults.model.Effort
+          PromptProfile = Defaults.promptProfile
           MaxExperiments = string Defaults.budgets.MaxExperiments
           MaxRawTokens = string Defaults.budgets.MaxRawTokens
+          MaxDuration = Defaults.budgets.MaxDuration
+          CodexTimeout = Defaults.budgets.CodexTimeout
+          MaxConsecutiveNonImprovements = Defaults.budgets.MaxConsecutiveNonImprovements
+          MaxConsecutiveFailures = Defaults.budgets.MaxConsecutiveFailures
           PromotionMode = AutoWhenStrictlyBetter }
+
+    let private draftFromConfig (config: HarnessConfig) =
+        { SourcePath = config.SourcePath
+          Objective = config.Objective
+          EditablePaths = String.concat ";" config.EditablePaths
+          SeedPatches = config.SeedPatches
+          EvaluatorExecutable = config.Evaluator.Executable
+          EvaluatorArguments = String.concat Environment.NewLine config.Evaluator.Arguments
+          EvaluatorWorkingDirectory = config.Evaluator.WorkingDirectory
+          EvaluatorTimeout = config.Evaluator.Timeout
+          MaxInconclusiveRetries = config.Evaluator.MaxInconclusiveRetries
+          RequiredConstraints = String.concat ";" config.Evaluator.RequiredConstraints
+          MetricName = config.Metric.Name
+          MetricDirection = config.Metric.Direction
+          MinDelta = string config.Metric.MinDelta
+          MetricTarget = config.Metric.Target
+          MetricComparison = config.Metric.Comparison
+          ModelId = config.Model.Id
+          ReasoningEffort = config.Model.Effort
+          PromptProfile = config.PromptProfile
+          MaxExperiments = string config.Budgets.MaxExperiments
+          MaxRawTokens = string config.Budgets.MaxRawTokens
+          MaxDuration = config.Budgets.MaxDuration
+          CodexTimeout = config.Budgets.CodexTimeout
+          MaxConsecutiveNonImprovements = config.Budgets.MaxConsecutiveNonImprovements
+          MaxConsecutiveFailures = config.Budgets.MaxConsecutiveFailures
+          PromotionMode = config.PromotionMode }
 
     let private subscribe (runtime: HarnessRuntime) =
         [ fun dispatch ->
@@ -121,6 +173,7 @@ module AppState =
           Activities = []
           History = []
           Busy = false
+          ExperimentFile = None
           Error = None },
         subscribe runtime
 
@@ -171,28 +224,32 @@ module AppState =
                       BaseCommit = repository.Head
                       Objective = model.Draft.Objective
                       EditablePaths = splitSemicolon model.Draft.EditablePaths
-                      SeedPatches = []
+                      SeedPatches = model.Draft.SeedPatches
                       Evaluator =
                         { Executable = model.Draft.EvaluatorExecutable
                           Arguments = splitLines model.Draft.EvaluatorArguments
                           WorkingDirectory = model.Draft.EvaluatorWorkingDirectory
-                          Timeout = TimeSpan.FromMinutes 15.0
+                          Timeout = model.Draft.EvaluatorTimeout
                           RequiredConstraints = splitSemicolon model.Draft.RequiredConstraints
-                          MaxInconclusiveRetries = 2 }
+                          MaxInconclusiveRetries = model.Draft.MaxInconclusiveRetries }
                       Metric =
                         { Name = model.Draft.MetricName
                           Direction = model.Draft.MetricDirection
                           MinDelta = minDelta
-                          Target = None
-                          Comparison = RetainedScore }
+                          Target = model.Draft.MetricTarget
+                          Comparison = model.Draft.MetricComparison }
                       Model =
                         { Id = model.Draft.ModelId
                           Effort = model.Draft.ReasoningEffort }
-                      PromptProfile = Defaults.promptProfile
+                      PromptProfile = model.Draft.PromptProfile
                       Budgets =
                         { Defaults.budgets with
                             MaxExperiments = maxExperiments
-                            MaxRawTokens = maxRawTokens }
+                            MaxRawTokens = maxRawTokens
+                            MaxDuration = model.Draft.MaxDuration
+                            CodexTimeout = model.Draft.CodexTimeout
+                            MaxConsecutiveNonImprovements = model.Draft.MaxConsecutiveNonImprovements
+                            MaxConsecutiveFailures = model.Draft.MaxConsecutiveFailures }
                       PromotionMode = model.Draft.PromotionMode }
 
                 match HarnessConfig.validate config with
@@ -203,6 +260,8 @@ module AppState =
     let update
         (runtime: HarnessRuntime)
         (pickRepositoryFolder: unit -> Async<Result<string option, string>>)
+        (loadExperiment: unit -> Async<Result<(string * HarnessConfig) option, string>>)
+        (saveExperiment: HarnessConfig -> Async<Result<string option, string>>)
         (message: Msg)
         (model: Model)
         =
@@ -220,6 +279,7 @@ module AppState =
                 { model with
                     Draft = updateDraft field value model.Draft
                     Prepared = None
+                    ExperimentFile = None
                     Error = None }
 
             match field with
@@ -235,10 +295,52 @@ module AppState =
                     Draft = { model.Draft with SourcePath = path }
                     Repository = None
                     Prepared = None
+                    ExperimentFile = None
                     Error = None },
                 Cmd.none
             | Ok None -> model, Cmd.none
             | Error error -> { model with Error = Some error }, Cmd.none
+        | LoadExperiment ->
+            { model with Busy = true; Error = None },
+            Cmd.OfAsync.perform (fun () -> loadExperiment ()) () ExperimentLoaded
+        | ExperimentLoaded result ->
+            match result with
+            | Ok(Some(path, config)) ->
+                { model with
+                    Draft = draftFromConfig config
+                    Repository = None
+                    CodexHealth = None
+                    Prepared = None
+                    Busy = false
+                    ExperimentFile = Some path
+                    Error = None },
+                Cmd.none
+            | Ok None -> { model with Busy = false }, Cmd.none
+            | Error error ->
+                { model with
+                    Busy = false
+                    Error = Some error },
+                Cmd.none
+        | SaveExperiment ->
+            match createConfig model with
+            | Error error -> { model with Error = Some error }, Cmd.none
+            | Ok config ->
+                { model with Busy = true; Error = None },
+                Cmd.OfAsync.perform (fun () -> saveExperiment config) () ExperimentSaved
+        | ExperimentSaved result ->
+            match result with
+            | Ok(Some path) ->
+                { model with
+                    Busy = false
+                    ExperimentFile = Some path
+                    Error = None },
+                Cmd.none
+            | Ok None -> { model with Busy = false }, Cmd.none
+            | Error error ->
+                { model with
+                    Busy = false
+                    Error = Some error },
+                Cmd.none
         | ToggleMetricDirection ->
             let direction =
                 match model.Draft.MetricDirection with
