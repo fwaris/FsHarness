@@ -47,7 +47,7 @@ type MainWindow() as this =
 
         Program.mkProgram (fun () -> AppState.init runtime) (AppState.update runtime pickRepositoryFolder) Views.view
         |> Program.withHost this
-        |> Program.run
+        |> Program.runWithAvaloniaSyncDispatch ()
 
 type App() =
     inherit Application()

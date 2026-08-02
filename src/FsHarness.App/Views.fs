@@ -170,24 +170,22 @@ module Views =
               ) ]
 
     let private repositorySummary (inspection: RepositoryInspection option) : IView =
-        let children =
-            match inspection with
-            | None -> [ muted "Not inspected. FsHarness requires a committed Git baseline." ]
-            | Some repository ->
-                let branch = repository.Branch |> Option.defaultValue "detached HEAD"
+        match inspection with
+        | None -> muted "Not inspected. FsHarness requires a committed Git baseline."
+        | Some repository ->
+            let branch = repository.Branch |> Option.defaultValue "detached HEAD"
 
-                let dirty =
-                    if repository.IsDirty then
-                        repository.DirtySummary
-                    else
-                        "Clean source worktree"
+            let dirty =
+                if repository.IsDirty then
+                    repository.DirtySummary
+                else
+                    "Clean source worktree"
 
-                [ text $"{branch} · {CommitOid.value repository.Head}" 12.0 Theme.text
-                  muted $"{dirty}. Experiments use only the committed HEAD." ]
-
-        // Keep the virtual-view type stable across inspection. Replacing a TextBlock
-        // with a StackPanel inside the ScrollViewer can invalidate FuncUI's patch target.
-        StackPanel.create [ StackPanel.spacing 3.0; StackPanel.children children ]
+            StackPanel.create
+                [ StackPanel.spacing 3.0
+                  StackPanel.children
+                      [ text $"{branch} · {CommitOid.value repository.Head}" 12.0 Theme.text
+                        muted $"{dirty}. Experiments use only the committed HEAD." ] ]
 
     let private codexSummary (report: CodexPreflight option) : IView =
         match report with

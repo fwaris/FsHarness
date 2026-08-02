@@ -4,9 +4,14 @@ open System
 open System.Threading
 open Avalonia
 open Avalonia.Controls
+open Avalonia.FuncUI.DSL
+open Avalonia.FuncUI.Elmish
+open Avalonia.FuncUI.Hosts
 open Avalonia.Headless
 open Avalonia.Input
+open Avalonia.Threading
 open Avalonia.VisualTree
+open Elmish
 open FsHarness.App
 open FsHarness.Core
 open FsHarness.Infrastructure
@@ -82,3 +87,54 @@ module UiTests =
         Assert.Equal(selectedPath, selected.Draft.SourcePath)
         Assert.True(selected.Repository.IsNone)
         Assert.NotNull(Views.view selected ignore)
+
+    [<Fact>]
+    let ``async command results render on the Avalonia dispatcher`` () =
+        use session = HeadlessUnitTestSession.StartNew(typeof<HeadlessAppBuilder>)
+        use rendered = new ManualResetEventSlim(false)
+        let mutable renderedOnUiThread = false
+        let mutable window: HostWindow option = None
+
+        session
+            .Dispatch(
+                Action(fun () ->
+                    let current = new HostWindow()
+                    window <- Some current
+
+                    let init () =
+                        false,
+                        Cmd.OfAsync.perform
+                            (fun () ->
+                                async {
+                                    do! Async.Sleep 25
+                                    return ()
+                                })
+                            ()
+                            id
+
+                    let update () _ = true, Cmd.none
+
+                    let view completed _ =
+                        if completed then
+                            renderedOnUiThread <- Dispatcher.UIThread.CheckAccess()
+                            rendered.Set()
+
+                        Border.create []
+
+                    Elmish.Program.mkProgram init update view
+                    |> Avalonia.FuncUI.Elmish.Program.withHost current
+                    |> Avalonia.FuncUI.Elmish.Program.runWithAvaloniaSyncDispatch ()
+
+                    current.Show()),
+                CancellationToken.None
+            )
+            .GetAwaiter()
+            .GetResult()
+
+        Assert.True(rendered.Wait(TimeSpan.FromSeconds 5.0), "The asynchronous Elmish command did not complete.")
+        Assert.True(renderedOnUiThread, "The resulting view was constructed off the Avalonia dispatcher.")
+
+        session
+            .Dispatch(Action(fun () -> window |> Option.iter (fun current -> current.Close())), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
