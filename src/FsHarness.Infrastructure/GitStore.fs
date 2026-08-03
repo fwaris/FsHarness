@@ -187,10 +187,115 @@ module GitStore =
         }
 
     let private repoPath store runId = DataPaths.repository store.Root runId
-    let private worktreeRoot store runId = DataPaths.worktrees store.Root runId
 
     let private runRef runId suffix =
         $"refs/fsharness/runs/{RunId.text runId}/{suffix}"
+
+    type GitLineage =
+        { Baseline: CommitOid option
+          Frontier: CommitOid option
+          Candidates: Map<ExperimentId, CommitOid * CommitOid option> }
+
+    let loadLineage store runId cancellationToken : Async<Result<GitLineage, HarnessError>> =
+        async {
+            let repository = repoPath store runId
+
+            if not (File.Exists repository) then
+                return
+                    Error(
+                        HarnessError.create
+                            "git.lineage_repository_missing"
+                            HarnessErrorCategory.Git
+                            "The private Git repository for this run is missing."
+                    )
+            else
+                let! refsResult =
+                    requireSuccess
+                        store
+                        "lineage_refs"
+                        None
+                        [ "--git-dir"
+                          repository
+                          "for-each-ref"
+                          "--format=%(refname)\t%(objectname)"
+                          (runRef runId "") ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                match refsResult with
+                | Error error -> return Error error
+                | Ok refsText ->
+                    let prefix = runRef runId ""
+                    let candidatePrefix = runRef runId "candidates/"
+
+                    let parsedRefs =
+                        refsText.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.toList
+                        |> List.choose (fun line ->
+                            match line.Split('\t', 2, StringSplitOptions.None) with
+                            | [| name; oid |] when name.StartsWith(prefix, StringComparison.Ordinal) ->
+                                Some(name.Trim(), oid.Trim())
+                            | _ -> None)
+
+                    let commitByExperiment =
+                        parsedRefs
+                        |> List.choose (fun (name, oid) ->
+                            if name.StartsWith(candidatePrefix, StringComparison.Ordinal) then
+                                let suffix = name.Substring(candidatePrefix.Length)
+
+                                match Guid.TryParse suffix with
+                                | true, value -> Some(ExperimentId.ofGuid value, CommitOid.create oid)
+                                | false, _ -> None
+                            else
+                                None)
+
+                    let parentFor (commit: CommitOid) =
+                        async {
+                            let! result =
+                                requireSuccess
+                                    store
+                                    "lineage_parent"
+                                    None
+                                    [ "--git-dir"
+                                      repository
+                                      "rev-list"
+                                      "--parents"
+                                      "--max-count=1"
+                                      (CommitOid.value commit) ]
+                                    None
+                                    Map.empty
+                                    cancellationToken
+
+                            return
+                                match result with
+                                | Error _ -> None
+                                | Ok text ->
+                                    text.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                                    |> Array.tryItem 1
+                                    |> Option.map CommitOid.create
+                        }
+
+                    let mutable candidates = Map.empty
+
+                    for experimentId, commit in commitByExperiment do
+                        let! parent = parentFor commit
+                        candidates <- candidates.Add(experimentId, (commit, parent))
+
+                    let findRef suffix =
+                        parsedRefs
+                        |> List.tryPick (fun (name, oid) ->
+                            if name = runRef runId suffix then
+                                Some(CommitOid.create oid)
+                            else
+                                None)
+
+                    return
+                        Ok
+                            { Baseline = findRef "baseline"
+                              Frontier = findRef "frontier"
+                              Candidates = candidates }
+        }
 
     let createRun store runId inspection cancellationToken =
         async {
@@ -308,7 +413,7 @@ module GitStore =
             let repository = repoPath store runId
 
             let generation =
-                Path.Combine(worktreeRoot store runId, ExperimentId.text experimentId, "generation")
+                Path.Combine(DataPaths.experiment store.Root runId experimentId, "generation")
 
             Directory.CreateDirectory(Path.GetDirectoryName generation) |> ignore
 
@@ -426,11 +531,11 @@ module GitStore =
 
                 let editable, initiallyProtected = PathPolicy.partition editableGlobs changed
 
-                let experimentRoot =
-                    Path.Combine(worktreeRoot store runId, ExperimentId.text workspace.ExperimentId)
+                let experimentRoot = DataPaths.experiment store.Root runId workspace.ExperimentId
 
                 let assembly = Path.Combine(experimentRoot, "assembly")
                 let evaluation = Path.Combine(experimentRoot, "evaluation")
+                let frontierEvaluation = Path.Combine(experimentRoot, "frontier-evaluation")
 
                 let! assemblyResult =
                     requireSuccess
@@ -584,6 +689,25 @@ module GitStore =
                                             Map.empty
                                             cancellationToken
 
+                                    let! frontierEvaluationResult =
+                                        match evaluationResult with
+                                        | Error error -> async { return Error error }
+                                        | Ok _ ->
+                                            requireSuccess
+                                                store
+                                                "prepare_frontier_evaluation"
+                                                None
+                                                [ "--git-dir"
+                                                  repository
+                                                  "worktree"
+                                                  "add"
+                                                  "--detach"
+                                                  frontierEvaluation
+                                                  parentText ]
+                                                None
+                                                Map.empty
+                                                cancellationToken
+
                                     let! _ =
                                         execute
                                             store
@@ -594,12 +718,13 @@ module GitStore =
                                             cancellationToken
 
                                     return
-                                        evaluationResult
+                                        frontierEvaluationResult
                                         |> Result.map (fun _ ->
                                             { Commit = CommitOid.create candidateText
                                               ChangedPaths = changed
                                               ProtectedPaths = protectedPaths |> List.distinct
-                                              EvaluationPath = evaluation })
+                                              EvaluationPath = evaluation
+                                              FrontierEvaluationPath = frontierEvaluation })
             | Error error, _
             | _, Error error -> return Error error
         }
@@ -622,6 +747,47 @@ module GitStore =
                     cancellationToken
 
             return result |> Result.map ignore
+        }
+
+    let applySeedPatch store (workspace: CandidateWorkspace) (patchPath: string) cancellationToken =
+        async {
+            let normalized = patchPath.Replace('\\', '/')
+
+            let fullPatchPath =
+                Path.GetFullPath(Path.Combine(workspace.GenerationPath, normalized))
+
+            let seedRoot =
+                Path.GetFullPath(Path.Combine(workspace.GenerationPath, ".fsharness", "seeds"))
+
+            if
+                not (
+                    fullPatchPath.StartsWith(
+                        seedRoot + string Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase
+                    )
+                )
+                || not (File.Exists fullPatchPath)
+            then
+                return
+                    Error(
+                        HarnessError.create
+                            "git.seed_patch_missing"
+                            HarnessErrorCategory.Git
+                            "Protected seed patch was not found below .fsharness/seeds/."
+                        |> HarnessError.withDetail normalized
+                    )
+            else
+                let! result =
+                    requireSuccess
+                        store
+                        "apply_seed"
+                        (Some workspace.GenerationPath)
+                        [ "apply"; "--whitespace=nowarn"; "--"; normalized ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                return result |> Result.map ignore
         }
 
     let exportPatch store runId candidate destination cancellationToken =
@@ -663,6 +829,7 @@ module GitStore =
         { InspectSource = inspectSource store
           CreateRun = createRun store
           PrepareCandidate = prepareCandidate store
+          ApplySeedPatch = applySeedPatch store
           CaptureCandidate = captureCandidate store
           AdvanceFrontier = advanceFrontier store
           ExportPatch = exportPatch store }

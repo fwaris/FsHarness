@@ -33,6 +33,16 @@ module AdapterFixture =
         let root = findRepositoryRoot (DirectoryInfo AppContext.BaseDirectory)
         Path.Combine(root, "tests", project, "bin", configuration, "net10.0", executableName name)
 
+module SanitizedEnvironmentTests =
+    [<Fact>]
+    let ``Windows dotnet profile paths survive evaluator sanitization`` () =
+        let environment = SanitizedEnvironment.core ()
+
+        if OperatingSystem.IsWindows() then
+            Assert.Equal(Environment.GetEnvironmentVariable("APPDATA"), environment["APPDATA"])
+            Assert.Equal(Environment.GetEnvironmentVariable("LOCALAPPDATA"), environment["LOCALAPPDATA"])
+            Assert.Equal(Environment.GetEnvironmentVariable("SystemDrive"), environment["SystemDrive"])
+
 module AdapterIntegrationTests =
     [<Fact>]
     let ``Codex discovery falls back to the newest VS Code extension`` () =
@@ -165,10 +175,16 @@ module AdapterIntegrationTests =
                   Arguments = []
                   WorkingDirectory = "."
                   Timeout = TimeSpan.FromSeconds 10.0
-                  RequiredConstraints = [ "build"; "tests" ] }
+                  RequiredConstraints = [ "build"; "tests" ]
+                  MaxInconclusiveRetries = 2 }
 
             let result =
-                Evaluator.run spec workspace (Path.Combine(root, "artifacts", "evaluation.json")) CancellationToken.None
+                Evaluator.run
+                    spec
+                    workspace
+                    workspace
+                    (Path.Combine(root, "artifacts", "evaluation.json"))
+                    CancellationToken.None
                 |> Async.RunSynchronously
 
             match result with

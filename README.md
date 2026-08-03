@@ -23,6 +23,8 @@ Codex discovery checks `FSHARNESS_CODEX_PATH` first, then `PATH`, then the newes
 
 Setup performs source inspection, `codex --version`, `codex login status`, `codex doctor --json`, bundled model discovery, private Git import, and baseline evaluation before Start is enabled. The default model request is `gpt-5.6-luna` with reasoning effort `max`; unsupported model/effort pairs fail closed.
 
+Setup can load and save schema-v2 experiment JSON through the native file picker. Loading restores the complete campaign configuration, including paired comparison, seed patches, evaluator timeout/retries, prompt limits, reasoning effort, and run budgets; the repository must then be inspected again so the app pins its current committed HEAD. Saving requires a successful repository inspection because `baseCommit` is part of the reproducible experiment file. Files saved by the app can be passed directly to the headless `fsharness run --config` command.
+
 ## Evaluator protocol
 
 The evaluator is launched directly, without a shell and without inherited secret environment variables. Its working directory is relative to the clean candidate worktree. `FSHARNESS_RESULT_PATH` is the only result destination. Exit zero means evaluation completed, even if quality constraints failed. The evaluator must atomically write:
@@ -53,6 +55,14 @@ The executable and argument list are passed with `ProcessStartInfo.ArgumentList`
 - Raw JSONL, stderr, prompts, diffs/evaluator results, SQLite records, and private Git lineage remain in app-owned storage.
 
 Missing terminal token usage is not interpreted as zero: the active candidate is evaluated and then the run pauses because the remaining budget cannot be enforced. Raw and uncached totals use the Codex counters without double-counting cached input or reasoning output.
+
+## Evolution view
+
+The **Evolution** page lets you select any persisted run and inspect its retained frontier over time. The lineage view places the baseline and accepted candidates on the central trunk; rejected, failed, inconclusive, and cancelled candidates remain visible as terminal side branches. Seed patches appear before Codex attempts.
+
+The metric view uses the configured metric's raw values and overlays the retained-score line, which advances only when a candidate is accepted. Selecting a node shows its outcome, commit, metric, timestamp, and any persisted experiment summary. New runs populate the SQLite experiment projection as they execute and refresh the page live through the runtime lineage event.
+
+Older runs are reconstructed best-effort from their journal events, evaluations, memories, and private Git refs. If an older run is missing metadata or its private repository, the page shows the available partial lineage and a warning rather than changing the stored run. The visualization describes FsHarness's existing single-frontier ratchet; it does not schedule independent branches.
 
 ## Hypothesis benchmark
 

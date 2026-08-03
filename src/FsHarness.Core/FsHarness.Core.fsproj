@@ -5,6 +5,7 @@
     <Compile Include="Benchmark.fs" />
     <Compile Include="Evaluation.fs" />
     <Compile Include="Prompt.fs" />
+    <Compile Include="Evolution.fs" />
     <Compile Include="StateMachine.fs" />
     <Compile Include="Ports.fs" />
   </ItemGroup>

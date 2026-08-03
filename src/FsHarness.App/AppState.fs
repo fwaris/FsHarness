@@ -10,6 +10,7 @@ open FsHarness.Infrastructure
 type Page =
     | Setup
     | CurrentRun
+    | Evolution
     | History
     | Settings
 
@@ -17,17 +18,27 @@ type DraftConfig =
     { SourcePath: string
       Objective: string
       EditablePaths: string
+      SeedPatches: string list
       EvaluatorExecutable: string
       EvaluatorArguments: string
       EvaluatorWorkingDirectory: string
+      EvaluatorTimeout: TimeSpan
+      MaxInconclusiveRetries: int
       RequiredConstraints: string
       MetricName: string
       MetricDirection: MetricDirection
       MinDelta: string
+      MetricTarget: decimal option
+      MetricComparison: MetricComparison
       ModelId: string
       ReasoningEffort: ReasoningEffort
+      PromptProfile: PromptProfile
       MaxExperiments: string
       MaxRawTokens: string
+      MaxDuration: TimeSpan
+      CodexTimeout: TimeSpan
+      MaxConsecutiveNonImprovements: int
+      MaxConsecutiveFailures: int
       PromotionMode: PromotionMode }
 
 type Model =
@@ -39,7 +50,14 @@ type Model =
       Run: RunState option
       Activities: RuntimeActivity list
       History: HistoryEvent list
+      EvolutionRuns: EvolutionRunSummary list
+      SelectedEvolutionRun: RunId option
+      Evolution: EvolutionSnapshot option
+      SelectedEvolutionNode: EvolutionNodeId option
+      EvolutionBusy: bool
+      EvolutionRequestId: int
       Busy: bool
+      ExperimentFile: string option
       Error: string option }
 
 type DraftField =
@@ -59,6 +77,12 @@ type DraftField =
 type Msg =
     | Navigate of Page
     | DraftChanged of DraftField * string
+    | BrowseRepository
+    | RepositoryFolderSelected of Result<string option, string>
+    | LoadExperiment
+    | ExperimentLoaded of Result<(string * HarnessConfig) option, string>
+    | SaveExperiment
+    | ExperimentSaved of Result<string option, string>
     | ToggleMetricDirection
     | TogglePromotionMode
     | InspectRepository
@@ -76,6 +100,13 @@ type Msg =
     | ReviewCompleted of Result<unit, HarnessError>
     | RuntimeStateChanged of RunState
     | RuntimeActivityReceived of RuntimeActivity
+    | RuntimeEvolutionChanged of RunId
+    | LoadEvolutionRuns
+    | EvolutionRunsLoaded of Result<EvolutionRunSummary list, HarnessError>
+    | SelectEvolutionRun of RunId
+    | EvolutionLoaded of int * RunId * Result<EvolutionSnapshot, HarnessError>
+    | RefreshEvolution
+    | SelectEvolutionNode of EvolutionNodeId
     | RefreshHistory
     | HistoryLoaded of Result<HistoryEvent list, HarnessError>
     | ClearError
@@ -91,23 +122,61 @@ module AppState =
         { SourcePath = Directory.GetCurrentDirectory()
           Objective = "Improve the primary metric with one small, maintainable change while preserving all constraints."
           EditablePaths = "src/**;tests/**"
+          SeedPatches = []
           EvaluatorExecutable = "dotnet"
           EvaluatorArguments = "run\n--project\n.fsharness/Evaluator.fsproj\n--configuration\nRelease\n--no-restore"
           EvaluatorWorkingDirectory = "."
+          EvaluatorTimeout = TimeSpan.FromMinutes 15.0
+          MaxInconclusiveRetries = 2
           RequiredConstraints = "build;tests"
           MetricName = "primary"
           MetricDirection = Maximize
           MinDelta = "0"
+          MetricTarget = None
+          MetricComparison = RetainedScore
           ModelId = Defaults.model.Id
           ReasoningEffort = Defaults.model.Effort
+          PromptProfile = Defaults.promptProfile
           MaxExperiments = string Defaults.budgets.MaxExperiments
           MaxRawTokens = string Defaults.budgets.MaxRawTokens
+          MaxDuration = Defaults.budgets.MaxDuration
+          CodexTimeout = Defaults.budgets.CodexTimeout
+          MaxConsecutiveNonImprovements = Defaults.budgets.MaxConsecutiveNonImprovements
+          MaxConsecutiveFailures = Defaults.budgets.MaxConsecutiveFailures
           PromotionMode = AutoWhenStrictlyBetter }
+
+    let private draftFromConfig (config: HarnessConfig) =
+        { SourcePath = config.SourcePath
+          Objective = config.Objective
+          EditablePaths = String.concat ";" config.EditablePaths
+          SeedPatches = config.SeedPatches
+          EvaluatorExecutable = config.Evaluator.Executable
+          EvaluatorArguments = String.concat Environment.NewLine config.Evaluator.Arguments
+          EvaluatorWorkingDirectory = config.Evaluator.WorkingDirectory
+          EvaluatorTimeout = config.Evaluator.Timeout
+          MaxInconclusiveRetries = config.Evaluator.MaxInconclusiveRetries
+          RequiredConstraints = String.concat ";" config.Evaluator.RequiredConstraints
+          MetricName = config.Metric.Name
+          MetricDirection = config.Metric.Direction
+          MinDelta = string config.Metric.MinDelta
+          MetricTarget = config.Metric.Target
+          MetricComparison = config.Metric.Comparison
+          ModelId = config.Model.Id
+          ReasoningEffort = config.Model.Effort
+          PromptProfile = config.PromptProfile
+          MaxExperiments = string config.Budgets.MaxExperiments
+          MaxRawTokens = string config.Budgets.MaxRawTokens
+          MaxDuration = config.Budgets.MaxDuration
+          CodexTimeout = config.Budgets.CodexTimeout
+          MaxConsecutiveNonImprovements = config.Budgets.MaxConsecutiveNonImprovements
+          MaxConsecutiveFailures = config.Budgets.MaxConsecutiveFailures
+          PromotionMode = config.PromotionMode }
 
     let private subscribe (runtime: HarnessRuntime) =
         [ fun dispatch ->
               runtime.StateChanged.Add(RuntimeStateChanged >> dispatch)
-              runtime.Activity.Add(RuntimeActivityReceived >> dispatch) ]
+              runtime.Activity.Add(RuntimeActivityReceived >> dispatch)
+              runtime.EvolutionChanged.Add(RuntimeEvolutionChanged >> dispatch) ]
 
     let init (runtime: HarnessRuntime) =
         { Page = Setup
@@ -118,7 +187,14 @@ module AppState =
           Run = runtime.State
           Activities = []
           History = []
+          EvolutionRuns = []
+          SelectedEvolutionRun = None
+          Evolution = None
+          SelectedEvolutionNode = None
+          EvolutionBusy = false
+          EvolutionRequestId = 0
           Busy = false
+          ExperimentFile = None
           Error = None },
         subscribe runtime
 
@@ -169,24 +245,32 @@ module AppState =
                       BaseCommit = repository.Head
                       Objective = model.Draft.Objective
                       EditablePaths = splitSemicolon model.Draft.EditablePaths
+                      SeedPatches = model.Draft.SeedPatches
                       Evaluator =
                         { Executable = model.Draft.EvaluatorExecutable
                           Arguments = splitLines model.Draft.EvaluatorArguments
                           WorkingDirectory = model.Draft.EvaluatorWorkingDirectory
-                          Timeout = TimeSpan.FromMinutes 15.0
-                          RequiredConstraints = splitSemicolon model.Draft.RequiredConstraints }
+                          Timeout = model.Draft.EvaluatorTimeout
+                          RequiredConstraints = splitSemicolon model.Draft.RequiredConstraints
+                          MaxInconclusiveRetries = model.Draft.MaxInconclusiveRetries }
                       Metric =
                         { Name = model.Draft.MetricName
                           Direction = model.Draft.MetricDirection
                           MinDelta = minDelta
-                          Target = None }
+                          Target = model.Draft.MetricTarget
+                          Comparison = model.Draft.MetricComparison }
                       Model =
                         { Id = model.Draft.ModelId
                           Effort = model.Draft.ReasoningEffort }
+                      PromptProfile = model.Draft.PromptProfile
                       Budgets =
                         { Defaults.budgets with
                             MaxExperiments = maxExperiments
-                            MaxRawTokens = maxRawTokens }
+                            MaxRawTokens = maxRawTokens
+                            MaxDuration = model.Draft.MaxDuration
+                            CodexTimeout = model.Draft.CodexTimeout
+                            MaxConsecutiveNonImprovements = model.Draft.MaxConsecutiveNonImprovements
+                            MaxConsecutiveFailures = model.Draft.MaxConsecutiveFailures }
                       PromotionMode = model.Draft.PromotionMode }
 
                 match HarnessConfig.validate config with
@@ -194,22 +278,93 @@ module AppState =
                 | Error errors -> Error(String.concat " " errors)
             | _ -> Error "Min delta, maximum experiments, and raw-token budget must be valid numbers."
 
-    let update (runtime: HarnessRuntime) (message: Msg) (model: Model) =
+    let update
+        (runtime: HarnessRuntime)
+        (pickRepositoryFolder: unit -> Async<Result<string option, string>>)
+        (loadExperiment: unit -> Async<Result<(string * HarnessConfig) option, string>>)
+        (saveExperiment: HarnessConfig -> Async<Result<string option, string>>)
+        (message: Msg)
+        (model: Model)
+        =
+        let loadEvolution runId requestId =
+            Cmd.OfAsync.perform (fun () -> runtime.LoadEvolution(runId, CancellationToken.None)) () (fun result ->
+                EvolutionLoaded(requestId, runId, result))
+
         match message with
         | Navigate page ->
             let command =
-                if page = History then
-                    Cmd.ofMsg RefreshHistory
-                else
-                    Cmd.none
+                if page = History then Cmd.ofMsg RefreshHistory
+                elif page = Evolution then Cmd.ofMsg LoadEvolutionRuns
+                else Cmd.none
 
             { model with Page = page }, command
         | DraftChanged(field, value) ->
-            { model with
-                Draft = updateDraft field value model.Draft
-                Prepared = None
-                Error = None },
-            Cmd.none
+            let updated =
+                { model with
+                    Draft = updateDraft field value model.Draft
+                    Prepared = None
+                    ExperimentFile = None
+                    Error = None }
+
+            match field with
+            | DraftField.SourcePath -> { updated with Repository = None }, Cmd.none
+            | _ -> updated, Cmd.none
+        | BrowseRepository ->
+            { model with Error = None },
+            Cmd.OfAsync.perform (fun () -> pickRepositoryFolder ()) () RepositoryFolderSelected
+        | RepositoryFolderSelected result ->
+            match result with
+            | Ok(Some path) ->
+                { model with
+                    Draft = { model.Draft with SourcePath = path }
+                    Repository = None
+                    Prepared = None
+                    ExperimentFile = None
+                    Error = None },
+                Cmd.none
+            | Ok None -> model, Cmd.none
+            | Error error -> { model with Error = Some error }, Cmd.none
+        | LoadExperiment ->
+            { model with Busy = true; Error = None },
+            Cmd.OfAsync.perform (fun () -> loadExperiment ()) () ExperimentLoaded
+        | ExperimentLoaded result ->
+            match result with
+            | Ok(Some(path, config)) ->
+                { model with
+                    Draft = draftFromConfig config
+                    Repository = None
+                    CodexHealth = None
+                    Prepared = None
+                    Busy = false
+                    ExperimentFile = Some path
+                    Error = None },
+                Cmd.none
+            | Ok None -> { model with Busy = false }, Cmd.none
+            | Error error ->
+                { model with
+                    Busy = false
+                    Error = Some error },
+                Cmd.none
+        | SaveExperiment ->
+            match createConfig model with
+            | Error error -> { model with Error = Some error }, Cmd.none
+            | Ok config ->
+                { model with Busy = true; Error = None },
+                Cmd.OfAsync.perform (fun () -> saveExperiment config) () ExperimentSaved
+        | ExperimentSaved result ->
+            match result with
+            | Ok(Some path) ->
+                { model with
+                    Busy = false
+                    ExperimentFile = Some path
+                    Error = None },
+                Cmd.none
+            | Ok None -> { model with Busy = false }, Cmd.none
+            | Error error ->
+                { model with
+                    Busy = false
+                    Error = Some error },
+                Cmd.none
         | ToggleMetricDirection ->
             let direction =
                 match model.Draft.MetricDirection with
@@ -327,10 +482,123 @@ module AppState =
                     Busy = false
                     Error = Some(errorText error) },
                 Cmd.none
-        | RuntimeStateChanged run -> { model with Run = Some run }, Cmd.none
+        | RuntimeStateChanged run ->
+            let shouldRefresh =
+                model.Page = Evolution && model.SelectedEvolutionRun = Some run.Id
+
+            let nextRequest =
+                if shouldRefresh then
+                    model.EvolutionRequestId + 1
+                else
+                    model.EvolutionRequestId
+
+            let command =
+                if shouldRefresh then
+                    loadEvolution run.Id nextRequest
+                else
+                    Cmd.none
+
+            { model with
+                Run = Some run
+                EvolutionRequestId = nextRequest
+                EvolutionBusy = shouldRefresh || model.EvolutionBusy },
+            command
         | RuntimeActivityReceived event ->
             { model with
                 Activities = event :: model.Activities |> List.truncate 2_000 },
+            Cmd.none
+        | RuntimeEvolutionChanged runId ->
+            if model.Page = Evolution && model.SelectedEvolutionRun = Some runId then
+                let requestId = model.EvolutionRequestId + 1
+
+                { model with
+                    EvolutionRequestId = requestId
+                    EvolutionBusy = true },
+                loadEvolution runId requestId
+            else
+                model, Cmd.none
+        | LoadEvolutionRuns ->
+            { model with
+                EvolutionBusy = true
+                Error = None },
+            Cmd.OfAsync.perform (fun () -> runtime.ListEvolutionRuns CancellationToken.None) () EvolutionRunsLoaded
+        | EvolutionRunsLoaded result ->
+            match result with
+            | Error error ->
+                { model with
+                    EvolutionBusy = false
+                    Error = Some(errorText error) },
+                Cmd.none
+            | Ok runs ->
+                let selected =
+                    model.SelectedEvolutionRun
+                    |> Option.filter (fun id -> runs |> List.exists (fun item -> item.Id = id))
+                    |> Option.orElseWith (fun () ->
+                        model.Run
+                        |> Option.map _.Id
+                        |> Option.filter (fun id -> runs |> List.exists (fun item -> item.Id = id)))
+                    |> Option.orElseWith (fun () -> runs |> List.tryHead |> Option.map _.Id)
+
+                let next =
+                    { model with
+                        EvolutionRuns = runs
+                        SelectedEvolutionRun = selected
+                        Evolution = None
+                        SelectedEvolutionNode = None
+                        EvolutionBusy = selected.IsSome
+                        Error = None }
+
+                match selected with
+                | Some runId ->
+                    let requestId = model.EvolutionRequestId + 1
+
+                    { next with
+                        EvolutionRequestId = requestId },
+                    loadEvolution runId requestId
+                | None -> { next with EvolutionBusy = false }, Cmd.none
+        | SelectEvolutionRun runId ->
+            let requestId = model.EvolutionRequestId + 1
+
+            { model with
+                SelectedEvolutionRun = Some runId
+                Evolution = None
+                SelectedEvolutionNode = None
+                EvolutionBusy = true
+                EvolutionRequestId = requestId
+                Error = None },
+            loadEvolution runId requestId
+        | EvolutionLoaded(requestId, runId, result) when requestId = model.EvolutionRequestId ->
+            match result with
+            | Ok snapshot when model.SelectedEvolutionRun = Some runId ->
+                { model with
+                    EvolutionRuns =
+                        model.EvolutionRuns
+                        |> List.map (fun run -> if run.Id = runId then snapshot.Run else run)
+                    Evolution = Some snapshot
+                    EvolutionBusy = false
+                    Error = None },
+                Cmd.none
+            | Error error when model.SelectedEvolutionRun = Some runId ->
+                { model with
+                    Evolution = None
+                    EvolutionBusy = false
+                    Error = Some(errorText error) },
+                Cmd.none
+            | _ -> model, Cmd.none
+        | EvolutionLoaded _ -> model, Cmd.none
+        | RefreshEvolution ->
+            match model.SelectedEvolutionRun with
+            | None -> model, Cmd.ofMsg LoadEvolutionRuns
+            | Some runId ->
+                let requestId = model.EvolutionRequestId + 1
+
+                { model with
+                    EvolutionRequestId = requestId
+                    EvolutionBusy = true },
+                loadEvolution runId requestId
+        | SelectEvolutionNode nodeId ->
+            { model with
+                SelectedEvolutionNode = Some nodeId },
             Cmd.none
         | RefreshHistory -> { model with Busy = true }, Cmd.ofMsg (HistoryLoaded(runtime.History 500))
         | HistoryLoaded result ->

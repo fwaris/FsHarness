@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <Compile Include="FileSystem.fs" />
+    <Compile Include="ConfigFile.fs" />
     <Compile Include="ProcessRunner.fs" />
     <Compile Include="GitStore.fs" />
     <Compile Include="Evaluator.fs" />

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../FsHarness.Core/FsHarness.Core.fsproj" />
+    <ProjectReference Include="../FsHarness.Codex/FsHarness.Codex.fsproj" />
+    <ProjectReference Include="../FsHarness.Infrastructure/FsHarness.Infrastructure.fsproj" />
+  </ItemGroup>
+</Project>

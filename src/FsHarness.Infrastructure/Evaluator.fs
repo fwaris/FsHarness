@@ -65,6 +65,16 @@ module Evaluator =
                         None)
                 |> Option.defaultValue ""
 
+            let status =
+                match schemaVersion, tryProperty "status" root with
+                | Some 1, _ -> Some EvaluationStatus.Complete
+                | Some 2, Some value when value.ValueKind = JsonValueKind.String ->
+                    match value.GetString() with
+                    | "complete" -> Some EvaluationStatus.Complete
+                    | "inconclusive" -> Some EvaluationStatus.Inconclusive
+                    | _ -> None
+                | _ -> None
+
             let evidence =
                 match tryProperty "evidence" root with
                 | Some values when values.ValueKind = JsonValueKind.Array ->
@@ -77,16 +87,17 @@ module Evaluator =
                     |> List.ofSeq
                 | _ -> []
 
-            match schemaVersion with
-            | Some 1 when not (Map.isEmpty metrics) ->
+            match schemaVersion, status with
+            | Some version, Some parsedStatus when (version = 1 || version = 2) && not (Map.isEmpty metrics) ->
                 Ok
-                    { SchemaVersion = 1
+                    { SchemaVersion = version
+                      Status = parsedStatus
                       Constraints = constraints
                       Metrics = metrics
                       Summary = summary
                       Evidence = evidence }
-            | Some version -> Error $"Unsupported evaluator schema {version} or missing metrics."
-            | None -> Error "Evaluator result did not contain an integer schemaVersion."
+            | Some version, _ -> Error $"Unsupported evaluator schema {version}, status, or metrics."
+            | None, _ -> Error "Evaluator result did not contain an integer schemaVersion."
         with exceptionValue ->
             Error exceptionValue.Message
 
@@ -101,7 +112,13 @@ module Evaluator =
         else
             executable
 
-    let run (spec: EvaluatorSpec) (worktree: string) (resultPath: string) (cancellationToken: CancellationToken) =
+    let run
+        (spec: EvaluatorSpec)
+        (frontierWorktree: string)
+        (worktree: string)
+        (resultPath: string)
+        (cancellationToken: CancellationToken)
+        =
         async {
             let evaluationRoot = Path.GetFullPath worktree
 
@@ -133,6 +150,8 @@ module Evaluator =
                     let environment =
                         SanitizedEnvironment.core ()
                         |> Map.add "FSHARNESS_RESULT_PATH" resultPath
+                        |> Map.add "FSHARNESS_CANDIDATE_PATH" evaluationRoot
+                        |> Map.add "FSHARNESS_FRONTIER_PATH" (Path.GetFullPath frontierWorktree)
                         |> Map.add "GIT_OPTIONAL_LOCKS" "0"
                         |> Map.add "GIT_TERMINAL_PROMPT" "0"
 

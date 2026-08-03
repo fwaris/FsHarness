@@ -9,6 +9,18 @@ open FsHarness.Infrastructure
 open Xunit
 
 module GitStoreTests =
+    let private deleteTree path =
+        if Directory.Exists path then
+            Directory.EnumerateFileSystemEntries(path, "*", SearchOption.AllDirectories)
+            |> Seq.iter (fun entry ->
+                try
+                    File.SetAttributes(entry, FileAttributes.Normal)
+                with _ ->
+                    ())
+
+            File.SetAttributes(path, FileAttributes.Normal)
+            Directory.Delete(path, true)
+
     let private getResult result =
         match result with
         | Ok value -> value
@@ -62,7 +74,7 @@ module GitStoreTests =
         try
             action path
         finally
-            Directory.Delete(path, true)
+            deleteTree path
 
     [<Fact>]
     let ``candidate lineage never mutates dirty source and quarantines protected paths`` () =
@@ -163,3 +175,55 @@ module GitStoreTests =
                 |> Async.RunSynchronously
 
             Assert.True(Result.isError stale))
+
+    [<Fact>]
+    let ``protected seed patch applies only inside generation worktree`` () =
+        withTempDirectory (fun directory ->
+            let source = createRepository directory
+            let seedDirectory = Path.Combine(source, ".fsharness", "seeds")
+            Directory.CreateDirectory(seedDirectory) |> ignore
+
+            File.WriteAllText(
+                Path.Combine(seedDirectory, "score.patch"),
+                "diff --git a/src/score.txt b/src/score.txt\nindex 56a6051..d8263ee 100644\n--- a/src/score.txt\n+++ b/src/score.txt\n@@ -1 +1 @@\n-1\n\\ No newline at end of file\n+2\n\\ No newline at end of file\n"
+            )
+
+            runGit source [ "add"; ".fsharness/seeds/score.patch" ] |> ignore
+
+            runGit
+                source
+                [ "-c"
+                  "user.name=Fixture"
+                  "-c"
+                  "user.email=fixture@example.test"
+                  "commit"
+                  "--quiet"
+                  "-m"
+                  "seed" ]
+            |> ignore
+
+            let dataRoot = Path.Combine(directory, "data")
+            let port = GitStore.create dataRoot |> GitStore.port
+
+            let inspection =
+                port.InspectSource source CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let runId = RunId.create ()
+
+            port.CreateRun runId inspection CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            let workspace =
+                port.PrepareCandidate runId (ExperimentId.create ()) inspection.Head CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            port.ApplySeedPatch workspace ".fsharness/seeds/score.patch" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            Assert.Equal("2", File.ReadAllText(Path.Combine(workspace.GenerationPath, "src", "score.txt")))
+            Assert.Equal("1", File.ReadAllText(Path.Combine(source, "src", "score.txt"))))

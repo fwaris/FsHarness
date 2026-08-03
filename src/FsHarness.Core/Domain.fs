@@ -102,6 +102,62 @@ type MemorySummary =
       Metric: decimal option
       Summary: ExperimentSummary }
 
+type EvolutionNodeId =
+    | BaselineNode
+    | ExperimentNode of ExperimentId
+
+[<RequireQualifiedAccess>]
+type EvolutionNodeKind =
+    | Baseline
+    | Seed
+    | Candidate
+
+[<RequireQualifiedAccess>]
+type EvolutionOutcome =
+    | Active of string
+    | Accepted
+    | Rejected of string
+    | Failed of string
+    | Inconclusive of string
+    | Cancelled
+    | Unknown of string
+
+type EvolutionRunSummary =
+    { Id: RunId
+      SourcePath: string
+      Status: string
+      CreatedAt: DateTimeOffset
+      UpdatedAt: DateTimeOffset
+      MetricName: string
+      Direction: MetricDirection
+      BaselineCommit: CommitOid option
+      BaselineScore: decimal option
+      FrontierScore: decimal option
+      AttemptCount: int
+      AcceptedCount: int }
+
+type EvolutionNode =
+    { Id: EvolutionNodeId
+      Kind: EvolutionNodeKind
+      Sequence: int
+      Parent: CommitOid option
+      Commit: CommitOid option
+      Outcome: EvolutionOutcome
+      Metric: decimal option
+      RetainedScore: decimal option
+      Summary: ExperimentSummary option
+      EvaluationSummary: string option
+      Usage: TokenUsage option
+      StartedAt: DateTimeOffset
+      UpdatedAt: DateTimeOffset
+      Label: string }
+
+type EvolutionSnapshot =
+    { Run: EvolutionRunSummary
+      Nodes: EvolutionNode list
+      Frontier: CommitOid option
+      Warnings: string list }
+
 type HarnessErrorCategory =
     | Configuration
     | Codex

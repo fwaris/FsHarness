@@ -5,16 +5,31 @@ open System.IO
 open System.Security.Cryptography
 open System.Text
 open System.Text.RegularExpressions
+open FsHarness.Core
 
 [<RequireQualifiedAccess>]
 module DataPaths =
+    let private compactIdentifier (value: string) =
+        if value.Length <= 12 then value else value.Substring(0, 12)
+
+    let private runKey runId = RunId.text runId |> compactIdentifier
+
+    let private experimentKey experimentId =
+        ExperimentId.text experimentId |> compactIdentifier
+
     let root () =
         match Environment.GetEnvironmentVariable "FSHARNESS_DATA_DIR" with
         | value when not (String.IsNullOrWhiteSpace value) -> Path.GetFullPath value
         | _ -> Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FsHarness")
 
     let runRoot root runId =
-        Path.Combine(root, "runs", FsHarness.Core.RunId.text runId)
+        let compact = Path.Combine(root, "runs", runKey runId)
+        let legacy = Path.Combine(root, "runs", RunId.text runId)
+
+        if Directory.Exists compact || not (Directory.Exists legacy) then
+            compact
+        else
+            legacy
 
     let repository root runId =
         Path.Combine(runRoot root runId, "repo.git")
@@ -24,6 +39,15 @@ module DataPaths =
 
     let artifacts root runId =
         Path.Combine(runRoot root runId, "artifacts")
+
+    let experiment root runId experimentId =
+        let compact = Path.Combine(worktrees root runId, experimentKey experimentId)
+        let legacy = Path.Combine(worktrees root runId, ExperimentId.text experimentId)
+
+        if Directory.Exists compact || not (Directory.Exists legacy) then
+            compact
+        else
+            legacy
 
     let projectLock root sourcePath =
         let canonical = Path.GetFullPath(sourcePath)
