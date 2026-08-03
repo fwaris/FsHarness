@@ -167,7 +167,10 @@ module SqliteStore =
     let private addParameter (command: SqliteCommand) name value =
         let parameter = command.CreateParameter()
         parameter.ParameterName <- name
-        parameter.Value <- value
+        // Microsoft.Data.Sqlite requires DBNull.Value for SQL NULL parameters;
+        // assigning a literal null leaves the parameter unbound and drops the
+        // baseline experiment whose parent is intentionally absent.
+        parameter.Value <- if isNull (box value) then box DBNull.Value else box value
         command.Parameters.Add parameter |> ignore
 
     let private serializeConfig (config: HarnessConfig) =

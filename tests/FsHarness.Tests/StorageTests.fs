@@ -136,6 +136,35 @@ module StorageTests =
             Assert.Equal("Accepted", record.Outcome))
 
     [<Fact>]
+    let ``baseline lineage record allows a missing parent`` () =
+        withTempDirectory (fun directory ->
+            let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
+
+            SqliteStore.initialize store CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let runId = RunId.create ()
+            let experimentId = ExperimentId.create ()
+            let baseline = CommitOid.create (String('c', 40))
+
+            SqliteStore.beginExperiment store runId experimentId 0 None "Baseline" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            SqliteStore.updateExperimentCandidate store experimentId baseline CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let record = SqliteStore.loadExperiments store runId |> getResult |> Assert.Single
+            Assert.Equal(0, record.Sequence)
+            Assert.True(record.Parent.IsNone)
+            Assert.Equal(Some baseline, record.Candidate))
+
+    [<Fact>]
     let ``persisted run appears in evolution run listing`` () =
         withTempDirectory (fun directory ->
             let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
