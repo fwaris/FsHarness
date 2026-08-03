@@ -383,6 +383,7 @@ module Views =
         | Evaluating -> "Verify"
         | Deciding -> "Decide"
         | AcceptPending -> "Persist"
+        | Promoting -> "Promote"
         | AwaitingReview -> "Review"
 
     let private metricCard (label: string) (value: string) (detail: string) : IView =

@@ -3,6 +3,7 @@
 .DS_Store
 .idea/
 .vscode/
+temp/
 .fsharness-data/
 .fsharness-cosmos3/
 r/

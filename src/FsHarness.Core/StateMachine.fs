@@ -9,6 +9,7 @@ type ExperimentPhase =
     | Evaluating
     | Deciding
     | AcceptPending
+    | Promoting
     | AwaitingReview
 
 type ExperimentOutcome =
@@ -61,20 +62,21 @@ type RunState =
 
 type RunEvent =
     | StartRequested of ExperimentId * DateTimeOffset
-    | WorktreePrepared
-    | GenerationCompleted of threadId: string * usage: TokenUsage option * summary: ExperimentSummary
-    | CandidateCaptured of CommitOid
-    | ProtectedPathDetected of string list
-    | EvaluationCompleted of EvaluationResult
-    | EvaluationInconclusive of string
-    | FrontierAdvanced
-    | ReviewAccepted
-    | ReviewRejected
-    | ExperimentFailed of HarnessError
+    | WorktreePrepared of ExperimentId
+    | GenerationCompleted of ExperimentId * threadId: string * usage: TokenUsage option * summary: ExperimentSummary
+    | CandidateCaptured of ExperimentId * CommitOid
+    | ProtectedPathDetected of ExperimentId * string list
+    | EvaluationCompleted of ExperimentId * EvaluationResult
+    | EvaluationInconclusive of ExperimentId * string
+    | PromotionStarted of ExperimentId
+    | FrontierAdvanced of ExperimentId
+    | ReviewAccepted of ExperimentId
+    | ReviewRejected of ExperimentId
+    | ExperimentFailed of ExperimentId * HarnessError
     | PauseRequested
     | ResumeRequested
     | StopRequested
-    | CancellationCompleted
+    | CancellationCompleted of ExperimentId
 
 type RunEffect =
     | PrepareCandidate of ExperimentId * CommitOid
@@ -161,47 +163,64 @@ module RunState =
                     PreviousEvaluation = previousEvaluation
                     Current = None }
 
-        match nextState.Status, budgetStopReason now nextState with
-        | PauseAfterCurrent, _ ->
+        match
+            nextState.Status,
+            Evaluation.targetReached nextState.Config.Metric nextState.FrontierScore,
+            budgetStopReason now nextState
+        with
+        | PauseAfterCurrent, _, _ ->
             { nextState with
                 Status = Paused "Pause requested." },
             [ PublishState ]
-        | Stopping, _ ->
+        | Stopping, _, _ ->
             { nextState with
                 Status = Completed "Stopped by user." },
             [ PublishState ]
-        | _, Some reason ->
+        | _, true, _ ->
+            { nextState with
+                Status = Completed "Metric target reached." },
+            [ PublishState ]
+        | _, _, Some reason ->
             { nextState with
                 Status = Completed reason },
             [ PublishState ]
-        | _, None -> { nextState with Status = Ready }, [ PublishState; ScheduleNext ]
+        | _, _, None -> { nextState with Status = Ready }, [ PublishState; ScheduleNext ]
 
     let transition now event state =
         match event, state.Status, state.Current with
         | StartRequested(experimentId, startedAt), Ready, None ->
-            let active =
-                { Id = experimentId
-                  Sequence = state.Attempted + 1
-                  Parent = state.Frontier
-                  Phase = PreparingWorktree
-                  Candidate = None
-                  ThreadId = None
-                  Summary = None
-                  Evaluation = None
-                  Usage = None
-                  StartedAt = startedAt }
+            match Evaluation.targetReached state.Config.Metric state.FrontierScore, budgetStopReason now state with
+            | true, _ ->
+                { state with
+                    Status = Completed "Metric target reached." },
+                [ PublishState ]
+            | _, Some reason -> { state with Status = Completed reason }, [ PublishState ]
+            | _ ->
+                let active =
+                    { Id = experimentId
+                      Sequence = state.Attempted + 1
+                      Parent = state.Frontier
+                      Phase = PreparingWorktree
+                      Candidate = None
+                      ThreadId = None
+                      Summary = None
+                      Evaluation = None
+                      Usage = None
+                      StartedAt = startedAt }
 
-            { state with
-                Status = Running
-                Current = Some active
-                Attempted = state.Attempted + 1 },
-            [ PrepareCandidate(experimentId, state.Frontier); PublishState ]
-        | WorktreePrepared, Running, Some active when active.Phase = PreparingWorktree ->
+                { state with
+                    Status = Running
+                    Current = Some active
+                    Attempted = state.Attempted + 1 },
+                [ PrepareCandidate(experimentId, state.Frontier); PublishState ]
+        | WorktreePrepared experimentId, (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = PreparingWorktree
+            ->
             { state with
                 Current = Some { active with Phase = Generating } },
             [ LaunchCodex active.Id; PublishState ]
-        | GenerationCompleted(threadId, usage, summary), (Running | PauseAfterCurrent), Some active when
-            active.Phase = Generating
+        | GenerationCompleted(experimentId, threadId, usage, summary), (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = Generating
             ->
             let nextUsage, usageKnown =
                 match usage with
@@ -225,7 +244,9 @@ module RunState =
                             Summary = Some summary
                             Usage = usage } },
             [ CaptureCandidate active.Id; PublishState ]
-        | CandidateCaptured candidate, (Running | PauseAfterCurrent), Some active when active.Phase = SnapshotPrepared ->
+        | CandidateCaptured(experimentId, candidate), (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = SnapshotPrepared
+            ->
             { state with
                 Current =
                     Some
@@ -233,15 +254,21 @@ module RunState =
                             Phase = Evaluating
                             Candidate = Some candidate } },
             [ RunEvaluator(active.Id, candidate); PublishState ]
-        | ProtectedPathDetected paths, _, Some active ->
+        | ProtectedPathDetected(experimentId, paths), (Running | PauseAfterCurrent | Stopping), Some active when
+            active.Id = experimentId
+            ->
             finishExperiment now (InvalidProtectedPath paths) state
             |> fun (next, effects) -> next, PersistRejected(active.Id, InvalidProtectedPath paths) :: effects
-        | EvaluationInconclusive reason, _, Some active when active.Phase = Evaluating ->
+        | EvaluationInconclusive(experimentId, reason), _, Some active when
+            active.Id = experimentId && active.Phase = Evaluating
+            ->
             let next, _ = finishExperiment now (InconclusiveEvaluation reason) state
 
             { next with Status = Paused reason },
             [ PersistRejected(active.Id, InconclusiveEvaluation reason); PublishState ]
-        | EvaluationCompleted evaluation, (Running | PauseAfterCurrent), Some active when active.Phase = Evaluating ->
+        | EvaluationCompleted(experimentId, evaluation), (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = Evaluating
+            ->
             let evaluatedState =
                 { state with
                     Current =
@@ -285,7 +312,13 @@ module RunState =
                     { state with
                         Status = RecoveryRequired error },
                     [ PublishState ]
-        | FrontierAdvanced, _, Some active when active.Phase = AcceptPending ->
+        | PromotionStarted experimentId, (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = AcceptPending
+            ->
+            { state with
+                Current = Some { active with Phase = Promoting } },
+            [ PublishState ]
+        | FrontierAdvanced experimentId, _, Some active when active.Id = experimentId && active.Phase = Promoting ->
             match active.Candidate, active.Evaluation with
             | Some candidate, Some evaluation ->
                 let score = evaluation.Metrics[state.Config.Metric.Name]
@@ -298,28 +331,35 @@ module RunState =
                 { state with
                     Status = RecoveryRequired error },
                 [ PublishState ]
-        | ReviewAccepted, _, Some active when active.Phase = AwaitingReview ->
+        | ReviewAccepted experimentId, (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = AwaitingReview
+            ->
             match active.Candidate with
             | Some candidate ->
                 { state with
                     Current = Some { active with Phase = AcceptPending } },
                 [ PersistAccepted(active.Id, candidate, active.Parent); PublishState ]
             | None -> state, []
-        | ReviewRejected, _, Some active when active.Phase = AwaitingReview ->
+        | ReviewRejected experimentId, (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = AwaitingReview
+            ->
             finishExperiment now RejectedByUser state
             |> fun (next, effects) -> next, PersistRejected(active.Id, RejectedByUser) :: effects
-        | ExperimentFailed error, _, Some active ->
+        | ExperimentFailed(experimentId, error), (Running | PauseAfterCurrent | Stopping), Some active when
+            active.Id = experimentId
+            ->
             finishExperiment now (Failed error) state
             |> fun (next, effects) -> next, PersistRejected(active.Id, Failed error) :: effects
         | PauseRequested, Running, _ ->
             { state with
                 Status = PauseAfterCurrent },
             [ PublishState ]
-        | ResumeRequested, Paused _, None -> { state with Status = Ready }, [ ScheduleNext; PublishState ]
+        | ResumeRequested, Paused _, None when state.UsageKnown ->
+            { state with Status = Ready }, [ ScheduleNext; PublishState ]
         | StopRequested, Running, Some active
         | StopRequested, PauseAfterCurrent, Some active ->
             { state with Status = Stopping }, [ CancelActiveProcess active.Id; PublishState ]
-        | CancellationCompleted, Stopping, Some active ->
+        | CancellationCompleted experimentId, Stopping, Some active when active.Id = experimentId ->
             finishExperiment now Cancelled state
             |> fun (next, effects) -> next, PersistRejected(active.Id, Cancelled) :: effects
         | StopRequested, Ready, None

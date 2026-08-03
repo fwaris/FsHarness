@@ -359,8 +359,7 @@ module Cli =
             match Environment.GetEnvironmentVariable "FSHARNESS_CODEX_WRITE_POLICY" with
             | value when String.Equals(value, "unrestricted", StringComparison.OrdinalIgnoreCase) ->
                 [ "--dangerously-bypass-approvals-and-sandbox" ]
-            | _ ->
-                [ "--sandbox"; "workspace-write" ]
+            | _ -> [ "--sandbox"; "workspace-write" ]
 
         [ "exec"
           "--json"

@@ -200,7 +200,7 @@ module GitStore =
         async {
             let repository = repoPath store runId
 
-            if not (File.Exists repository) then
+            if not (Directory.Exists repository) then
                 return
                     Error(
                         HarnessError.create
@@ -823,6 +823,27 @@ module GitStore =
                                 "Could not write patch export."
                             |> HarnessError.withDetail error.Message
                         )
+        }
+
+    let diffCommits store runId fromCommit toCommit cancellationToken =
+        async {
+            let! diff =
+                requireSuccess
+                    store
+                    "diff_commits"
+                    None
+                    [ "--git-dir"
+                      repoPath store runId
+                      "diff"
+                      "--binary"
+                      "--full-index"
+                      CommitOid.value fromCommit
+                      CommitOid.value toCommit ]
+                    None
+                    Map.empty
+                    cancellationToken
+
+            return diff
         }
 
     let port store =

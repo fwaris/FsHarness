@@ -43,9 +43,12 @@ module ConfigFile =
     let private optionalDecimal (name: string) (element: JsonElement) =
         tryProperty name element
         |> Option.bind (fun value ->
-            match value.TryGetDecimal() with
-            | true, parsed -> Some parsed
-            | false, _ -> None)
+            if value.ValueKind = JsonValueKind.Number then
+                match value.TryGetDecimal() with
+                | true, parsed -> Some parsed
+                | false, _ -> None
+            else
+                None)
 
     let private stringList (name: string) (element: JsonElement) =
         match tryProperty name element with
@@ -125,9 +128,9 @@ module ConfigFile =
               MaxEvaluationCharacters = requiredInt "maxEvaluationCharacters" profile }
         | _ -> raise (InvalidDataException "promptProfile must be an object.")
 
-    let read (path: string) =
+    let parse (contents: string) =
         try
-            use document = JsonDocument.Parse(File.ReadAllText path)
+            use document = JsonDocument.Parse contents
             let root = document.RootElement
 
             let schemaVersion =
@@ -180,6 +183,12 @@ module ConfigFile =
                     |> parsePromotion }
 
             HarnessConfig.validate config
+        with error ->
+            Error [ error.Message ]
+
+    let read (path: string) =
+        try
+            File.ReadAllText path |> parse
         with error ->
             Error [ error.Message ]
 

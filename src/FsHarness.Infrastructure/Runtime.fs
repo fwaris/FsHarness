@@ -2,11 +2,14 @@ namespace FsHarness.Infrastructure
 
 open System
 open System.IO
+open System.Runtime.InteropServices
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open FsHarness.Codex
 open FsHarness.Core
+
+exception RuntimePersistenceAbort of HarnessError
 
 type PreparedRunReport =
     { RunId: RunId
@@ -38,6 +41,15 @@ type CampaignSummary =
       TokensToFirstQualifiedImprovement: int64 option
       AcceptedPercentImprovement: decimal
       TokensPerAcceptedOnePercentSpeedup: decimal option }
+
+type RuntimeHealth =
+    { RunId: RunId
+      Healthy: bool
+      ArtifactCount: int
+      PendingOperationCount: int
+      WorkPlanCount: int
+      KnowledgeClaimCount: int
+      Issues: string list }
 
 type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     let root = Path.GetFullPath dataRoot
@@ -78,22 +90,56 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     let persistStatus (next: RunState) =
         SqliteStore.updateRunStatus sqlite next.Id (statusText next.Status) CancellationToken.None
         |> Async.RunSynchronously
-        |> ignore
+
+    let durableState next =
+        match persistStatus next with
+        | Ok() -> next, None
+        | Error error ->
+            { next with
+                Status = RecoveryRequired error },
+            Some error
 
     let notifyEvolution runId = evolutionChanged.Trigger runId
+
+    let enterRecovery (error: HarnessError) (experimentId: ExperimentId option) =
+        let correlated =
+            { error with
+                ExperimentId = experimentId }
+
+        let updated =
+            lock stateGate (fun () ->
+                match state with
+                | None -> None
+                | Some current ->
+                    let next =
+                        { current with
+                            Status = RecoveryRequired correlated }
+
+                    state <- Some next
+                    Some next)
+
+        runCancellation
+        |> Option.iter (fun cancellation ->
+            try
+                cancellation.Cancel()
+            with :? ObjectDisposedException ->
+                ())
+
+        publish $"Persistence recovery required: {error.Summary}" experimentId
+        updated |> Option.iter stateChanged.Trigger
 
     let persistExperimentStart runId experimentId sequence parent outcome cancellationToken =
         async {
             match! SqliteStore.beginExperiment sqlite runId experimentId sequence parent outcome cancellationToken with
             | Ok() -> notifyEvolution runId
-            | Error error -> publish $"Lineage journal warning: {error.Summary}" (Some experimentId)
+            | Error error -> enterRecovery error (Some experimentId)
         }
 
     let persistCandidate runId experimentId candidate cancellationToken =
         async {
             match! SqliteStore.updateExperimentCandidate sqlite experimentId candidate cancellationToken with
             | Ok() -> notifyEvolution runId
-            | Error error -> publish $"Lineage journal warning: {error.Summary}" (Some experimentId)
+            | Error error -> enterRecovery error (Some experimentId)
         }
 
     let outcomeCode kind payload =
@@ -125,10 +171,18 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         activeLock |> Option.iter _.Dispose()
         activeLock <- None
 
+    let abortPersistence error =
+        releaseRunLock ()
+        raise (RuntimePersistenceAbort error)
+
     let setState next =
-        lock stateGate (fun () -> state <- Some next)
-        persistStatus next
-        stateChanged.Trigger next
+        let durable, persistenceError = durableState next
+        lock stateGate (fun () -> state <- Some durable)
+
+        persistenceError
+        |> Option.iter (fun error -> publish $"Run status persistence failed: {error.Summary}" None)
+
+        stateChanged.Trigger durable
 
     let dispatch event =
         let result =
@@ -137,15 +191,19 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                 | None -> None
                 | Some current ->
                     let next, effects = RunState.transition DateTimeOffset.UtcNow event current
-                    state <- Some next
-                    Some(next, effects))
+                    let durable, persistenceError = durableState next
+                    state <- Some durable
+
+                    Some(durable, (if persistenceError.IsSome then [] else effects), persistenceError))
 
         result
-        |> Option.iter (fun (next, _) ->
-            persistStatus next
+        |> Option.iter (fun (next, _, persistenceError) ->
+            persistenceError
+            |> Option.iter (fun error -> publish $"Run status persistence failed: {error.Summary}" None)
+
             stateChanged.Trigger next)
 
-        result
+        result |> Option.map (fun (next, effects, _) -> next, effects)
 
     let journalEvent runId experimentId kind payload cancellationToken =
         async {
@@ -160,14 +218,83 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
                 notifyEvolution runId
                 return ()
-            | Error error -> publish $"Journal warning: {error.Summary}" experimentId
+            | Error error -> enterRecovery error experimentId
         }
 
     let recordArtifact runId experimentId kind path cancellationToken =
         async {
             match! SqliteStore.saveArtifact sqlite runId experimentId kind path cancellationToken with
             | Ok() -> return ()
-            | Error error -> publish $"Artifact journal warning: {error.Summary}" experimentId
+            | Error error -> enterRecovery error experimentId
+        }
+
+    let recordExperimentKnowledge
+        runId
+        experimentId
+        parent
+        candidate
+        evaluationPath
+        (evaluation: EvaluationResult)
+        (summary: ExperimentSummary)
+        cancellationToken
+        =
+        async {
+            let entity =
+                { Id = KnowledgeEntityId.create ()
+                  Kind = KnowledgeEntityKind.Experiment
+                  CanonicalName = $"Experiment {ExperimentId.text experimentId}"
+                  Attributes =
+                    Map
+                        [ "experimentId", ExperimentId.text experimentId
+                          "parent", CommitOid.value parent
+                          "candidate", CommitOid.value candidate ] }
+
+            let source =
+                { Id = KnowledgeSourceId.create ()
+                  RunId = runId
+                  ExperimentId = Some experimentId
+                  Kind = KnowledgeSourceKind.Evaluation
+                  Location = Path.GetFullPath evaluationPath
+                  Sha256 =
+                    if File.Exists evaluationPath then
+                        Some(AtomicFile.sha256 evaluationPath)
+                    else
+                        None
+                  CapturedAt = DateTimeOffset.UtcNow }
+
+            match! SqliteStore.saveKnowledgeEntity sqlite runId entity cancellationToken with
+            | Error error -> publish $"Knowledge graph warning: {error.Summary}" (Some experimentId)
+            | Ok() ->
+                match! SqliteStore.saveKnowledgeSource sqlite source cancellationToken with
+                | Error error -> publish $"Knowledge graph warning: {error.Summary}" (Some experimentId)
+                | Ok() ->
+                    let claims =
+                        { Id = KnowledgeClaimId.create ()
+                          RunId = runId
+                          Subject = entity.Id
+                          Predicate = "tested-hypothesis"
+                          Object = KnowledgeValue.Text summary.Hypothesis
+                          Confidence = 0.8M
+                          Sources = Set.singleton source.Id
+                          Supersedes = None
+                          CreatedAt = DateTimeOffset.UtcNow }
+                        :: (evaluation.Metrics
+                            |> Map.toList
+                            |> List.map (fun (name, value) ->
+                                { Id = KnowledgeClaimId.create ()
+                                  RunId = runId
+                                  Subject = entity.Id
+                                  Predicate = $"metric:{name}"
+                                  Object = KnowledgeValue.Number value
+                                  Confidence = 1M
+                                  Sources = Set.singleton source.Id
+                                  Supersedes = None
+                                  CreatedAt = DateTimeOffset.UtcNow }))
+
+                    for claim in claims do
+                        match! SqliteStore.saveKnowledgeClaim sqlite claim cancellationToken with
+                        | Ok() -> ()
+                        | Error error -> publish $"Knowledge graph warning: {error.Summary}" (Some experimentId)
         }
 
     let experimentSchema =
@@ -186,6 +313,43 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
           "required": ["hypothesis", "changeSummary", "expectedEffect", "validationNotes", "reusableLesson"]
         }
         """
+
+    let reproducibilityManifest
+        runId
+        (config: HarnessConfig)
+        (repository: RepositoryInspection)
+        (preflight: CodexPreflight)
+        =
+        let evaluatorPath =
+            if Path.IsPathRooted config.Evaluator.Executable then
+                config.Evaluator.Executable
+            elif config.Evaluator.Executable.Contains(Path.DirectorySeparatorChar) then
+                Path.GetFullPath(Path.Combine(repository.TopLevel, config.Evaluator.Executable))
+            else
+                config.Evaluator.Executable
+
+        let evaluatorSha256 =
+            if File.Exists evaluatorPath then
+                Some(AtomicFile.sha256 evaluatorPath)
+            else
+                None
+
+        JsonSerializer.Serialize
+            {| schemaVersion = 1
+               runId = RunId.text runId
+               sourcePath = repository.TopLevel
+               sourceCommit = CommitOid.value config.BaseCommit
+               sourceWasDirty = repository.IsDirty
+               objective = config.Objective
+               model = config.Model.Id
+               reasoningEffort = ReasoningEffort.toConfigValue config.Model.Effort
+               codexVersion = preflight.Version
+               evaluatorExecutable = config.Evaluator.Executable
+               evaluatorSha256 = evaluatorSha256
+               operatingSystem = RuntimeInformation.OSDescription
+               processArchitecture = string RuntimeInformation.ProcessArchitecture
+               framework = RuntimeInformation.FrameworkDescription
+               createdAt = DateTimeOffset.UtcNow |}
 
     let validateModel (config: HarnessConfig) (preflight: CodexPreflight) =
         match preflight.Models |> List.tryFind (fun model -> model.Id = config.Model.Id) with
@@ -207,6 +371,36 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
     let tryCurrent () = lock stateGate (fun () -> state)
 
+    let beginPromotion experimentId =
+        match dispatch (PromotionStarted experimentId) with
+        | Some(next, _) ->
+            next.Current
+            |> Option.exists (fun active -> active.Id = experimentId && active.Phase = Promoting)
+        | None -> false
+
+    let handleExperimentError runId experimentId kind (error: HarnessError) =
+        async {
+            let isStopping =
+                tryCurrent ()
+                |> Option.exists (fun current ->
+                    current.Id = runId
+                    && current.Status = Stopping
+                    && (current.Current |> Option.exists (fun active -> active.Id = experimentId)))
+
+            if isStopping then
+                dispatch (CancellationCompleted experimentId) |> ignore
+
+                do! journalEvent runId (Some experimentId) "Cancelled" error.Summary CancellationToken.None
+            else
+                let correlatedError =
+                    { error with
+                        ExperimentId = Some experimentId }
+
+                dispatch (ExperimentFailed(experimentId, correlatedError)) |> ignore
+
+                do! journalEvent runId (Some experimentId) kind error.Summary CancellationToken.None
+        }
+
     let captureAfterFailure (currentState: RunState) (workspace: CandidateWorkspace) cancellationToken =
         async {
             match!
@@ -227,6 +421,137 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
               Metric = metricValue
               Summary = summary }
             cancellationToken
+
+    let promoteCandidate runId experimentId parent candidate score summary acceptedEvent =
+        async {
+            let operationKind = "advance-frontier"
+
+            let operationPayload =
+                JsonSerializer.Serialize
+                    {| parent = CommitOid.value parent
+                       candidate = CommitOid.value candidate
+                       score = score |}
+
+            match!
+                SqliteStore.beginDurableOperation
+                    sqlite
+                    runId
+                    experimentId
+                    operationKind
+                    operationPayload
+                    CancellationToken.None
+            with
+            | Error error ->
+                do! handleExperimentError runId experimentId "AcceptFailed" error
+                return Error error
+            | Ok() ->
+                match!
+                    journal.AppendEvent
+                        runId
+                        (Some experimentId)
+                        "AcceptPending"
+                        (CommitOid.value candidate)
+                        CancellationToken.None
+                with
+                | Error error ->
+                    do!
+                        SqliteStore.completeDurableOperation
+                            sqlite
+                            runId
+                            experimentId
+                            operationKind
+                            "failed"
+                            CancellationToken.None
+                        |> Async.Ignore
+
+                    do! handleExperimentError runId experimentId "AcceptFailed" error
+                    return Error error
+                | Ok() when beginPromotion experimentId ->
+                    match! git.AdvanceFrontier runId parent candidate CancellationToken.None with
+                    | Error error ->
+                        do!
+                            SqliteStore.completeDurableOperation
+                                sqlite
+                                runId
+                                experimentId
+                                operationKind
+                                "failed"
+                                CancellationToken.None
+                            |> Async.Ignore
+
+                        do! handleExperimentError runId experimentId "AcceptFailed" error
+                        return Error error
+                    | Ok() ->
+                        match!
+                            journal.AppendEvent
+                                runId
+                                (Some experimentId)
+                                acceptedEvent
+                                (string score)
+                                CancellationToken.None
+                        with
+                        | Error error ->
+                            match tryCurrent () with
+                            | Some current when current.Id = runId ->
+                                setState
+                                    { current with
+                                        Status = RecoveryRequired error }
+                            | _ -> ()
+
+                            return Error error
+                        | Ok() ->
+                            match!
+                                SqliteStore.completeExperiment sqlite experimentId "Accepted" CancellationToken.None
+                            with
+                            | Error error ->
+                                match tryCurrent () with
+                                | Some current when current.Id = runId ->
+                                    setState
+                                        { current with
+                                            Status = RecoveryRequired error }
+                                | _ -> ()
+
+                                return Error error
+                            | Ok() ->
+                                notifyEvolution runId
+
+                                do!
+                                    saveMemory runId experimentId "Accepted" (Some score) summary CancellationToken.None
+                                    |> Async.Ignore
+
+                                dispatch (FrontierAdvanced experimentId) |> ignore
+
+                                do!
+                                    SqliteStore.completeDurableOperation
+                                        sqlite
+                                        runId
+                                        experimentId
+                                        operationKind
+                                        "completed"
+                                        CancellationToken.None
+                                    |> Async.Ignore
+
+                                return Ok()
+                | Ok() ->
+                    let error =
+                        HarnessError.create
+                            "runtime.promotion_not_authorized"
+                            HarnessErrorCategory.Recovery
+                            "Candidate promotion was cancelled before the frontier update began."
+
+                    do!
+                        SqliteStore.completeDurableOperation
+                            sqlite
+                            runId
+                            experimentId
+                            operationKind
+                            "cancelled"
+                            CancellationToken.None
+                        |> Async.Ignore
+
+                    do! handleExperimentError runId experimentId "AcceptFailed" error
+                    return Error error
+        }
 
     let runEvaluatorWithRetries (spec: EvaluatorSpec) frontierPath candidatePath resultPath cancellationToken =
         let rec loop attempt =
@@ -462,6 +787,150 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         with _ ->
             None, None
 
+    let parseStoredEvaluation (json: string) =
+        try
+            use document = JsonDocument.Parse json
+            let root = document.RootElement
+
+            let schemaVersion = root.GetProperty("schemaVersion").GetInt32()
+
+            let status =
+                match root.TryGetProperty "status" with
+                | true, value when value.GetString() = "inconclusive" -> EvaluationStatus.Inconclusive
+                | _ -> EvaluationStatus.Complete
+
+            let constraints =
+                root.GetProperty("constraints").EnumerateObject()
+                |> Seq.choose (fun property ->
+                    match property.Value.ValueKind with
+                    | JsonValueKind.True -> Some(property.Name, true)
+                    | JsonValueKind.False -> Some(property.Name, false)
+                    | _ -> None)
+                |> Map.ofSeq
+
+            let metrics =
+                root.GetProperty("metrics").EnumerateObject()
+                |> Seq.choose (fun property ->
+                    match property.Value.TryGetDecimal() with
+                    | true, value -> Some(property.Name, value)
+                    | false, _ -> None)
+                |> Map.ofSeq
+
+            let summary =
+                match root.TryGetProperty "summary" with
+                | true, value when value.ValueKind = JsonValueKind.String -> value.GetString()
+                | _ -> ""
+
+            let evidence =
+                match root.TryGetProperty "evidence" with
+                | true, value when value.ValueKind = JsonValueKind.Array ->
+                    value.EnumerateArray()
+                    |> Seq.choose (fun item ->
+                        if item.ValueKind = JsonValueKind.String then
+                            item.GetString() |> Option.ofObj
+                        else
+                            None)
+                    |> List.ofSeq
+                | _ -> []
+
+            Some
+                { SchemaVersion = schemaVersion
+                  Status = status
+                  Constraints = constraints
+                  Metrics = metrics
+                  Summary = summary
+                  Evidence = evidence }
+        with _ ->
+            None
+
+    let parseAdvanceFrontierOperation (operation: DurableOperation) =
+        try
+            use document = JsonDocument.Parse operation.Payload
+            let root = document.RootElement
+
+            Some(
+                CommitOid.create (root.GetProperty("parent").GetString()),
+                CommitOid.create (root.GetProperty("candidate").GetString()),
+                root.GetProperty("score").GetDecimal()
+            )
+        with _ ->
+            None
+
+    let reconcilePendingOperations runId cancellationToken =
+        async {
+            match SqliteStore.loadPendingOperations sqlite runId with
+            | Error error -> return Error error
+            | Ok [] -> return Ok()
+            | Ok operations ->
+                match! GitStore.loadLineage gitStore runId cancellationToken with
+                | Error error -> return Error error
+                | Ok lineage ->
+                    let mutable reconciliationError = None
+
+                    for operation in operations do
+                        if reconciliationError.IsNone then
+                            match operation.Kind, parseAdvanceFrontierOperation operation with
+                            | "advance-frontier", Some(parent, candidate, score) ->
+                                match lineage.Frontier with
+                                | Some frontier when frontier = candidate ->
+                                    do!
+                                        journalEvent
+                                            runId
+                                            (Some operation.ExperimentId)
+                                            "Accepted"
+                                            (string score)
+                                            cancellationToken
+
+                                    do!
+                                        SqliteStore.completeDurableOperation
+                                            sqlite
+                                            runId
+                                            operation.ExperimentId
+                                            operation.Kind
+                                            "completed"
+                                            cancellationToken
+                                        |> Async.Ignore
+                                | Some frontier when frontier = parent ->
+                                    do!
+                                        journalEvent
+                                            runId
+                                            (Some operation.ExperimentId)
+                                            "Cancelled"
+                                            "Recovered before frontier promotion."
+                                            cancellationToken
+
+                                    do!
+                                        SqliteStore.completeDurableOperation
+                                            sqlite
+                                            runId
+                                            operation.ExperimentId
+                                            operation.Kind
+                                            "cancelled"
+                                            cancellationToken
+                                        |> Async.Ignore
+                                | _ ->
+                                    reconciliationError <-
+                                        Some(
+                                            HarnessError.create
+                                                "recovery.frontier_conflict"
+                                                HarnessErrorCategory.Recovery
+                                                "The private Git frontier does not match either side of a pending promotion."
+                                        )
+                            | _ ->
+                                reconciliationError <-
+                                    Some(
+                                        HarnessError.create
+                                            "recovery.operation_invalid"
+                                            HarnessErrorCategory.Recovery
+                                            "A pending durable operation could not be parsed."
+                                    )
+
+                    return
+                        match reconciliationError with
+                        | Some error -> Error error
+                        | None -> Ok()
+        }
+
     let payloadReason (payload: string) =
         match payload.IndexOf(':') with
         | index when index >= 0 -> payload.Substring(index + 1).Trim()
@@ -554,8 +1023,8 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                 | Error error -> [], [ error.Summary ]
 
             let events, eventWarnings =
-                match SqliteStore.loadEvents sqlite 100_000 with
-                | Ok value -> value |> List.filter (fun item -> item.RunId = storedRun.Id), []
+                match SqliteStore.loadEventsForRun sqlite storedRun.Id with
+                | Ok value -> value, []
                 | Error error -> [], [ error.Summary ]
 
             let! lineageResult = GitStore.loadLineage gitStore storedRun.Id cancellationToken
@@ -808,7 +1277,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
                 match transition with
                 | None -> return ()
-                | Some(startedState, _) ->
+                | Some(startedState, _) when
+                    startedState.Current |> Option.exists (fun active -> active.Id = experimentId)
+                    ->
                     do!
                         persistExperimentStart
                             startedState.Id
@@ -817,6 +1288,38 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             (Some startedState.Frontier)
                             "Active"
                             cancellationToken
+
+                    let workPlan =
+                        WorkPlan.standardExperiment
+                            startedState.Id
+                            experimentId
+                            startedState.Config.Objective
+                            startedState.Config.Budgets
+                            startedState.Config.Evaluator.Timeout
+                            startedAt
+
+                    match WorkPlan.validate workPlan with
+                    | Error errors ->
+                        let detail = String.concat " " errors
+
+                        enterRecovery
+                            (HarnessError.create
+                                "runtime.plan_invalid"
+                                HarnessErrorCategory.Recovery
+                                "The generated typed work plan is invalid."
+                             |> HarnessError.withDetail detail)
+                            (Some experimentId)
+                    | Ok _ ->
+                        match! SqliteStore.saveWorkPlan sqlite workPlan cancellationToken with
+                        | Error error -> enterRecovery error (Some experimentId)
+                        | Ok() ->
+                            do!
+                                journalEvent
+                                    startedState.Id
+                                    (Some experimentId)
+                                    "PlanCreated"
+                                    (WorkPlanId.text workPlan.Id)
+                                    cancellationToken
 
                     do!
                         journalEvent
@@ -831,18 +1334,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                     match!
                         git.PrepareCandidate startedState.Id experimentId startedState.Frontier cancellationToken
                     with
-                    | Error error ->
-                        dispatch (ExperimentFailed error) |> ignore
-
-                        do!
-                            journalEvent
-                                startedState.Id
-                                (Some experimentId)
-                                "PrepareFailed"
-                                error.Summary
-                                cancellationToken
+                    | Error error -> do! handleExperimentError startedState.Id experimentId "PrepareFailed" error
                     | Ok workspace ->
-                        dispatch WorktreePrepared |> ignore
+                        dispatch (WorktreePrepared experimentId) |> ignore
 
                         let! memoryResult =
                             memory.Select
@@ -926,39 +1420,13 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         match codexResult with
                         | Error error ->
                             do! captureAfterFailure startedState workspace CancellationToken.None
-
-                            match tryCurrent () with
-                            | Some stopping when stopping.Status = Stopping ->
-                                dispatch CancellationCompleted |> ignore
-
-                                do!
-                                    journalEvent
-                                        stopping.Id
-                                        (Some experimentId)
-                                        "Cancelled"
-                                        error.Summary
-                                        CancellationToken.None
-                            | _ ->
-                                dispatch (
-                                    ExperimentFailed
-                                        { error with
-                                            ExperimentId = Some experimentId }
-                                )
-                                |> ignore
-
-                                do!
-                                    journalEvent
-                                        startedState.Id
-                                        (Some experimentId)
-                                        "CodexFailed"
-                                        error.Summary
-                                        CancellationToken.None
+                            do! handleExperimentError startedState.Id experimentId "CodexFailed" error
                         | Ok result ->
                             do!
                                 journal.SaveUsage startedState.Id experimentId result.Usage CancellationToken.None
                                 |> Async.Ignore
 
-                            dispatch (GenerationCompleted(result.ThreadId, result.Usage, result.Summary))
+                            dispatch (GenerationCompleted(experimentId, result.ThreadId, result.Usage, result.Summary))
                             |> ignore
 
                             do!
@@ -981,22 +1449,16 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                     startedState.Id
                                     workspace
                                     startedState.Config.EditablePaths
-                                    CancellationToken.None
+                                    cancellationToken
                             with
                             | Error error ->
-                                dispatch (ExperimentFailed error) |> ignore
-
-                                do!
-                                    journalEvent
-                                        startedState.Id
-                                        (Some experimentId)
-                                        "CaptureFailed"
-                                        error.Summary
-                                        CancellationToken.None
+                                do! handleExperimentError startedState.Id experimentId "CaptureFailed" error
                             | Ok snapshot when not (List.isEmpty snapshot.ProtectedPaths) ->
                                 do! persistCandidate startedState.Id experimentId snapshot.Commit CancellationToken.None
 
-                                dispatch (ProtectedPathDetected snapshot.ProtectedPaths) |> ignore
+                                dispatch (ProtectedPathDetected(experimentId, snapshot.ProtectedPaths))
+                                |> ignore
+
                                 let detail = String.concat ", " snapshot.ProtectedPaths
 
                                 do!
@@ -1021,7 +1483,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             | Ok snapshot ->
                                 do! persistCandidate startedState.Id experimentId snapshot.Commit CancellationToken.None
 
-                                dispatch (CandidateCaptured snapshot.Commit) |> ignore
+                                dispatch (CandidateCaptured(experimentId, snapshot.Commit)) |> ignore
                                 publish "Running deterministic evaluator in a clean worktree." (Some experimentId)
                                 let evaluatorPath = Path.Combine(artifactRoot, "evaluation.json")
 
@@ -1031,18 +1493,10 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         snapshot.FrontierEvaluationPath
                                         snapshot.EvaluationPath
                                         evaluatorPath
-                                        CancellationToken.None
+                                        cancellationToken
                                 with
                                 | Error error ->
-                                    dispatch (ExperimentFailed error) |> ignore
-
-                                    do!
-                                        journalEvent
-                                            startedState.Id
-                                            (Some experimentId)
-                                            "EvaluationFailed"
-                                            error.Summary
-                                            CancellationToken.None
+                                    do! handleExperimentError startedState.Id experimentId "EvaluationFailed" error
 
                                     do!
                                         saveMemory
@@ -1060,7 +1514,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         else
                                             evaluation.Summary
 
-                                    dispatch (EvaluationInconclusive reason) |> ignore
+                                    dispatch (EvaluationInconclusive(experimentId, reason)) |> ignore
 
                                     do!
                                         journalEvent
@@ -1089,8 +1543,18 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             CancellationToken.None
                                     with
                                     | Ok() -> ()
-                                    | Error error ->
-                                        publish $"Evaluation journal warning: {error.Summary}" (Some experimentId)
+                                    | Error error -> enterRecovery error (Some experimentId)
+
+                                    do!
+                                        recordExperimentKnowledge
+                                            startedState.Id
+                                            experimentId
+                                            startedState.Frontier
+                                            snapshot.Commit
+                                            evaluatorPath
+                                            evaluation
+                                            result.Summary
+                                            CancellationToken.None
 
                                     let candidateMetric =
                                         evaluation.Metrics |> Map.tryFind startedState.Config.Metric.Name
@@ -1102,7 +1566,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             startedState.FrontierScore
                                             evaluation
 
-                                    let decisionTransition = dispatch (EvaluationCompleted evaluation)
+                                    let decisionTransition = dispatch (EvaluationCompleted(experimentId, evaluation))
 
                                     match decision, decisionTransition with
                                     | StrictImprovement score, Some(_, effects) ->
@@ -1114,79 +1578,55 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         with
                                         | Some(candidate, parent) ->
                                             match!
-                                                journal.AppendEvent
+                                                promoteCandidate
                                                     startedState.Id
-                                                    (Some experimentId)
-                                                    "AcceptPending"
-                                                    (CommitOid.value candidate)
-                                                    CancellationToken.None
+                                                    experimentId
+                                                    parent
+                                                    candidate
+                                                    score
+                                                    result.Summary
+                                                    "Accepted"
                                             with
                                             | Error error ->
-                                                dispatch (ExperimentFailed error) |> ignore
-
-                                                publish
-                                                    $"Acceptance blocked because AcceptPending could not be journaled: {error.Summary}"
-                                                    (Some experimentId)
+                                                publish $"Acceptance failed safely: {error.Summary}" (Some experimentId)
                                             | Ok() ->
-                                                match!
-                                                    git.AdvanceFrontier
-                                                        startedState.Id
-                                                        parent
-                                                        candidate
-                                                        CancellationToken.None
-                                                with
-                                                | Ok() ->
-                                                    dispatch FrontierAdvanced |> ignore
-
-                                                    do!
-                                                        journalEvent
-                                                            startedState.Id
-                                                            (Some experimentId)
-                                                            "Accepted"
-                                                            (string score)
-                                                            CancellationToken.None
-
-                                                    do!
-                                                        saveMemory
-                                                            startedState.Id
-                                                            experimentId
-                                                            "Accepted"
-                                                            (Some score)
-                                                            result.Summary
-                                                            CancellationToken.None
-                                                        |> Async.Ignore
-
-                                                    publish
-                                                        $"Accepted strict improvement: {startedState.FrontierScore} → {score}."
-                                                        (Some experimentId)
-                                                | Error error ->
-                                                    dispatch (ExperimentFailed error) |> ignore
-
-                                                    do!
-                                                        journalEvent
-                                                            startedState.Id
-                                                            (Some experimentId)
-                                                            "AcceptFailed"
-                                                            error.Summary
-                                                            CancellationToken.None
+                                                publish
+                                                    $"Accepted strict improvement: {startedState.FrontierScore} → {score}."
+                                                    (Some experimentId)
                                         | None ->
-                                            let candidateText =
+                                            let awaitingReview =
                                                 tryCurrent ()
                                                 |> Option.bind _.Current
-                                                |> Option.bind _.Candidate
-                                                |> Option.map CommitOid.value
-                                                |> Option.defaultValue "candidate pending"
+                                                |> Option.filter (fun active ->
+                                                    active.Id = experimentId && active.Phase = AwaitingReview)
 
-                                            do!
-                                                journalEvent
-                                                    startedState.Id
-                                                    (Some experimentId)
-                                                    "AcceptPending"
-                                                    candidateText
-                                                    CancellationToken.None
+                                            match awaitingReview with
+                                            | Some active ->
+                                                do!
+                                                    journalEvent
+                                                        startedState.Id
+                                                        (Some experimentId)
+                                                        "AcceptPending"
+                                                        (active.Candidate
+                                                         |> Option.map CommitOid.value
+                                                         |> Option.defaultValue "candidate pending")
+                                                        CancellationToken.None
 
-                                            publish "Strict winner is awaiting human review." (Some experimentId)
-                                    | CandidateDecision.Rejected reason, _ ->
+                                                publish "Strict winner is awaiting human review." (Some experimentId)
+                                            | None ->
+                                                let error =
+                                                    HarnessError.create
+                                                        "runtime.decision_not_current"
+                                                        HarnessErrorCategory.Recovery
+                                                        "The evaluation completed after its experiment was no longer current."
+
+                                                do!
+                                                    handleExperimentError
+                                                        startedState.Id
+                                                        experimentId
+                                                        "EvaluationFailed"
+                                                        error
+                                    | CandidateDecision.Rejected reason, Some(next, _) when next.Current.IsNone ->
                                         do!
                                             journalEvent
                                                 startedState.Id
@@ -1208,7 +1648,28 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         publish
                                             "Candidate did not strictly improve the retained metric."
                                             (Some experimentId)
+                                    | CandidateDecision.Rejected _, _ ->
+                                        let error =
+                                            HarnessError.create
+                                                "runtime.rejection_not_current"
+                                                HarnessErrorCategory.Recovery
+                                                "The evaluation completed after its experiment was no longer current."
+
+                                        do! handleExperimentError startedState.Id experimentId "EvaluationFailed" error
                                     | _ -> ()
+
+                    let planStatus =
+                        match tryCurrent () |> Option.bind _.Current with
+                        | Some active when active.Id = experimentId && active.Phase = AwaitingReview ->
+                            "awaiting-review"
+                        | Some active when active.Id = experimentId -> "active"
+                        | _ -> "finished"
+
+                    match! SqliteStore.updateWorkPlanStatus sqlite workPlan.Id planStatus CancellationToken.None with
+                    | Ok() -> ()
+                    | Error error -> enterRecovery error (Some experimentId)
+
+                | Some _ -> ()
 
                 match tryCurrent () with
                 | Some next when next.Status = Ready -> return! runLoop cancellationToken
@@ -1245,64 +1706,575 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
     member _.ListEvolutionRuns(cancellationToken: CancellationToken) =
         async {
-            match SqliteStore.loadRuns sqlite with
+            match! SqliteStore.initialize sqlite cancellationToken with
             | Error error -> return Error error
-            | Ok runs ->
-                let summaries =
-                    runs
-                    |> List.map (fun stored ->
-                        let metricName, direction, _ = parseRunConfig stored.ConfigJson
+            | Ok() ->
+                match SqliteStore.loadRuns sqlite with
+                | Error error -> return Error error
+                | Ok runs ->
+                    let summaries =
+                        runs
+                        |> List.map (fun stored ->
+                            let metricName, direction, _ = parseRunConfig stored.ConfigJson
 
-                        { Id = stored.Id
-                          SourcePath = stored.SourcePath
-                          Status =
-                            if
-                                stored.Status = "Running"
-                                && not (tryCurrent () |> Option.exists (fun value -> value.Id = stored.Id))
-                            then
-                                "Interrupted"
-                            else
-                                stored.Status
-                          CreatedAt = stored.CreatedAt
-                          UpdatedAt = stored.UpdatedAt
-                          MetricName = metricName
-                          Direction = direction
-                          BaselineCommit =
-                            stored.ConfigJson
-                            |> Option.bind (fun json ->
-                                try
-                                    use document = JsonDocument.Parse json
+                            { Id = stored.Id
+                              SourcePath = stored.SourcePath
+                              Status =
+                                if
+                                    stored.Status = "Running"
+                                    && not (tryCurrent () |> Option.exists (fun value -> value.Id = stored.Id))
+                                then
+                                    "Interrupted"
+                                else
+                                    stored.Status
+                              CreatedAt = stored.CreatedAt
+                              UpdatedAt = stored.UpdatedAt
+                              MetricName = metricName
+                              Direction = direction
+                              BaselineCommit =
+                                stored.ConfigJson
+                                |> Option.bind (fun json ->
+                                    try
+                                        use document = JsonDocument.Parse json
 
-                                    Some(
-                                        CommitOid.create (document.RootElement.GetProperty("baseCommit").GetString())
-                                    )
-                                with _ ->
-                                    None)
-                          BaselineScore = None
-                          FrontierScore = None
-                          AttemptCount = 0
-                          AcceptedCount = 0 })
+                                        Some(
+                                            CommitOid.create (
+                                                document.RootElement.GetProperty("baseCommit").GetString()
+                                            )
+                                        )
+                                    with _ ->
+                                        None)
+                              BaselineScore = None
+                              FrontierScore = None
+                              AttemptCount = 0
+                              AcceptedCount = 0 })
 
-                return Ok summaries
+                    return Ok summaries
         }
 
     member _.LoadEvolution(runId: RunId, cancellationToken: CancellationToken) =
         async {
-            match SqliteStore.loadRuns sqlite with
+            match! SqliteStore.initialize sqlite cancellationToken with
             | Error error -> return Error error
-            | Ok runs ->
-                match runs |> List.tryFind (fun run -> run.Id = runId) with
-                | None ->
+            | Ok() ->
+                match SqliteStore.loadRuns sqlite with
+                | Error error -> return Error error
+                | Ok runs ->
+                    match runs |> List.tryFind (fun run -> run.Id = runId) with
+                    | None ->
+                        return
+                            Error(
+                                HarnessError.create
+                                    "runtime.evolution_run_missing"
+                                    HarnessErrorCategory.Persistence
+                                    "The selected run could not be found."
+                            )
+                    | Some run ->
+                        let! snapshot = loadEvolutionSnapshot run cancellationToken
+                        return Ok snapshot
+        }
+
+    member this.LoadWorkGraph(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadEvolution(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok snapshot -> return WorkGraph.ofEvolution snapshot
+        }
+
+    member this.WorkGraphChildren(runId: RunId, parent: CommitOid, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph when WorkGraph.contains parent graph -> return Ok(WorkGraph.children parent graph)
+            | Ok _ ->
+                return
+                    Error(
+                        HarnessError.create
+                            "work_graph.parent_unknown"
+                            HarnessErrorCategory.Recovery
+                            "The requested parent commit is not present in the work graph."
+                    )
+        }
+
+    member this.WorkGraphLeaves(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph -> return Ok(WorkGraph.leaves graph)
+        }
+
+    member this.WorkGraphLineage(runId: RunId, commit: CommitOid, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph -> return WorkGraph.lineage commit graph
+        }
+
+    member this.WorkGraphDiff
+        (runId: RunId, fromCommit: CommitOid, toCommit: CommitOid, cancellationToken: CancellationToken)
+        =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph when
+                not (WorkGraph.contains fromCommit graph)
+                || not (WorkGraph.contains toCommit graph)
+                ->
+                return
+                    Error(
+                        HarnessError.create
+                            "work_graph.diff_commit_unknown"
+                            HarnessErrorCategory.Recovery
+                            "Both diff commits must be present in the selected work graph."
+                    )
+            | Ok _ -> return! GitStore.diffCommits gitStore runId fromCommit toCommit cancellationToken
+        }
+
+    member _.UpsertKnowledgeEntity(runId: RunId, entity: KnowledgeEntity, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() -> return! SqliteStore.saveKnowledgeEntity sqlite runId entity cancellationToken
+        }
+
+    member _.AddKnowledgeAlias
+        (runId: RunId, entityId: KnowledgeEntityId, alias: string, cancellationToken: CancellationToken)
+        =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() -> return! SqliteStore.saveKnowledgeAlias sqlite runId entityId alias cancellationToken
+        }
+
+    member _.AddKnowledgeSource(source: KnowledgeSource, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() -> return! SqliteStore.saveKnowledgeSource sqlite source cancellationToken
+        }
+
+    member _.AddKnowledgeClaim(claim: KnowledgeClaim, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() ->
+                match SqliteStore.loadKnowledgeGraph sqlite claim.RunId with
+                | Error error -> return Error error
+                | Ok graph ->
+                    match KnowledgeGraph.addClaim claim graph with
+                    | Error detail ->
+                        return
+                            Error(
+                                HarnessError.create
+                                    "knowledge.claim_invalid"
+                                    HarnessErrorCategory.Configuration
+                                    "The knowledge claim is invalid."
+                                |> HarnessError.withDetail detail
+                            )
+                    | Ok _ -> return! SqliteStore.saveKnowledgeClaim sqlite claim cancellationToken
+        }
+
+    member _.SearchKnowledge(runId: RunId, query: string, limit: int, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() ->
+                return
+                    SqliteStore.loadKnowledgeGraph sqlite runId
+                    |> Result.map (KnowledgeGraph.search query limit)
+        }
+
+    member _.AddAnnotation(annotation: RunAnnotation, cancellationToken: CancellationToken) =
+        async {
+            match RunAnnotation.validate annotation with
+            | Error errors ->
+                return
+                    Error(
+                        HarnessError.create
+                            "annotation.invalid"
+                            HarnessErrorCategory.Configuration
+                            "The run annotation is invalid."
+                        |> HarnessError.withDetail (String.concat " " errors)
+                    )
+            | Ok validated ->
+                match! SqliteStore.initialize sqlite cancellationToken with
+                | Error error -> return Error error
+                | Ok() ->
+                    match! SqliteStore.saveAnnotation sqlite validated cancellationToken with
+                    | Error error -> return Error error
+                    | Ok() ->
+                        let experimentId =
+                            match validated.Target with
+                            | AnnotationTarget.Experiment id -> Some id
+                            | _ -> None
+
+                        do!
+                            journalEvent
+                                validated.RunId
+                                experimentId
+                                "AnnotationAdded"
+                                (RunAnnotationId.text validated.Id)
+                                cancellationToken
+
+                        return Ok validated
+        }
+
+    member _.LoadAnnotations(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() -> return SqliteStore.loadAnnotations sqlite runId
+        }
+
+    member _.LoadWorkPlans(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() -> return SqliteStore.loadWorkPlans sqlite runId
+        }
+
+    member _.ExecuteWorkPlan
+        (
+            plan: WorkPlan,
+            parent: CommitOid,
+            maxParallelism: int,
+            availableTools: Set<ToolCapability>,
+            rawTokensRemaining: int64,
+            deadline: DateTimeOffset,
+            handler: WorkItemHandler,
+            cancellationToken: CancellationToken
+        ) =
+        PlanExecutor.run maxParallelism parent availableTools rawTokensRemaining deadline handler cancellationToken plan
+
+    member _.HealthCheck(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() ->
+                match SqliteStore.loadRuns sqlite with
+                | Error error -> return Error error
+                | Ok runs when runs |> List.exists (fun run -> run.Id = runId) |> not ->
                     return
                         Error(
                             HarnessError.create
-                                "runtime.evolution_run_missing"
-                                HarnessErrorCategory.Persistence
-                                "The selected run could not be found."
+                                "health.run_missing"
+                                HarnessErrorCategory.Recovery
+                                "The requested run does not exist."
                         )
-                | Some run ->
-                    let! snapshot = loadEvolutionSnapshot run cancellationToken
-                    return Ok snapshot
+                | Ok _ ->
+                    let! lineageResult = GitStore.loadLineage gitStore runId cancellationToken
+                    let artifactsResult = SqliteStore.loadArtifactsForRun sqlite runId
+                    let operationsResult = SqliteStore.loadPendingOperations sqlite runId
+                    let plansResult = SqliteStore.loadWorkPlans sqlite runId
+                    let knowledgeResult = SqliteStore.loadKnowledgeGraph sqlite runId
+
+                    let artifactCount, artifactIssues =
+                        match artifactsResult with
+                        | Error error -> 0, [ error.Summary ]
+                        | Ok artifacts ->
+                            artifacts.Length,
+                            (artifacts
+                             |> List.choose (fun artifact ->
+                                 match SqliteStore.verifyArtifact artifact with
+                                 | Ok() -> None
+                                 | Error detail -> Some detail))
+
+                    let pendingCount, operationIssues =
+                        match operationsResult with
+                        | Error error -> 0, [ error.Summary ]
+                        | Ok operations ->
+                            operations.Length,
+                            (if List.isEmpty operations then
+                                 []
+                             else
+                                 [ $"{operations.Length} durable operation(s) require reconciliation." ])
+
+                    let planCount, planIssues =
+                        match plansResult with
+                        | Ok plans -> plans.Length, []
+                        | Error error -> 0, [ error.Summary ]
+
+                    let claimCount, knowledgeIssues =
+                        match knowledgeResult with
+                        | Ok graph -> graph.Claims.Count, []
+                        | Error error -> 0, [ error.Summary ]
+
+                    let lineageIssues =
+                        match lineageResult with
+                        | Ok lineage when lineage.Baseline.IsSome && lineage.Frontier.IsSome -> []
+                        | Ok _ -> [ "Private Git lineage is missing its baseline or frontier ref." ]
+                        | Error error -> [ error.Summary ]
+
+                    let issues =
+                        lineageIssues @ artifactIssues @ operationIssues @ planIssues @ knowledgeIssues
+
+                    return
+                        Ok
+                            { RunId = runId
+                              Healthy = List.isEmpty issues
+                              ArtifactCount = artifactCount
+                              PendingOperationCount = pendingCount
+                              WorkPlanCount = planCount
+                              KnowledgeClaimCount = claimCount
+                              Issues = issues }
+        }
+
+    member _.Recover(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match prepared, state with
+            | Some _, _
+            | _, Some _ ->
+                return
+                    Error(
+                        HarnessError.create
+                            "recovery.runtime_busy"
+                            HarnessErrorCategory.Recovery
+                            "Another run is already prepared or active in this runtime."
+                    )
+            | None, None ->
+                match! journal.Initialize cancellationToken with
+                | Error error -> return Error error
+                | Ok() ->
+                    let storedRunResult =
+                        match SqliteStore.loadRuns sqlite with
+                        | Error error -> Error error
+                        | Ok runs ->
+                            match runs |> List.tryFind (fun run -> run.Id = runId) with
+                            | Some run -> Ok run
+                            | None ->
+                                Error(
+                                    HarnessError.create
+                                        "recovery.run_missing"
+                                        HarnessErrorCategory.Recovery
+                                        "The requested persisted run was not found."
+                                )
+
+                    match storedRunResult with
+                    | Error error -> return Error error
+                    | Ok storedRun ->
+                        let configResult =
+                            match storedRun.ConfigJson with
+                            | Some json -> ConfigFile.parse json
+                            | None -> Error [ "The persisted run has no configuration." ]
+
+                        match configResult with
+                        | Error errors ->
+                            return
+                                Error(
+                                    HarnessError.create
+                                        "recovery.config_invalid"
+                                        HarnessErrorCategory.Recovery
+                                        "The persisted run configuration cannot be restored."
+                                    |> HarnessError.withDetail (String.concat " " errors)
+                                )
+                        | Ok config ->
+                            match ProjectLock.tryAcquire (DataPaths.projectLock root config.SourcePath) with
+                            | Error detail ->
+                                return
+                                    Error(
+                                        HarnessError.create
+                                            "recovery.locked"
+                                            HarnessErrorCategory.Recovery
+                                            "The source repository is locked by another run."
+                                        |> HarnessError.withDetail detail
+                                    )
+                            | Ok runLock ->
+                                activeLock <- Some runLock
+                                let! repositoryResult = git.InspectSource config.SourcePath cancellationToken
+                                let! codexResult = codex.Preflight codexExecutable cancellationToken
+
+                                match repositoryResult, codexResult with
+                                | Error error, _
+                                | _, Error error ->
+                                    releaseRunLock ()
+                                    return Error error
+                                | Ok repository, Ok codexReport ->
+                                    match validateModel config codexReport with
+                                    | Error error ->
+                                        releaseRunLock ()
+                                        return Error error
+                                    | Ok() ->
+                                        match! reconcilePendingOperations runId cancellationToken with
+                                        | Error error ->
+                                            releaseRunLock ()
+                                            return Error error
+                                        | Ok() ->
+                                            match SqliteStore.loadExperiments sqlite runId with
+                                            | Error error ->
+                                                releaseRunLock ()
+                                                return Error error
+                                            | Ok beforeRecovery ->
+                                                for experiment in beforeRecovery do
+                                                    if
+                                                        experiment.Outcome = "Active"
+                                                        || experiment.Outcome = "AwaitingReview"
+                                                    then
+                                                        do!
+                                                            journalEvent
+                                                                runId
+                                                                (Some experiment.Id)
+                                                                "Cancelled"
+                                                                "Recovered an interrupted experiment; candidate evidence remains preserved."
+                                                                cancellationToken
+
+                                                let artifactResult = SqliteStore.loadArtifactsForRun sqlite runId
+
+                                                match artifactResult with
+                                                | Error error ->
+                                                    releaseRunLock ()
+                                                    return Error error
+                                                | Ok artifacts ->
+                                                    let integrityErrors =
+                                                        artifacts
+                                                        |> List.choose (fun artifact ->
+                                                            match SqliteStore.verifyArtifact artifact with
+                                                            | Ok() -> None
+                                                            | Error detail -> Some detail)
+
+                                                    if not (List.isEmpty integrityErrors) then
+                                                        releaseRunLock ()
+
+                                                        return
+                                                            Error(
+                                                                HarnessError.create
+                                                                    "recovery.artifact_integrity"
+                                                                    HarnessErrorCategory.Recovery
+                                                                    "One or more persisted artifacts failed integrity verification."
+                                                                |> HarnessError.withDetail (
+                                                                    String.concat " " integrityErrors
+                                                                )
+                                                            )
+                                                    else
+                                                        let! snapshot =
+                                                            loadEvolutionSnapshot storedRun cancellationToken
+
+                                                        match
+                                                            snapshot.Frontier,
+                                                            snapshot.Run.FrontierScore,
+                                                            snapshot.Run.BaselineScore,
+                                                            SqliteStore.loadExperiments sqlite runId,
+                                                            SqliteStore.loadEvaluationsForRun sqlite runId,
+                                                            SqliteStore.loadUsageForRun sqlite runId
+                                                        with
+                                                        | Some frontier,
+                                                          Some frontierScore,
+                                                          Some baselineScore,
+                                                          Ok experiments,
+                                                          Ok evaluations,
+                                                          Ok usages ->
+                                                            let parsedEvaluations =
+                                                                evaluations
+                                                                |> List.sortBy _.CreatedAt
+                                                                |> List.choose (fun stored ->
+                                                                    parseStoredEvaluation stored.ResultJson
+                                                                    |> Option.map (fun value ->
+                                                                        stored.ExperimentId, value))
+
+                                                            let baseline =
+                                                                experiments
+                                                                |> List.tryFind (fun experiment ->
+                                                                    experiment.Sequence = 0)
+                                                                |> Option.bind (fun experiment ->
+                                                                    parsedEvaluations
+                                                                    |> List.tryPick (fun (experimentId, evaluation) ->
+                                                                        if experimentId = experiment.Id then
+                                                                            Some evaluation
+                                                                        else
+                                                                            None))
+
+                                                            match baseline with
+                                                            | None ->
+                                                                releaseRunLock ()
+
+                                                                return
+                                                                    Error(
+                                                                        HarnessError.create
+                                                                            "recovery.baseline_missing"
+                                                                            HarnessErrorCategory.Recovery
+                                                                            "The persisted baseline evaluation is missing."
+                                                                        |> HarnessError.withDetail (
+                                                                            let experimentDetails =
+                                                                                experiments
+                                                                                |> List.map (fun item ->
+                                                                                    $"{ExperimentId.text item.Id}:{item.Sequence}:{item.Outcome}")
+                                                                                |> String.concat ","
+
+                                                                            let evaluationDetails =
+                                                                                parsedEvaluations
+                                                                                |> List.map (fst >> ExperimentId.text)
+                                                                                |> String.concat ","
+
+                                                                            $"Loaded experiments [{experimentDetails}] and parsed evaluations [{evaluationDetails}]."
+                                                                        )
+                                                                    )
+                                                            | Some baselineEvaluation ->
+                                                                let usage =
+                                                                    usages
+                                                                    |> List.choose _.Usage
+                                                                    |> List.fold TokenUsage.add TokenUsage.zero
+
+                                                                let usageKnown =
+                                                                    usages
+                                                                    |> List.forall (fun stored -> stored.Usage.IsSome)
+
+                                                                let previousEvaluation =
+                                                                    parsedEvaluations
+                                                                    |> List.filter (fun (experimentId, _) ->
+                                                                        experiments
+                                                                        |> List.exists (fun experiment ->
+                                                                            experiment.Id = experimentId
+                                                                            && experiment.Sequence > 0))
+                                                                    |> List.tryLast
+                                                                    |> Option.map snd
+
+                                                                let restoredState =
+                                                                    { RunState.create
+                                                                          runId
+                                                                          config
+                                                                          frontier
+                                                                          frontierScore
+                                                                          DateTimeOffset.UtcNow with
+                                                                        Status = Ready
+                                                                        Attempted = snapshot.Run.AttemptCount
+                                                                        AcceptedCount = snapshot.Run.AcceptedCount
+                                                                        Usage = usage
+                                                                        UsageKnown = usageKnown
+                                                                        PreviousEvaluation = previousEvaluation }
+
+                                                                let report =
+                                                                    { RunId = runId
+                                                                      Repository = repository
+                                                                      Codex = codexReport
+                                                                      Baseline = baselineEvaluation
+                                                                      BaselineScore = baselineScore
+                                                                      DataDirectory = DataPaths.runRoot root runId }
+
+                                                                prepared <- Some report
+                                                                setState restoredState
+
+                                                                do!
+                                                                    journalEvent
+                                                                        runId
+                                                                        None
+                                                                        "RunRecovered"
+                                                                        (CommitOid.value frontier)
+                                                                        cancellationToken
+
+                                                                publish
+                                                                    "Recovered persisted run from its verified frontier."
+                                                                    None
+
+                                                                return Ok report
+                                                        | _ ->
+                                                            releaseRunLock ()
+
+                                                            return
+                                                                Error(
+                                                                    HarnessError.create
+                                                                        "recovery.state_incomplete"
+                                                                        HarnessErrorCategory.Recovery
+                                                                        "The persisted run does not contain enough verified state to resume."
+                                                                )
         }
 
     member _.InspectSource(sourcePath: string, cancellationToken: CancellationToken) =
@@ -1387,19 +2359,35 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                 cancellationToken
 
                                         match savedRun with
-                                        | Error error -> publish $"Run journal warning: {error.Summary}" None
+                                        | Error error -> abortPersistence error
                                         | Ok() -> ()
+
+                                        let manifest = reproducibilityManifest runId validated repository codexReport
+
+                                        match!
+                                            SqliteStore.saveReproducibilityManifest
+                                                sqlite
+                                                runId
+                                                manifest
+                                                cancellationToken
+                                        with
+                                        | Error error -> abortPersistence error
+                                        | Ok _ -> ()
 
                                         let baselineExperiment = ExperimentId.create ()
 
-                                        do!
-                                            persistExperimentStart
+                                        match!
+                                            SqliteStore.beginExperiment
+                                                sqlite
                                                 runId
                                                 baselineExperiment
                                                 0
                                                 None
                                                 "Baseline"
                                                 cancellationToken
+                                        with
+                                        | Error error -> abortPersistence error
+                                        | Ok() -> ()
 
                                         match!
                                             SqliteStore.updateExperimentCandidate
@@ -1408,7 +2396,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                 validated.BaseCommit
                                                 cancellationToken
                                         with
-                                        | Error error -> publish $"Lineage journal warning: {error.Summary}" None
+                                        | Error error -> abortPersistence error
                                         | Ok() -> notifyEvolution runId
 
                                         match!
@@ -1468,8 +2456,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                         cancellationToken
                                                 with
                                                 | Ok() -> ()
-                                                | Error error ->
-                                                    publish $"Baseline journal warning: {error.Summary}" None
+                                                | Error error -> abortPersistence error
 
                                                 let failed =
                                                     validated.Evaluator.RequiredConstraints
@@ -1519,8 +2506,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                                 "Ready"
                                                                 cancellationToken
                                                         with
-                                                        | Error error ->
-                                                            publish $"Run-status journal warning: {error.Summary}" None
+                                                        | Error error -> abortPersistence error
                                                         | Ok() -> ()
 
                                                         let report =
@@ -1553,9 +2539,38 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                         publish "Preflight, baseline, and protected seeds passed." None
                                                         return Ok report
         }
+        |> fun operation ->
+            async {
+                let! outcome = Async.Catch operation
+
+                match outcome with
+                | Choice1Of2 result -> return result
+                | Choice2Of2(RuntimePersistenceAbort error) -> return Error error
+                | Choice2Of2 exceptionValue ->
+                    releaseRunLock ()
+
+                    return
+                        Error(
+                            HarnessError.create
+                                "runtime.prepare_unexpected"
+                                HarnessErrorCategory.Recovery
+                                "Run preparation failed unexpectedly."
+                            |> HarnessError.withDetail exceptionValue.Message
+                        )
+            }
 
     member _.Start() =
         match prepared, tryCurrent () with
+        | Some _, Some current when
+            current.Status = Ready
+            && Evaluation.targetReached current.Config.Metric current.FrontierScore
+            ->
+            setState
+                { current with
+                    Status = Completed "Metric target already reached by the prepared frontier." }
+
+            publish "Run completed without another experiment because the metric target is already reached." None
+            Ok current.Id
         | Some _, Some current when current.Status = Ready ->
             match
                 SqliteStore.updateRunStatus sqlite current.Id "Running" CancellationToken.None
@@ -1596,69 +2611,31 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         let metric = evaluation.Metrics[current.Config.Metric.Name]
 
                         if accept then
-                            dispatch ReviewAccepted |> ignore
+                            dispatch (ReviewAccepted active.Id) |> ignore
 
                             match!
-                                journal.AppendEvent
+                                promoteCandidate
                                     current.Id
-                                    (Some active.Id)
-                                    "AcceptPending"
-                                    (CommitOid.value candidate)
-                                    CancellationToken.None
+                                    active.Id
+                                    active.Parent
+                                    candidate
+                                    metric
+                                    summary
+                                    "AcceptedAfterReview"
                             with
                             | Error error ->
-                                dispatch (ExperimentFailed error) |> ignore
-
-                                publish
-                                    $"Acceptance blocked because AcceptPending could not be journaled: {error.Summary}"
-                                    (Some active.Id)
+                                publish $"Reviewed candidate acceptance failed safely: {error.Summary}" (Some active.Id)
 
                                 return Error error
                             | Ok() ->
-                                match!
-                                    git.AdvanceFrontier current.Id active.Parent candidate CancellationToken.None
-                                with
-                                | Ok() ->
-                                    dispatch FrontierAdvanced |> ignore
+                                publish
+                                    $"Accepted reviewed strict improvement: {current.FrontierScore} → {metric}."
+                                    (Some active.Id)
 
-                                    do!
-                                        journalEvent
-                                            current.Id
-                                            (Some active.Id)
-                                            "AcceptedAfterReview"
-                                            (string metric)
-                                            CancellationToken.None
-
-                                    do!
-                                        saveMemory
-                                            current.Id
-                                            active.Id
-                                            "Accepted"
-                                            (Some metric)
-                                            summary
-                                            CancellationToken.None
-                                        |> Async.Ignore
-
-                                    publish
-                                        $"Accepted reviewed strict improvement: {current.FrontierScore} → {metric}."
-                                        (Some active.Id)
-
-                                    startWorkerIfReady ()
-                                    return Ok()
-                                | Error error ->
-                                    dispatch (ExperimentFailed error) |> ignore
-
-                                    do!
-                                        journalEvent
-                                            current.Id
-                                            (Some active.Id)
-                                            "AcceptFailed"
-                                            error.Summary
-                                            CancellationToken.None
-
-                                    return Error error
+                                startWorkerIfReady ()
+                                return Ok()
                         else
-                            dispatch ReviewRejected |> ignore
+                            dispatch (ReviewRejected active.Id) |> ignore
 
                             do!
                                 journalEvent
@@ -1759,6 +2736,13 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
     interface IDisposable with
         member _.Dispose() =
-            runCancellation |> Option.iter _.Cancel()
-            runCancellation |> Option.iter _.Dispose()
+            runCancellation
+            |> Option.iter (fun cancellation ->
+                try
+                    cancellation.Cancel()
+                    cancellation.Dispose()
+                with :? ObjectDisposedException ->
+                    ())
+
+            runCancellation <- None
             releaseRunLock ()

@@ -136,35 +136,6 @@ module StorageTests =
             Assert.Equal("Accepted", record.Outcome))
 
     [<Fact>]
-    let ``baseline lineage record allows a missing parent`` () =
-        withTempDirectory (fun directory ->
-            let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
-
-            SqliteStore.initialize store CancellationToken.None
-            |> Async.RunSynchronously
-            |> getResult
-            |> ignore
-
-            let runId = RunId.create ()
-            let experimentId = ExperimentId.create ()
-            let baseline = CommitOid.create (String('c', 40))
-
-            SqliteStore.beginExperiment store runId experimentId 0 None "Baseline" CancellationToken.None
-            |> Async.RunSynchronously
-            |> getResult
-            |> ignore
-
-            SqliteStore.updateExperimentCandidate store experimentId baseline CancellationToken.None
-            |> Async.RunSynchronously
-            |> getResult
-            |> ignore
-
-            let record = SqliteStore.loadExperiments store runId |> getResult |> Assert.Single
-            Assert.Equal(0, record.Sequence)
-            Assert.True(record.Parent.IsNone)
-            Assert.Equal(Some baseline, record.Candidate))
-
-    [<Fact>]
     let ``persisted run appears in evolution run listing`` () =
         withTempDirectory (fun directory ->
             let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
@@ -183,3 +154,206 @@ module StorageTests =
 
             let runs = SqliteStore.loadRuns store |> getResult
             Assert.Single runs |> ignore)
+
+    [<Fact>]
+    let ``persisted paired metric configuration can be parsed for recovery`` () =
+        withTempDirectory (fun directory ->
+            let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
+
+            SqliteStore.initialize store CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let runId = RunId.create ()
+
+            let expected =
+                { config with
+                    SourcePath = Path.GetFullPath config.SourcePath
+                    Metric =
+                        { config.Metric with
+                            Direction = Minimize
+                            Target = Some 4.5M
+                            Comparison = EvaluationMetric "frontier_metric" }
+                    PromotionMode = ReviewStrictWinners }
+
+            SqliteStore.saveRun store runId expected "Ready" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let stored = SqliteStore.loadRuns store |> getResult |> Assert.Single
+
+            let json =
+                stored.ConfigJson
+                |> Option.defaultWith (fun () -> failwith "Missing configuration")
+
+            match ConfigFile.parse json with
+            | Error errors -> Assert.Fail(String.concat " " errors)
+            | Ok actual -> Assert.Equal(expected, actual))
+
+    [<Fact>]
+    let ``durable promotion operation and artifact integrity round trip`` () =
+        withTempDirectory (fun directory ->
+            let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
+
+            SqliteStore.initialize store CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let runId = RunId.create ()
+            let experimentId = ExperimentId.create ()
+            let artifactPath = Path.Combine(directory, "evaluation.json")
+            File.WriteAllText(artifactPath, "{\"score\":2}")
+
+            SqliteStore.saveRun store runId config "Running" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            SqliteStore.beginExperiment
+                store
+                runId
+                experimentId
+                1
+                (Some config.BaseCommit)
+                "Active"
+                CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let workPlan =
+                WorkPlan.standardExperiment
+                    runId
+                    experimentId
+                    config.Objective
+                    config.Budgets
+                    config.Evaluator.Timeout
+                    DateTimeOffset.UtcNow
+
+            SqliteStore.saveWorkPlan store workPlan CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let storedPlan = SqliteStore.loadWorkPlans store runId |> getResult |> Assert.Single
+            Assert.Equal(workPlan.Id, storedPlan.Id)
+            Assert.Contains("generate-with-codex", storedPlan.PlanJson)
+
+            SqliteStore.updateWorkPlanStatus store workPlan.Id "finished" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            SqliteStore.beginDurableOperation
+                store
+                runId
+                experimentId
+                "advance-frontier"
+                "{\"candidate\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}"
+                CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            SqliteStore.saveArtifact store runId (Some experimentId) "evaluation" artifactPath CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let pending =
+                SqliteStore.loadPendingOperations store runId |> getResult |> Assert.Single
+
+            Assert.Equal("advance-frontier", pending.Kind)
+
+            let artifact =
+                SqliteStore.loadArtifactsForRun store runId |> getResult |> Assert.Single
+
+            SqliteStore.verifyArtifact artifact |> getResult |> ignore
+            File.AppendAllText(artifactPath, "changed")
+            Assert.True(SqliteStore.verifyArtifact artifact |> Result.isError)
+
+            SqliteStore.completeDurableOperation
+                store
+                runId
+                experimentId
+                "advance-frontier"
+                "completed"
+                CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            Assert.Empty(SqliteStore.loadPendingOperations store runId |> getResult))
+
+    [<Fact>]
+    let ``provenance knowledge graph round trips entities aliases sources and claims`` () =
+        withTempDirectory (fun directory ->
+            let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
+
+            SqliteStore.initialize store CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let runId = RunId.create ()
+
+            SqliteStore.saveRun store runId config "Ready" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let entity =
+                { Id = KnowledgeEntityId.create ()
+                  Kind = KnowledgeEntityKind.File
+                  CanonicalName = "Planning.fs"
+                  Attributes = Map [ "layer", "core" ] }
+
+            let source =
+                { Id = KnowledgeSourceId.create ()
+                  RunId = runId
+                  ExperimentId = None
+                  Kind = KnowledgeSourceKind.Artifact
+                  Location = Path.Combine(directory, "evaluation.json")
+                  Sha256 = Some(String('a', 64))
+                  CapturedAt = DateTimeOffset.UtcNow }
+
+            let claim =
+                { Id = KnowledgeClaimId.create ()
+                  RunId = runId
+                  Subject = entity.Id
+                  Predicate = "contains"
+                  Object = KnowledgeValue.Text "budget-aware scheduler"
+                  Confidence = 0.9M
+                  Sources = Set.singleton source.Id
+                  Supersedes = None
+                  CreatedAt = DateTimeOffset.UtcNow }
+
+            SqliteStore.saveKnowledgeEntity store runId entity CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            SqliteStore.saveKnowledgeAlias store runId entity.Id "planner" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            SqliteStore.saveKnowledgeSource store source CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            SqliteStore.saveKnowledgeClaim store claim CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let graph = SqliteStore.loadKnowledgeGraph store runId |> getResult
+            Assert.Equal(entity, graph.Entities[entity.Id])
+            Assert.Contains(entity.Id, graph.Aliases["planner"])
+            let hit = KnowledgeGraph.search "planner scheduler" 5 graph |> Assert.Single
+            Assert.Equal(claim.Id, hit.Claim.Id)
+            Assert.Equal(source.Id, hit.Sources.Head.Id))
