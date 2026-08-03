@@ -4,6 +4,7 @@ open System
 open Avalonia
 open Avalonia.Controls
 open Avalonia.Controls.Primitives
+open Avalonia.Controls.Shapes
 open Avalonia.FuncUI
 open Avalonia.FuncUI.DSL
 open Avalonia.FuncUI.Types
@@ -563,6 +564,294 @@ module Views =
                                                   StackPanel.children (activityRows model.Activities) ] ] ] ]
                   ) ]
 
+    let private shortCommit commit =
+        commit
+        |> Option.map CommitOid.value
+        |> Option.map (fun value -> if value.Length > 8 then value.Substring(0, 8) else value)
+        |> Option.defaultValue "not captured"
+
+    let private outcomeBrush outcome =
+        match outcome with
+        | EvolutionOutcome.Accepted -> Theme.accentDark
+        | EvolutionOutcome.Rejected _
+        | EvolutionOutcome.Failed _ -> Theme.dangerDark
+        | EvolutionOutcome.Inconclusive _ -> Theme.warning
+        | EvolutionOutcome.Cancelled -> Theme.surfaceRaised
+        | EvolutionOutcome.Active _ -> Theme.accentDark
+        | EvolutionOutcome.Unknown _ -> Theme.surfaceRaised
+
+    let private outcomeLabel outcome = Evolution.outcomeText outcome
+
+    let private evolutionEdge (edge: EvolutionEdgeLayout) : IView =
+        Line.create
+            [ Line.startPoint (Point(edge.From.X, edge.From.Y))
+              Line.endPoint (Point(edge.To.X, edge.To.Y))
+              Line.stroke Theme.border
+              Line.strokeThickness 2.0 ]
+
+    let private evolutionNodeButton (layout: EvolutionNodeLayout) (selected: bool) (dispatch: Msg -> unit) : IView =
+        let node = layout.Node
+
+        let marker =
+            match node.Outcome with
+            | EvolutionOutcome.Accepted -> "✓"
+            | EvolutionOutcome.Rejected _ -> "×"
+            | EvolutionOutcome.Failed _ -> "!"
+            | EvolutionOutcome.Inconclusive _ -> "?"
+            | EvolutionOutcome.Cancelled -> "–"
+            | EvolutionOutcome.Active _ -> "…"
+            | EvolutionOutcome.Unknown _ -> "·"
+
+        Button.create
+            [ Canvas.left layout.X
+              Canvas.top layout.Y
+              Button.width layout.Width
+              Button.height layout.Height
+              Button.content $"{marker} {node.Label}\n{shortCommit node.Commit}"
+              Button.background (
+                  if selected then
+                      Theme.accentDark
+                  else
+                      outcomeBrush node.Outcome
+              )
+              Button.foreground Theme.text
+              Button.borderBrush (if selected then Theme.accent else Theme.border)
+              Button.borderThickness (if selected then 2.0 else 1.0)
+              Button.padding (Thickness(8.0, 5.0))
+              Button.onClick (fun _ -> dispatch (SelectEvolutionNode node.Id)) ]
+
+    let private scoreLine (left: EvolutionScoreLayout) (right: EvolutionScoreLayout) : IView option =
+        match left.RetainedY, right.RetainedY with
+        | Some leftY, Some rightY ->
+            Some(
+                Line.create
+                    [ Line.startPoint (Point(left.X, leftY))
+                      Line.endPoint (Point(right.X, rightY))
+                      Line.stroke Theme.accent
+                      Line.strokeThickness 2.0 ]
+            )
+        | _ -> None
+
+    let private scorePointButton (point: EvolutionScoreLayout) (selected: bool) (dispatch: Msg -> unit) : IView option =
+        match point.MetricY with
+        | None -> None
+        | Some y ->
+            Some(
+                Button.create
+                    [ Canvas.left (point.X - 10.0)
+                      Canvas.top (y - 10.0)
+                      Button.width 20.0
+                      Button.height 20.0
+                      Button.content "●"
+                      Button.fontSize 14.0
+                      Button.padding 0.0
+                      Button.background (if selected then Theme.accentDark else Theme.surfaceRaised)
+                      Button.foreground Theme.accent
+                      Button.borderBrush (if selected then Theme.accent else Theme.border)
+                      Button.borderThickness 1.0
+                      Button.onClick (fun _ -> dispatch (SelectEvolutionNode point.NodeId)) ]
+            )
+
+    let private evolutionGraphView
+        (snapshot: EvolutionSnapshot)
+        (selected: EvolutionNodeId option)
+        (dispatch: Msg -> unit)
+        : IView =
+        let layout = EvolutionLayout.build snapshot
+
+        let graphChildren =
+            (layout.Edges |> List.map evolutionEdge)
+            @ (layout.Nodes
+               |> List.map (fun item -> evolutionNodeButton item (selected = Some item.Node.Id) dispatch))
+
+        let chartLines =
+            layout.Scores
+            |> List.pairwise
+            |> List.choose (fun pair -> scoreLine (fst pair) (snd pair))
+
+        let chartPoints =
+            layout.Scores
+            |> List.choose (fun point -> scorePointButton point (selected = Some point.NodeId) dispatch)
+
+        let axisLabels =
+            [ match layout.AxisMaximum with
+              | Some value ->
+                  TextBlock.create
+                      [ Canvas.left 0.0
+                        Canvas.top 6.0
+                        TextBlock.text (string value)
+                        TextBlock.foreground Theme.muted
+                        TextBlock.fontSize 10.0 ]
+                  :> IView
+              | None -> TextBlock.create [] :> IView
+              match layout.AxisMinimum with
+              | Some value ->
+                  TextBlock.create
+                      [ Canvas.left 0.0
+                        Canvas.top 174.0
+                        TextBlock.text (string value)
+                        TextBlock.foreground Theme.muted
+                        TextBlock.fontSize 10.0 ]
+                  :> IView
+              | None -> TextBlock.create [] :> IView ]
+
+        let directionText =
+            if snapshot.Run.Direction = Maximize then
+                "higher is better"
+            else
+                "lower is better"
+
+        StackPanel.create
+            [ StackPanel.spacing 8.0
+              StackPanel.children
+                  [ overline "LINEAGE"
+                    ScrollViewer.create
+                        [ ScrollViewer.horizontalScrollBarVisibility ScrollBarVisibility.Auto
+                          ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Disabled
+                          ScrollViewer.content (
+                              Canvas.create
+                                  [ Canvas.width layout.Width
+                                    Canvas.height layout.GraphHeight
+                                    Canvas.children graphChildren ]
+                          ) ]
+                    overline "METRIC EVOLUTION"
+                    muted $"{snapshot.Run.MetricName} · {directionText}"
+                    ScrollViewer.create
+                        [ ScrollViewer.horizontalScrollBarVisibility ScrollBarVisibility.Auto
+                          ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Disabled
+                          ScrollViewer.content (
+                              Canvas.create
+                                  [ Canvas.width layout.Width
+                                    Canvas.height layout.ChartHeight
+                                    Canvas.children (axisLabels @ chartLines @ chartPoints) ]
+                          ) ] ] ]
+
+    let private evolutionNodeForId (snapshot: EvolutionSnapshot) nodeId =
+        match nodeId with
+        | ExperimentNode experimentId ->
+            snapshot.Nodes
+            |> List.tryFind (fun node -> node.Id = ExperimentNode experimentId)
+        | BaselineNode ->
+            Some
+                { Id = BaselineNode
+                  Kind = EvolutionNodeKind.Baseline
+                  Sequence = 0
+                  Parent = None
+                  Commit = snapshot.Run.BaselineCommit
+                  Outcome = EvolutionOutcome.Unknown "Baseline"
+                  Metric = snapshot.Run.BaselineScore
+                  RetainedScore = snapshot.Run.BaselineScore
+                  Summary = None
+                  EvaluationSummary = None
+                  Usage = None
+                  StartedAt = snapshot.Run.CreatedAt
+                  UpdatedAt = snapshot.Run.UpdatedAt
+                  Label = "Baseline" }
+
+    let private evolutionDetails (snapshot: EvolutionSnapshot) selected : IView =
+        match selected |> Option.bind (evolutionNodeForId snapshot) with
+        | None -> card [ overline "NODE DETAILS"; muted "Select a node to inspect its experiment." ]
+        | Some node ->
+            let summaryRows =
+                match node.Summary with
+                | None -> [ muted "No experiment summary was persisted." ]
+                | Some summary ->
+                    [ text summary.Hypothesis 13.0 Theme.text
+                      muted summary.ChangeSummary
+                      muted $"Expected effect: {summary.ExpectedEffect}"
+                      if List.isEmpty summary.ValidationNotes then
+                          muted "No validation notes."
+                      else
+                          let notes = String.concat "; " summary.ValidationNotes
+                          muted $"Validation: {notes}" ]
+
+            let metricText =
+                node.Metric |> Option.map string |> Option.defaultValue "not available"
+
+            let startedText = node.StartedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+
+            card (
+                [ overline "NODE DETAILS"
+                  text $"{node.Label} · {outcomeLabel node.Outcome}" 15.0 Theme.text
+                  muted $"Commit: {shortCommit node.Commit}"
+                  muted $"Metric: {metricText}"
+                  muted $"Started: {startedText}"
+                  yield! summaryRows ]
+            )
+
+    let private evolutionRunSelector (model: Model) (dispatch: Msg -> unit) : IView =
+        if List.isEmpty model.EvolutionRuns then
+            muted "No persisted runs yet. Prepare a run from Setup to begin tracking evolution."
+        else
+            ScrollViewer.create
+                [ ScrollViewer.maxHeight 180.0
+                  ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Auto
+                  ScrollViewer.horizontalScrollBarVisibility ScrollBarVisibility.Disabled
+                  ScrollViewer.content (
+                      WrapPanel.create
+                          [ WrapPanel.orientation Orientation.Horizontal
+                            WrapPanel.itemSpacing 6.0
+                            WrapPanel.lineSpacing 6.0
+                            WrapPanel.children (
+                                model.EvolutionRuns
+                                |> List.map (fun run ->
+                                    let runIdText = RunId.text run.Id
+                                    let runTime = run.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                                    let label = $"{runTime} · {runIdText.Substring(0, 8)} · {run.Status}"
+
+                                    Button.create
+                                        [ Button.horizontalContentAlignment HorizontalAlignment.Left
+                                          Button.content label
+                                          Button.background (
+                                              if model.SelectedEvolutionRun = Some run.Id then
+                                                  Theme.accentDark
+                                              else
+                                                  Theme.surfaceRaised
+                                          )
+                                          Button.foreground Theme.text
+                                          Button.borderBrush Theme.border
+                                          Button.borderThickness 1.0
+                                          Button.padding (Thickness(10.0, 7.0))
+                                          Button.onClick (fun _ -> dispatch (SelectEvolutionRun run.Id)) ]
+                                    :> IView)
+                            ) ]
+                  ) ]
+
+    let private evolutionView (model: Model) (dispatch: Msg -> unit) : IView =
+        let body =
+            match model.Evolution, model.EvolutionBusy with
+            | None, true -> muted "Loading run evolution…"
+            | None, false -> muted "Select a run to inspect its retained frontier and candidate branches."
+            | Some snapshot, _ ->
+                StackPanel.create
+                    [ StackPanel.spacing 14.0
+                      StackPanel.children
+                          [ evolutionGraphView snapshot model.SelectedEvolutionNode dispatch
+                            if not (List.isEmpty snapshot.Warnings) then
+                                card [ overline "PARTIAL DATA"; muted (String.concat " " snapshot.Warnings) ]
+                            else
+                                Border.create []
+                            evolutionDetails snapshot model.SelectedEvolutionNode ] ]
+
+        ScrollViewer.create
+            [ ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Auto
+              ScrollViewer.content (
+                  StackPanel.create
+                      [ StackPanel.margin (Thickness 24.0)
+                        StackPanel.spacing 14.0
+                        StackPanel.children
+                            [ Grid.create
+                                  [ Grid.columnDefinitions "*,Auto"
+                                    Grid.children
+                                        [ heading "Evolution"
+                                          secondaryButton "Refresh" (not model.EvolutionBusy) RefreshEvolution dispatch
+                                          |> fun view -> Border.create [ Grid.column 1; Border.child view ] ] ]
+                              muted
+                                  "Accepted candidates extend the central retained trunk; side branches are preserved rejected or failed attempts."
+                              evolutionRunSelector model dispatch
+                              body ] ]
+              ) ]
+
     let private historyView (model: Model) (dispatch: Msg -> unit) : IView =
         let rows =
             model.History
@@ -671,6 +960,7 @@ module Views =
             match model.Page with
             | Setup -> setupView model dispatch
             | CurrentRun -> currentRunView model dispatch
+            | Evolution -> evolutionView model dispatch
             | History -> historyView model dispatch
             | Settings -> settingsView model
 
@@ -697,6 +987,7 @@ module Views =
                                                 StackPanel.children
                                                     [ navigationButton model.Page Setup "Setup" dispatch
                                                       navigationButton model.Page CurrentRun "Current Run" dispatch
+                                                      navigationButton model.Page Evolution "Evolution" dispatch
                                                       navigationButton model.Page History "History" dispatch
                                                       navigationButton model.Page Settings "Settings" dispatch ] ] ] ]
                           ) ]

@@ -109,6 +109,43 @@ module EvaluationTests =
 
         Assert.Equal(Rejected(ConstraintFailed [ "tests" ]), decision)
 
+module EvolutionTests =
+    let private node id sequence outcome metric parent =
+        { Id = ExperimentNode id
+          Kind = EvolutionNodeKind.Candidate
+          Sequence = sequence
+          Parent = parent
+          Commit = Some(CommitOid.create (String(char (98 + sequence), 40)))
+          Outcome = outcome
+          Metric = metric
+          RetainedScore = None
+          Summary = None
+          EvaluationSummary = None
+          Usage = None
+          StartedAt = DateTimeOffset.UtcNow
+          UpdatedAt = DateTimeOffset.UtcNow
+          Label = string sequence }
+
+    [<Fact>]
+    let ``score points advance only on accepted candidates`` () =
+        let first =
+            node (ExperimentId.create ()) 1 EvolutionOutcome.Accepted (Some 11M) None
+
+        let second =
+            node (ExperimentId.create ()) 2 (EvolutionOutcome.Rejected "not better") (Some 10M) first.Commit
+
+        let points = Evolution.scorePoints Maximize (Some 10M) [ first; second ]
+
+        Assert.Equal<decimal option list>([ Some 10M; Some 11M; Some 11M ], points |> List.map _.RetainedScore)
+
+    [<Fact>]
+    let ``equal metric range still produces usable score points`` () =
+        let candidate =
+            node (ExperimentId.create ()) 1 EvolutionOutcome.Accepted (Some 10M) None
+
+        let points = Evolution.scorePoints Minimize (Some 10M) [ candidate ]
+        Assert.Equal(2, points.Length)
+
     [<Fact>]
     let ``paired metric compares candidate against evaluator frontier from same cycle`` () =
         let pairedMetric =

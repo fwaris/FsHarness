@@ -16,6 +16,33 @@ type HistoryEvent =
       Payload: string
       CreatedAt: DateTimeOffset }
 
+type StoredRun =
+    { Id: RunId
+      SourcePath: string
+      Status: string
+      ConfigJson: string option
+      CreatedAt: DateTimeOffset
+      UpdatedAt: DateTimeOffset }
+
+type StoredExperiment =
+    { Id: ExperimentId
+      RunId: RunId
+      Sequence: int
+      Parent: CommitOid option
+      Candidate: CommitOid option
+      Outcome: string
+      CreatedAt: DateTimeOffset
+      UpdatedAt: DateTimeOffset }
+
+type StoredEvaluation =
+    { ExperimentId: ExperimentId
+      ResultJson: string
+      CreatedAt: DateTimeOffset }
+
+type StoredUsage =
+    { ExperimentId: ExperimentId
+      Usage: TokenUsage option }
+
 type SqliteStore = private { DatabasePath: string }
 
 [<RequireQualifiedAccess>]
@@ -222,6 +249,95 @@ module SqliteStore =
                         persistenceError
                             "sqlite.run_failed"
                             "Could not persist immutable run configuration."
+                            exceptionValue
+                    )
+        }
+
+    let beginExperiment store runId experimentId sequence parent outcome (_: CancellationToken) =
+        async {
+            try
+                use database = connection store
+                database.Open()
+                use command = database.CreateCommand()
+
+                command.CommandText <-
+                    """
+                    INSERT INTO experiments(id, run_id, sequence, parent_oid, candidate_oid, outcome, created_at, updated_at)
+                    VALUES ($id, $run, $sequence, $parent, NULL, $outcome, $created, $updated)
+                    ON CONFLICT(id) DO UPDATE SET
+                        run_id = excluded.run_id,
+                        sequence = excluded.sequence,
+                        parent_oid = excluded.parent_oid,
+                        outcome = excluded.outcome,
+                        updated_at = excluded.updated_at;
+                    """
+
+                let timestamp = DateTimeOffset.UtcNow.ToString("o")
+                addParameter command "$id" (ExperimentId.text experimentId)
+                addParameter command "$run" (RunId.text runId)
+                addParameter command "$sequence" sequence
+                addParameter command "$parent" (parent |> Option.map CommitOid.value |> Option.defaultValue null)
+                addParameter command "$outcome" outcome
+                addParameter command "$created" timestamp
+                addParameter command "$updated" timestamp
+                command.ExecuteNonQuery() |> ignore
+                return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError
+                            "sqlite.experiment_begin_failed"
+                            "Could not persist the planned experiment."
+                            exceptionValue
+                    )
+        }
+
+    let updateExperimentCandidate store experimentId candidate (_: CancellationToken) =
+        async {
+            try
+                use database = connection store
+                database.Open()
+                use command = database.CreateCommand()
+
+                command.CommandText <-
+                    "UPDATE experiments SET candidate_oid = $candidate, updated_at = $updated WHERE id = $id;"
+
+                addParameter command "$id" (ExperimentId.text experimentId)
+                addParameter command "$candidate" (CommitOid.value candidate)
+                addParameter command "$updated" (DateTimeOffset.UtcNow.ToString("o"))
+                command.ExecuteNonQuery() |> ignore
+                return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError
+                            "sqlite.experiment_candidate_failed"
+                            "Could not persist the captured candidate."
+                            exceptionValue
+                    )
+        }
+
+    let completeExperiment store experimentId outcome (_: CancellationToken) =
+        async {
+            try
+                use database = connection store
+                database.Open()
+                use command = database.CreateCommand()
+
+                command.CommandText <-
+                    "UPDATE experiments SET outcome = $outcome, updated_at = $updated WHERE id = $id;"
+
+                addParameter command "$id" (ExperimentId.text experimentId)
+                addParameter command "$outcome" outcome
+                addParameter command "$updated" (DateTimeOffset.UtcNow.ToString("o"))
+                command.ExecuteNonQuery() |> ignore
+                return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError
+                            "sqlite.experiment_complete_failed"
+                            "Could not persist the experiment outcome."
                             exceptionValue
                     )
         }
@@ -529,6 +645,195 @@ module SqliteStore =
             Ok(List.ofSeq events)
         with exceptionValue ->
             Error(persistenceError "sqlite.history_failed" "Could not load run history." exceptionValue)
+
+    let private nullableString (reader: SqliteDataReader) index =
+        if reader.IsDBNull index then
+            None
+        else
+            Some(reader.GetString index)
+
+    let loadRuns store : Result<StoredRun list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                "SELECT runs.id, projects.source_path, runs.status, runs.config_json, runs.created_at, runs.updated_at FROM runs LEFT JOIN projects ON projects.id = runs.project_id ORDER BY runs.created_at DESC;"
+
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredRun>()
+
+            while reader.Read() do
+                results.Add
+                    { Id = RunId.ofGuid (Guid.Parse(reader.GetString 0))
+                      SourcePath = if reader.IsDBNull 1 then "" else reader.GetString 1
+                      Status = reader.GetString 2
+                      ConfigJson = nullableString reader 3
+                      CreatedAt = DateTimeOffset.Parse(reader.GetString 4)
+                      UpdatedAt = DateTimeOffset.Parse(reader.GetString 5) }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(persistenceError "sqlite.runs_load_failed" "Could not load persisted runs." exceptionValue)
+
+    let loadExperiments store runId : Result<StoredExperiment list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                "SELECT id, run_id, sequence, parent_oid, candidate_oid, outcome, created_at, updated_at FROM experiments WHERE run_id = $run ORDER BY sequence, created_at;"
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredExperiment>()
+
+            while reader.Read() do
+                results.Add
+                    { Id = ExperimentId.ofGuid (Guid.Parse(reader.GetString 0))
+                      RunId = RunId.ofGuid (Guid.Parse(reader.GetString 1))
+                      Sequence = reader.GetInt32 2
+                      Parent = nullableString reader 3 |> Option.map CommitOid.create
+                      Candidate = nullableString reader 4 |> Option.map CommitOid.create
+                      Outcome = reader.GetString 5
+                      CreatedAt = DateTimeOffset.Parse(reader.GetString 6)
+                      UpdatedAt = DateTimeOffset.Parse(reader.GetString 7) }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.experiments_load_failed"
+                    "Could not load persisted experiment lineage."
+                    exceptionValue
+            )
+
+    let loadEvaluationsForRun store runId : Result<StoredEvaluation list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                "SELECT experiment_id, result_json, created_at FROM evaluations WHERE run_id = $run ORDER BY created_at;"
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredEvaluation>()
+
+            while reader.Read() do
+                if not (reader.IsDBNull 1) && not (reader.IsDBNull 0) then
+                    results.Add
+                        { ExperimentId = ExperimentId.ofGuid (Guid.Parse(reader.GetString 0))
+                          ResultJson = reader.GetString 1
+                          CreatedAt = DateTimeOffset.Parse(reader.GetString 2) }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.evaluations_load_failed"
+                    "Could not load persisted evaluation results."
+                    exceptionValue
+            )
+
+    let loadUsageForRun store runId : Result<StoredUsage list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                "SELECT experiment_id, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens FROM usage WHERE run_id = $run;"
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredUsage>()
+
+            while reader.Read() do
+                let value index =
+                    if reader.IsDBNull index then
+                        None
+                    else
+                        Some(reader.GetInt64 index)
+
+                let usage =
+                    match value 1, value 2, value 3, value 4 with
+                    | Some input, Some cached, Some output, Some reasoning ->
+                        Some(
+                            TokenUsage.normalize
+                                { InputTokens = input
+                                  CachedInputTokens = cached
+                                  OutputTokens = output
+                                  ReasoningOutputTokens = reasoning }
+                        )
+                    | _ -> None
+
+                results.Add
+                    { ExperimentId = ExperimentId.ofGuid (Guid.Parse(reader.GetString 0))
+                      Usage = usage }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(persistenceError "sqlite.usage_load_failed" "Could not load persisted token usage." exceptionValue)
+
+    let loadEvolutionMemories store runId : Result<MemorySummary list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                """
+                SELECT experiment_id, outcome, metric, hypothesis, change_summary,
+                       expected_effect, validation_notes_json, reusable_lesson
+                FROM memories WHERE run_id = $run ORDER BY created_at;
+                """
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<MemorySummary>()
+
+            while reader.Read() do
+                let metric =
+                    if reader.IsDBNull 2 then
+                        None
+                    else
+                        match Decimal.TryParse(reader.GetString 2) with
+                        | true, value -> Some value
+                        | false, _ -> None
+
+                results.Add
+                    { ExperimentId = ExperimentId.ofGuid (Guid.Parse(reader.GetString 0))
+                      Outcome = reader.GetString 1
+                      Metric = metric
+                      Summary =
+                        { Hypothesis = reader.GetString 3
+                          ChangeSummary = reader.GetString 4
+                          ExpectedEffect = reader.GetString 5
+                          ValidationNotes = JsonSerializer.Deserialize<string list>(reader.GetString 6)
+                          ReusableLesson = reader.GetString 7 } }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.evolution_memories_load_failed"
+                    "Could not load persisted experiment summaries."
+                    exceptionValue
+            )
 
     let countDuplicateHypotheses store runId =
         try

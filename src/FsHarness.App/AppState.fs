@@ -10,6 +10,7 @@ open FsHarness.Infrastructure
 type Page =
     | Setup
     | CurrentRun
+    | Evolution
     | History
     | Settings
 
@@ -49,6 +50,12 @@ type Model =
       Run: RunState option
       Activities: RuntimeActivity list
       History: HistoryEvent list
+      EvolutionRuns: EvolutionRunSummary list
+      SelectedEvolutionRun: RunId option
+      Evolution: EvolutionSnapshot option
+      SelectedEvolutionNode: EvolutionNodeId option
+      EvolutionBusy: bool
+      EvolutionRequestId: int
       Busy: bool
       ExperimentFile: string option
       Error: string option }
@@ -93,6 +100,13 @@ type Msg =
     | ReviewCompleted of Result<unit, HarnessError>
     | RuntimeStateChanged of RunState
     | RuntimeActivityReceived of RuntimeActivity
+    | RuntimeEvolutionChanged of RunId
+    | LoadEvolutionRuns
+    | EvolutionRunsLoaded of Result<EvolutionRunSummary list, HarnessError>
+    | SelectEvolutionRun of RunId
+    | EvolutionLoaded of int * RunId * Result<EvolutionSnapshot, HarnessError>
+    | RefreshEvolution
+    | SelectEvolutionNode of EvolutionNodeId
     | RefreshHistory
     | HistoryLoaded of Result<HistoryEvent list, HarnessError>
     | ClearError
@@ -161,7 +175,8 @@ module AppState =
     let private subscribe (runtime: HarnessRuntime) =
         [ fun dispatch ->
               runtime.StateChanged.Add(RuntimeStateChanged >> dispatch)
-              runtime.Activity.Add(RuntimeActivityReceived >> dispatch) ]
+              runtime.Activity.Add(RuntimeActivityReceived >> dispatch)
+              runtime.EvolutionChanged.Add(RuntimeEvolutionChanged >> dispatch) ]
 
     let init (runtime: HarnessRuntime) =
         { Page = Setup
@@ -172,6 +187,12 @@ module AppState =
           Run = runtime.State
           Activities = []
           History = []
+          EvolutionRuns = []
+          SelectedEvolutionRun = None
+          Evolution = None
+          SelectedEvolutionNode = None
+          EvolutionBusy = false
+          EvolutionRequestId = 0
           Busy = false
           ExperimentFile = None
           Error = None },
@@ -265,13 +286,16 @@ module AppState =
         (message: Msg)
         (model: Model)
         =
+        let loadEvolution runId requestId =
+            Cmd.OfAsync.perform (fun () -> runtime.LoadEvolution(runId, CancellationToken.None)) () (fun result ->
+                EvolutionLoaded(requestId, runId, result))
+
         match message with
         | Navigate page ->
             let command =
-                if page = History then
-                    Cmd.ofMsg RefreshHistory
-                else
-                    Cmd.none
+                if page = History then Cmd.ofMsg RefreshHistory
+                elif page = Evolution then Cmd.ofMsg LoadEvolutionRuns
+                else Cmd.none
 
             { model with Page = page }, command
         | DraftChanged(field, value) ->
@@ -458,10 +482,123 @@ module AppState =
                     Busy = false
                     Error = Some(errorText error) },
                 Cmd.none
-        | RuntimeStateChanged run -> { model with Run = Some run }, Cmd.none
+        | RuntimeStateChanged run ->
+            let shouldRefresh =
+                model.Page = Evolution && model.SelectedEvolutionRun = Some run.Id
+
+            let nextRequest =
+                if shouldRefresh then
+                    model.EvolutionRequestId + 1
+                else
+                    model.EvolutionRequestId
+
+            let command =
+                if shouldRefresh then
+                    loadEvolution run.Id nextRequest
+                else
+                    Cmd.none
+
+            { model with
+                Run = Some run
+                EvolutionRequestId = nextRequest
+                EvolutionBusy = shouldRefresh || model.EvolutionBusy },
+            command
         | RuntimeActivityReceived event ->
             { model with
                 Activities = event :: model.Activities |> List.truncate 2_000 },
+            Cmd.none
+        | RuntimeEvolutionChanged runId ->
+            if model.Page = Evolution && model.SelectedEvolutionRun = Some runId then
+                let requestId = model.EvolutionRequestId + 1
+
+                { model with
+                    EvolutionRequestId = requestId
+                    EvolutionBusy = true },
+                loadEvolution runId requestId
+            else
+                model, Cmd.none
+        | LoadEvolutionRuns ->
+            { model with
+                EvolutionBusy = true
+                Error = None },
+            Cmd.OfAsync.perform (fun () -> runtime.ListEvolutionRuns CancellationToken.None) () EvolutionRunsLoaded
+        | EvolutionRunsLoaded result ->
+            match result with
+            | Error error ->
+                { model with
+                    EvolutionBusy = false
+                    Error = Some(errorText error) },
+                Cmd.none
+            | Ok runs ->
+                let selected =
+                    model.SelectedEvolutionRun
+                    |> Option.filter (fun id -> runs |> List.exists (fun item -> item.Id = id))
+                    |> Option.orElseWith (fun () ->
+                        model.Run
+                        |> Option.map _.Id
+                        |> Option.filter (fun id -> runs |> List.exists (fun item -> item.Id = id)))
+                    |> Option.orElseWith (fun () -> runs |> List.tryHead |> Option.map _.Id)
+
+                let next =
+                    { model with
+                        EvolutionRuns = runs
+                        SelectedEvolutionRun = selected
+                        Evolution = None
+                        SelectedEvolutionNode = None
+                        EvolutionBusy = selected.IsSome
+                        Error = None }
+
+                match selected with
+                | Some runId ->
+                    let requestId = model.EvolutionRequestId + 1
+
+                    { next with
+                        EvolutionRequestId = requestId },
+                    loadEvolution runId requestId
+                | None -> { next with EvolutionBusy = false }, Cmd.none
+        | SelectEvolutionRun runId ->
+            let requestId = model.EvolutionRequestId + 1
+
+            { model with
+                SelectedEvolutionRun = Some runId
+                Evolution = None
+                SelectedEvolutionNode = None
+                EvolutionBusy = true
+                EvolutionRequestId = requestId
+                Error = None },
+            loadEvolution runId requestId
+        | EvolutionLoaded(requestId, runId, result) when requestId = model.EvolutionRequestId ->
+            match result with
+            | Ok snapshot when model.SelectedEvolutionRun = Some runId ->
+                { model with
+                    EvolutionRuns =
+                        model.EvolutionRuns
+                        |> List.map (fun run -> if run.Id = runId then snapshot.Run else run)
+                    Evolution = Some snapshot
+                    EvolutionBusy = false
+                    Error = None },
+                Cmd.none
+            | Error error when model.SelectedEvolutionRun = Some runId ->
+                { model with
+                    Evolution = None
+                    EvolutionBusy = false
+                    Error = Some(errorText error) },
+                Cmd.none
+            | _ -> model, Cmd.none
+        | EvolutionLoaded _ -> model, Cmd.none
+        | RefreshEvolution ->
+            match model.SelectedEvolutionRun with
+            | None -> model, Cmd.ofMsg LoadEvolutionRuns
+            | Some runId ->
+                let requestId = model.EvolutionRequestId + 1
+
+                { model with
+                    EvolutionRequestId = requestId
+                    EvolutionBusy = true },
+                loadEvolution runId requestId
+        | SelectEvolutionNode nodeId ->
+            { model with
+                SelectedEvolutionNode = Some nodeId },
             Cmd.none
         | RefreshHistory -> { model with Busy = true }, Cmd.ofMsg (HistoryLoaded(runtime.History 500))
         | HistoryLoaded result ->

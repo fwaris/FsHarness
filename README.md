@@ -56,6 +56,14 @@ The executable and argument list are passed with `ProcessStartInfo.ArgumentList`
 
 Missing terminal token usage is not interpreted as zero: the active candidate is evaluated and then the run pauses because the remaining budget cannot be enforced. Raw and uncached totals use the Codex counters without double-counting cached input or reasoning output.
 
+## Evolution view
+
+The **Evolution** page lets you select any persisted run and inspect its retained frontier over time. The lineage view places the baseline and accepted candidates on the central trunk; rejected, failed, inconclusive, and cancelled candidates remain visible as terminal side branches. Seed patches appear before Codex attempts.
+
+The metric view uses the configured metric's raw values and overlays the retained-score line, which advances only when a candidate is accepted. Selecting a node shows its outcome, commit, metric, timestamp, and any persisted experiment summary. New runs populate the SQLite experiment projection as they execute and refresh the page live through the runtime lineage event.
+
+Older runs are reconstructed best-effort from their journal events, evaluations, memories, and private Git refs. If an older run is missing metadata or its private repository, the page shows the available partial lineage and a warning rather than changing the stored run. The visualization describes FsHarness's existing single-frontier ratchet; it does not schedule independent branches.
+
 ## Hypothesis benchmark
 
 The frozen benchmark contract and scorer are in `HypothesisBenchmark`. It defines four task categories and three arms:

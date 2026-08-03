@@ -25,6 +25,59 @@ type HeadlessAppBuilder =
 
 module UiTests =
     [<Fact>]
+    let ``evolution page constructs a selectable graph and score view`` () =
+        use runtime = new HarnessRuntime("codex")
+        let model, _ = AppState.init runtime
+        let runId = RunId.create ()
+        let experimentId = ExperimentId.create ()
+        let baseline = CommitOid.create (String('a', 40))
+        let candidate = CommitOid.create (String('b', 40))
+        let now = DateTimeOffset.UtcNow
+
+        let run =
+            { Id = runId
+              SourcePath = "C:\\source"
+              Status = "Completed"
+              CreatedAt = now
+              UpdatedAt = now
+              MetricName = "primary"
+              Direction = Maximize
+              BaselineCommit = Some baseline
+              BaselineScore = Some 1M
+              FrontierScore = Some 2M
+              AttemptCount = 1
+              AcceptedCount = 1 }
+
+        let snapshot =
+            { Run = run
+              Frontier = Some candidate
+              Warnings = []
+              Nodes =
+                [ { Id = ExperimentNode experimentId
+                    Kind = EvolutionNodeKind.Candidate
+                    Sequence = 1
+                    Parent = Some baseline
+                    Commit = Some candidate
+                    Outcome = EvolutionOutcome.Accepted
+                    Metric = Some 2M
+                    RetainedScore = Some 2M
+                    Summary = None
+                    EvaluationSummary = Some "ok"
+                    Usage = None
+                    StartedAt = now
+                    UpdatedAt = now
+                    Label = "Attempt 1" } ] }
+
+        let evolutionModel =
+            { model with
+                Page = Evolution
+                EvolutionRuns = [ run ]
+                SelectedEvolutionRun = Some runId
+                Evolution = Some snapshot }
+
+        Assert.NotNull(Views.view evolutionModel ignore)
+
+    [<Fact>]
     let ``shell renders at both supported viewport sizes and accepts keyboard focus`` () =
         use session = HeadlessUnitTestSession.StartNew(typeof<HeadlessAppBuilder>)
 
@@ -59,6 +112,15 @@ module UiTests =
                             |> Seq.tryExactlyOne
 
                         Assert.True(loadExperiment.IsSome, "Setup should expose experiment loading.")
+
+                        let evolution =
+                            window.GetVisualDescendants()
+                            |> Seq.choose (function
+                                | :? Button as button when string button.Content = "Evolution" -> Some button
+                                | _ -> None)
+                            |> Seq.tryExactlyOne
+
+                        Assert.True(evolution.IsSome, "The shell should expose the Evolution page.")
 
                         window.KeyPressQwerty(PhysicalKey.Tab, RawInputModifiers.None)
                         Assert.NotNull(window.FocusManager.GetFocusedElement())

@@ -187,8 +187,115 @@ module GitStore =
         }
 
     let private repoPath store runId = DataPaths.repository store.Root runId
+
     let private runRef runId suffix =
         $"refs/fsharness/runs/{RunId.text runId}/{suffix}"
+
+    type GitLineage =
+        { Baseline: CommitOid option
+          Frontier: CommitOid option
+          Candidates: Map<ExperimentId, CommitOid * CommitOid option> }
+
+    let loadLineage store runId cancellationToken : Async<Result<GitLineage, HarnessError>> =
+        async {
+            let repository = repoPath store runId
+
+            if not (File.Exists repository) then
+                return
+                    Error(
+                        HarnessError.create
+                            "git.lineage_repository_missing"
+                            HarnessErrorCategory.Git
+                            "The private Git repository for this run is missing."
+                    )
+            else
+                let! refsResult =
+                    requireSuccess
+                        store
+                        "lineage_refs"
+                        None
+                        [ "--git-dir"
+                          repository
+                          "for-each-ref"
+                          "--format=%(refname)\t%(objectname)"
+                          (runRef runId "") ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                match refsResult with
+                | Error error -> return Error error
+                | Ok refsText ->
+                    let prefix = runRef runId ""
+                    let candidatePrefix = runRef runId "candidates/"
+
+                    let parsedRefs =
+                        refsText.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.toList
+                        |> List.choose (fun line ->
+                            match line.Split('\t', 2, StringSplitOptions.None) with
+                            | [| name; oid |] when name.StartsWith(prefix, StringComparison.Ordinal) ->
+                                Some(name.Trim(), oid.Trim())
+                            | _ -> None)
+
+                    let commitByExperiment =
+                        parsedRefs
+                        |> List.choose (fun (name, oid) ->
+                            if name.StartsWith(candidatePrefix, StringComparison.Ordinal) then
+                                let suffix = name.Substring(candidatePrefix.Length)
+
+                                match Guid.TryParse suffix with
+                                | true, value -> Some(ExperimentId.ofGuid value, CommitOid.create oid)
+                                | false, _ -> None
+                            else
+                                None)
+
+                    let parentFor (commit: CommitOid) =
+                        async {
+                            let! result =
+                                requireSuccess
+                                    store
+                                    "lineage_parent"
+                                    None
+                                    [ "--git-dir"
+                                      repository
+                                      "rev-list"
+                                      "--parents"
+                                      "--max-count=1"
+                                      (CommitOid.value commit) ]
+                                    None
+                                    Map.empty
+                                    cancellationToken
+
+                            return
+                                match result with
+                                | Error _ -> None
+                                | Ok text ->
+                                    text.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                                    |> Array.tryItem 1
+                                    |> Option.map CommitOid.create
+                        }
+
+                    let mutable candidates = Map.empty
+
+                    for experimentId, commit in commitByExperiment do
+                        let! parent = parentFor commit
+                        candidates <- candidates.Add(experimentId, (commit, parent))
+
+                    let findRef suffix =
+                        parsedRefs
+                        |> List.tryPick (fun (name, oid) ->
+                            if name = runRef runId suffix then
+                                Some(CommitOid.create oid)
+                            else
+                                None)
+
+                    return
+                        Ok
+                            { Baseline = findRef "baseline"
+                              Frontier = findRef "frontier"
+                              Candidates = candidates }
+        }
 
     let createRun store runId inspection cancellationToken =
         async {
@@ -424,8 +531,7 @@ module GitStore =
 
                 let editable, initiallyProtected = PathPolicy.partition editableGlobs changed
 
-                let experimentRoot =
-                    DataPaths.experiment store.Root runId workspace.ExperimentId
+                let experimentRoot = DataPaths.experiment store.Root runId workspace.ExperimentId
 
                 let assembly = Path.Combine(experimentRoot, "assembly")
                 let evaluation = Path.Combine(experimentRoot, "evaluation")

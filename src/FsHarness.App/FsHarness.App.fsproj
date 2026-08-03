@@ -4,6 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="AppState.fs" />
+    <Compile Include="EvolutionLayout.fs" />
     <Compile Include="Views.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

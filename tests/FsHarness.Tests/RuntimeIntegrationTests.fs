@@ -143,5 +143,25 @@ module RuntimeIntegrationTests =
             let pending = history |> List.findIndex (fun event -> event.Kind = "AcceptPending")
             let accepted = history |> List.findIndex (fun event -> event.Kind = "Accepted")
             Assert.True(pending < accepted)
+
+            let runs =
+                runtime.ListEvolutionRuns(CancellationToken.None)
+                |> Async.RunSynchronously
+                |> getResult
+
+            let listed = Assert.Single runs
+            Assert.Equal(runtime.State.Value.Id, listed.Id)
+
+            let snapshot =
+                runtime.LoadEvolution(listed.Id, CancellationToken.None)
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.Equal(1, snapshot.Nodes.Length)
+            Assert.Equal(1, snapshot.Run.AcceptedCount)
+            Assert.Equal(2M, snapshot.Run.FrontierScore.Value)
+            Assert.Equal(sourceHead, CommitOid.value snapshot.Run.BaselineCommit.Value)
+            Assert.Equal(sourceHead, CommitOid.value snapshot.Nodes.Head.Parent.Value)
+            Assert.Contains(snapshot.Nodes, fun node -> node.Outcome = EvolutionOutcome.Accepted)
         finally
             deleteTree temporary
