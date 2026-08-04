@@ -36,6 +36,19 @@ type MainWindow() as this =
                 return Error $"Unable to open the repository folder picker: {error.Message}"
         }
 
+    let pickDataRootFolder () =
+        async {
+            try
+                let options =
+                    FolderPickerOpenOptions(Title = "Select the FsHarness data root", AllowMultiple = false)
+
+                let! folders = this.StorageProvider.OpenFolderPickerAsync options |> Async.AwaitTask
+
+                return folders |> Seq.tryHead |> Option.map (fun folder -> folder.Path.LocalPath) |> Ok
+            with error ->
+                return Error $"Unable to open the data-root folder picker: {error.Message}"
+        }
+
     let experimentFileType () =
         let fileType = FilePickerFileType("FsHarness experiment")
         fileType.Patterns <- [ "*.json" ]
@@ -98,7 +111,7 @@ type MainWindow() as this =
 
         Program.mkProgram
             (fun () -> AppState.init runtime)
-            (AppState.update runtime pickRepositoryFolder loadExperiment saveExperiment)
+            (AppState.update runtime pickRepositoryFolder pickDataRootFolder loadExperiment saveExperiment)
             Views.view
         |> Program.withHost this
         |> Program.runWithAvaloniaSyncDispatch ()

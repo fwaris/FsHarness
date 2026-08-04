@@ -104,6 +104,15 @@ module UiTests =
 
                         Assert.True(browse.IsSome, "The repository field should expose a folder picker.")
 
+                        let dataRootBrowse =
+                            window.GetVisualDescendants()
+                            |> Seq.choose (function
+                                | :? Button as button when string button.Content = "Browse data root" -> Some button
+                                | _ -> None)
+                            |> Seq.tryExactlyOne
+
+                        Assert.True(dataRootBrowse.IsSome, "The data-root field should expose a folder picker.")
+
                         let loadExperiment =
                             window.GetVisualDescendants()
                             |> Seq.choose (function
@@ -152,6 +161,7 @@ module UiTests =
                 runtime
                 (fun () -> async { return Ok None })
                 (fun () -> async { return Ok None })
+                (fun () -> async { return Ok None })
                 (fun _ -> async { return Ok None })
                 (RepositoryFolderSelected(Ok(Some selectedPath)))
                 { model with
@@ -198,6 +208,7 @@ module UiTests =
         let loaded, _ =
             AppState.update
                 runtime
+                (fun () -> async { return Ok None })
                 (fun () -> async { return Ok None })
                 (fun () -> async { return Ok None })
                 (fun _ -> async { return Ok None })

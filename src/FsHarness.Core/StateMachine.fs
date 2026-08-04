@@ -62,16 +62,17 @@ type RunState =
 
 type RunEvent =
     | StartRequested of ExperimentId * DateTimeOffset
-    | WorktreePrepared
-    | GenerationCompleted of threadId: string * usage: TokenUsage option * summary: ExperimentSummary
-    | CandidateCaptured of CommitOid
-    | ProtectedPathDetected of string list
-    | EvaluationCompleted of EvaluationResult
-    | EvaluationInconclusive of string
-    | FrontierAdvanced
-    | ReviewAccepted
-    | ReviewRejected
-    | ExperimentFailed of HarnessError
+    | WorktreePrepared of ExperimentId
+    | GenerationCompleted of ExperimentId * threadId: string * usage: TokenUsage option * summary: ExperimentSummary
+    | CandidateCaptured of ExperimentId * CommitOid
+    | ProtectedPathDetected of ExperimentId * string list
+    | EvaluationCompleted of ExperimentId * EvaluationResult
+    | EvaluationInconclusive of ExperimentId * string
+    | PromotionStarted of ExperimentId
+    | FrontierAdvanced of ExperimentId
+    | ReviewAccepted of ExperimentId
+    | ReviewRejected of ExperimentId
+    | ExperimentFailed of ExperimentId * HarnessError
     | PauseRequested
     | ResumeRequested
     | StopRequested
@@ -258,12 +259,16 @@ module RunState =
             ->
             finishExperiment now (InvalidProtectedPath paths) state
             |> fun (next, effects) -> next, PersistRejected(active.Id, InvalidProtectedPath paths) :: effects
-        | EvaluationInconclusive reason, _, Some active when active.Phase = Evaluating ->
+        | EvaluationInconclusive(experimentId, reason), _, Some active when
+            active.Id = experimentId && active.Phase = Evaluating
+            ->
             let next, _ = finishExperiment now (InconclusiveEvaluation reason) state
 
             { next with Status = Paused reason },
             [ PersistRejected(active.Id, InconclusiveEvaluation reason); PublishState ]
-        | EvaluationCompleted evaluation, (Running | PauseAfterCurrent), Some active when active.Phase = Evaluating ->
+        | EvaluationCompleted(experimentId, evaluation), (Running | PauseAfterCurrent), Some active when
+            active.Id = experimentId && active.Phase = Evaluating
+            ->
             let evaluatedState =
                 { state with
                     Current =

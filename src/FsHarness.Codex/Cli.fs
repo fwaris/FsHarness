@@ -367,14 +367,20 @@ module Cli =
                                           WritePolicy = policy }
         }
 
-    let private codexArguments (request: CodexRequest) =
-        let writePolicy =
-            match Environment.GetEnvironmentVariable "FSHARNESS_CODEX_WRITE_POLICY" with
-            | value when String.Equals(value, "unrestricted", StringComparison.OrdinalIgnoreCase) ->
-                [ "--dangerously-bypass-approvals-and-sandbox" ]
-            | _ ->
-                [ "--sandbox"; "workspace-write" ]
+    let preflight (executable: string) (cancellationToken: CancellationToken) =
+        async {
+            match parseWritePolicy () with
+            | Error error -> return Error error
+            | Ok policy -> return! preflightWithPolicy policy executable cancellationToken
+        }
 
+    let private writePolicyArguments policy =
+        match policy with
+        | CodexWritePolicy.Unrestricted -> [ "--dangerously-bypass-approvals-and-sandbox" ]
+        | CodexWritePolicy.WorkspaceWrite -> [ "--sandbox"; "workspace-write" ]
+        | CodexWritePolicy.ReadOnly -> [ "--sandbox"; "read-only" ]
+
+    let argumentsFor (policy: CodexWritePolicy) (request: CodexRequest) =
         [ "exec"
           "--json"
           "--color"
@@ -384,7 +390,7 @@ module Cli =
           "--strict-config"
           "--model"
           request.Model.Id
-          yield! writePolicy
+          yield! writePolicyArguments policy
           "-C"
           request.WorkingDirectory
           "--output-schema"
