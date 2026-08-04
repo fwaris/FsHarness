@@ -200,7 +200,7 @@ module GitStore =
         async {
             let repository = repoPath store runId
 
-            if not (Directory.Exists repository) then
+            if not (File.Exists repository) then
                 return
                     Error(
                         HarnessError.create

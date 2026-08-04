@@ -27,6 +27,7 @@ Setup performs source inspection, `codex --version`, `codex login status`, `code
 
 Setup can load and save schema-v2 experiment JSON through the native file picker. Loading restores the complete campaign configuration, including paired comparison, seed patches, evaluator timeout/retries, prompt limits, reasoning effort, and run budgets; the repository must then be inspected again so the app pins its current committed HEAD. Saving requires a successful repository inspection because `baseCommit` is part of the reproducible experiment file. Files saved by the app can be passed directly to the headless `fsharness run --config` command.
 
+<<<<<<< HEAD
 ## Headless and operational CLI
 
 The CLI can start or recover campaigns and inspect all durable orchestration surfaces:
@@ -50,6 +51,8 @@ fsharness health --run-id <guid>
 
 Use `--data-root <dir>` when the run is outside the platform-default data directory. On Windows, use a short root outside the source checkout—such as `E:\fsh\r12`—and keep the run folder name short. Do not place private worktrees below `<repository>\.fsharness\runs-*`: native ONNX Runtime provider DLLs can otherwise exceed the Windows path limit (Error 206). The desktop Setup page also shows the data root for the next run and lets you edit it or choose a folder; the selected root takes effect when you prepare the private run and cannot replace an active or prepared run. `FSHARNESS_DATA_DIR` can set the initial desktop root. `resume` verifies the source and Codex preflight, reconciles pending frontier operations, checks artifact hashes, restores usage and attempt counters, and refuses to exceed an already-consumed budget.
 
+=======
+>>>>>>> be7b8aad37f34892198ae316552574a02e58a15a
 ## Evaluator protocol
 
 The evaluator is launched directly, without a shell and without inherited secret environment variables. Its working directory is relative to the clean candidate worktree. `FSHARNESS_RESULT_PATH` is the only result destination. Exit zero means evaluation completed, even if quality constraints failed. The evaluator must atomically write:
@@ -87,23 +90,11 @@ Missing terminal token usage is not interpreted as zero: the active candidate is
 
 ## Evolution view
 
-The **Evolution** page lets you select any persisted run and inspect its retained frontier over time. The lineage view places the baseline and accepted candidates on the central trunk; rejected, failed, inconclusive, and cancelled candidates remain visible as side branches. Seed patches appear before Codex attempts.
+The **Evolution** page lets you select any persisted run and inspect its retained frontier over time. The lineage view places the baseline and accepted candidates on the central trunk; rejected, failed, inconclusive, and cancelled candidates remain visible as terminal side branches. Seed patches appear before Codex attempts.
 
 The metric view uses the configured metric's raw values and overlays the retained-score line, which advances only when a candidate is accepted. Selecting a node shows its outcome, commit, metric, timestamp, and any persisted experiment summary. New runs populate the SQLite experiment projection as they execute and refresh the page live through the runtime lineage event.
 
-Older runs are reconstructed best-effort from their journal events, evaluations, memories, and private Git refs. If an older run is missing metadata or its private repository, the page shows the available partial lineage and a warning rather than changing the stored run. The same graph is available programmatically and through `children`, `leaves`, `lineage`, and `diff` CLI commands.
-
-## Plans and agents
-
-Every foreground experiment persists a typed four-step plan: generate, snapshot, evaluate, and decide. Work items declare dependencies, required tool capabilities, priority, token allowance, duration, and retry limits. Invalid references, cycles, self-dependencies, missing tools, exhausted budgets, and deadlines fail or close work explicitly.
-
-`PlanExecutor` and `HarnessRuntime.ExecuteWorkPlan` execute custom plans in dependency-ready waves. `MultiAgent.run` bounds concurrency with `AsyncSeq.mapAsyncParallelThrottled`; aggregation is stable across completion order and reports overlapping changed paths. The desktop's default frontier campaign remains intentionally serial because it has one compare-and-swap frontier, while custom plans can perform independent research, implementation, evaluation, and review work concurrently.
-
-## Provenance and collaboration
-
-Completed candidate evaluations are ingested into a run-scoped knowledge graph as entities and sourced claims. Claims require at least one known provenance source and support aliases, confidence, typed values, and supersession. `knowledge` performs bounded lexical retrieval with source locations included in every result.
-
-Human or external-system notes can target a run, experiment, or knowledge claim. Annotations are immutable timeline entries exposed through runtime APIs and the CLI. `health` verifies private Git refs, artifact SHA-256 values, pending durable operations, work plans, and knowledge storage without mutating the run.
+Older runs are reconstructed best-effort from their journal events, evaluations, memories, and private Git refs. If an older run is missing metadata or its private repository, the page shows the available partial lineage and a warning rather than changing the stored run. The visualization describes FsHarness's existing single-frontier ratchet; it does not schedule independent branches.
 
 ## Hypothesis benchmark
 
