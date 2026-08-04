@@ -6,11 +6,6 @@
     <Compile Include="Evaluation.fs" />
     <Compile Include="Prompt.fs" />
     <Compile Include="Evolution.fs" />
-    <Compile Include="WorkGraph.fs" />
-    <Compile Include="Planning.fs" />
-    <Compile Include="Agents.fs" />
-    <Compile Include="KnowledgeGraph.fs" />
-    <Compile Include="Collaboration.fs" />
     <Compile Include="StateMachine.fs" />
     <Compile Include="Ports.fs" />
   </ItemGroup>

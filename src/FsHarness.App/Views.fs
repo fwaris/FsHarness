@@ -147,32 +147,6 @@ module Views =
                                       Button.padding (Thickness(15.0, 9.0))
                                       Button.onClick (fun _ -> dispatch BrowseRepository) ] ] ] ] ]
 
-    let private dataRootField (value: string) (enabled: bool) (dispatch: Msg -> unit) : IView =
-        StackPanel.create
-            [ StackPanel.spacing 5.0
-              StackPanel.children
-                  [ muted "FsHarness data root for the next run"
-                    Grid.create
-                        [ Grid.columnDefinitions "*,Auto"
-                          Grid.columnSpacing 8.0
-                          Grid.children
-                              [ TextBox.create
-                                    [ TextBox.text value
-                                      TextBox.foreground Theme.text
-                                      TextBox.background Theme.surfaceRaised
-                                      TextBox.borderBrush Theme.border
-                                      TextBox.onTextChanged (fun next -> dispatch (DataRootChanged next)) ]
-                                Button.create
-                                    [ Grid.column 1
-                                      Button.content "Browse data root"
-                                      Button.isEnabled enabled
-                                      Button.background Theme.surfaceRaised
-                                      Button.foreground Theme.text
-                                      Button.borderBrush Theme.border
-                                      Button.borderThickness 1.0
-                                      Button.padding (Thickness(15.0, 9.0))
-                                      Button.onClick (fun _ -> dispatch BrowseDataRoot) ] ] ] ] ]
-
     let private errorBanner (error: string) (dispatch: Msg -> unit) : IView =
         Border.create
             [ Border.background Theme.dangerDark

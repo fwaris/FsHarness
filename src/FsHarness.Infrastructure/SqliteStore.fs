@@ -46,34 +46,6 @@ type StoredUsage =
     { ExperimentId: ExperimentId
       Usage: TokenUsage option }
 
-type StoredArtifact =
-    { Id: int64
-      RunId: RunId
-      ExperimentId: ExperimentId option
-      Kind: string
-      Path: string
-      Sha256: string option
-      CreatedAt: DateTimeOffset }
-
-type DurableOperation =
-    { RunId: RunId
-      ExperimentId: ExperimentId
-      Kind: string
-      Status: string
-      Payload: string
-      CreatedAt: DateTimeOffset
-      UpdatedAt: DateTimeOffset }
-
-type StoredWorkPlan =
-    { Id: WorkPlanId
-      RunId: RunId
-      ExperimentId: ExperimentId
-      Objective: string
-      PlanJson: string
-      Status: string
-      CreatedAt: DateTimeOffset
-      UpdatedAt: DateTimeOffset }
-
 type SqliteStore = private { DatabasePath: string }
 
 [<RequireQualifiedAccess>]
@@ -355,7 +327,7 @@ module SqliteStore =
                    direction = direction
                    minDelta = config.Metric.MinDelta
                    target = config.Metric.Target |> Option.map box |> Option.defaultValue null
-                   comparison = comparison |}
+                   comparison = string config.Metric.Comparison |}
                model =
                 {| id = config.Model.Id
                    reasoningEffort = ReasoningEffort.toConfigValue config.Model.Effort |}
@@ -441,15 +413,7 @@ module SqliteStore =
                 addParameter command "$id" (ExperimentId.text experimentId)
                 addParameter command "$run" (RunId.text runId)
                 addParameter command "$sequence" sequence
-
-                addParameter
-                    command
-                    "$parent"
-                    (parent
-                     |> Option.map CommitOid.value
-                     |> Option.map box
-                     |> Option.defaultValue DBNull.Value)
-
+                addParameter command "$parent" (parent |> Option.map CommitOid.value |> Option.defaultValue null)
                 addParameter command "$outcome" outcome
                 addParameter command "$created" timestamp
                 addParameter command "$updated" timestamp
@@ -1511,126 +1475,6 @@ module SqliteStore =
             Ok(List.ofSeq events)
         with exceptionValue ->
             Error(persistenceError "sqlite.history_failed" "Could not load run history." exceptionValue)
-
-    let loadEventsForRun store runId : Result<HistoryEvent list, HarnessError> =
-        try
-            use database = connection store
-            database.Open()
-            use command = database.CreateCommand()
-
-            command.CommandText <-
-                "SELECT sequence, run_id, experiment_id, kind, payload, created_at FROM events WHERE run_id = $run ORDER BY sequence;"
-
-            addParameter command "$run" (RunId.text runId)
-            use reader = command.ExecuteReader()
-            let events = ResizeArray<HistoryEvent>()
-
-            while reader.Read() do
-                events.Add
-                    { Sequence = reader.GetInt64 0
-                      RunId = RunId.ofGuid (Guid.Parse(reader.GetString 1))
-                      ExperimentId =
-                        if reader.IsDBNull 2 then
-                            None
-                        else
-                            Some(ExperimentId.ofGuid (Guid.Parse(reader.GetString 2)))
-                      Kind = reader.GetString 3
-                      Payload = reader.GetString 4
-                      CreatedAt = DateTimeOffset.Parse(reader.GetString 5) }
-
-            Ok(List.ofSeq events)
-        with exceptionValue ->
-            Error(
-                persistenceError
-                    "sqlite.run_history_failed"
-                    "Could not load the selected run's event history."
-                    exceptionValue
-            )
-
-    let loadArtifactsForRun store runId : Result<StoredArtifact list, HarnessError> =
-        try
-            use database = connection store
-            database.Open()
-            use command = database.CreateCommand()
-
-            command.CommandText <-
-                "SELECT id, run_id, experiment_id, kind, path, sha256, created_at FROM artifacts WHERE run_id = $run ORDER BY id;"
-
-            addParameter command "$run" (RunId.text runId)
-            use reader = command.ExecuteReader()
-            let artifacts = ResizeArray<StoredArtifact>()
-
-            while reader.Read() do
-                artifacts.Add
-                    { Id = reader.GetInt64 0
-                      RunId = RunId.ofGuid (Guid.Parse(reader.GetString 1))
-                      ExperimentId =
-                        if reader.IsDBNull 2 then
-                            None
-                        else
-                            Some(ExperimentId.ofGuid (Guid.Parse(reader.GetString 2)))
-                      Kind = reader.GetString 3
-                      Path = reader.GetString 4
-                      Sha256 = if reader.IsDBNull 5 then None else Some(reader.GetString 5)
-                      CreatedAt = DateTimeOffset.Parse(reader.GetString 6) }
-
-            Ok(List.ofSeq artifacts)
-        with exceptionValue ->
-            Error(
-                persistenceError
-                    "sqlite.artifacts_load_failed"
-                    "Could not load persisted artifact metadata."
-                    exceptionValue
-            )
-
-    let verifyArtifact (artifact: StoredArtifact) =
-        match artifact.Sha256 with
-        | None -> Error $"Artifact '{artifact.Path}' has no persisted hash."
-        | Some _ when not (File.Exists artifact.Path) -> Error $"Artifact '{artifact.Path}' is missing."
-        | Some expected ->
-            let actual = AtomicFile.sha256 artifact.Path
-
-            if String.Equals(expected, actual, StringComparison.OrdinalIgnoreCase) then
-                Ok()
-            else
-                Error $"Artifact '{artifact.Path}' failed SHA-256 verification."
-
-    let loadPendingOperations store runId : Result<DurableOperation list, HarnessError> =
-        try
-            use database = connection store
-            database.Open()
-            use command = database.CreateCommand()
-
-            command.CommandText <-
-                """
-                SELECT run_id, experiment_id, kind, status, payload, created_at, updated_at
-                FROM durable_operations
-                WHERE run_id = $run AND status = 'pending'
-                ORDER BY created_at;
-                """
-
-            addParameter command "$run" (RunId.text runId)
-            use reader = command.ExecuteReader()
-            let operations = ResizeArray<DurableOperation>()
-
-            while reader.Read() do
-                operations.Add
-                    { RunId = RunId.ofGuid (Guid.Parse(reader.GetString 0))
-                      ExperimentId = ExperimentId.ofGuid (Guid.Parse(reader.GetString 1))
-                      Kind = reader.GetString 2
-                      Status = reader.GetString 3
-                      Payload = reader.GetString 4
-                      CreatedAt = DateTimeOffset.Parse(reader.GetString 5)
-                      UpdatedAt = DateTimeOffset.Parse(reader.GetString 6) }
-
-            Ok(List.ofSeq operations)
-        with exceptionValue ->
-            Error(
-                persistenceError
-                    "sqlite.operations_load_failed"
-                    "Could not load pending durable operations."
-                    exceptionValue
-            )
 
     let private nullableString (reader: SqliteDataReader) index =
         if reader.IsDBNull index then
