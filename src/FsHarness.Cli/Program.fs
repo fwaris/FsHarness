@@ -272,7 +272,12 @@ module Program =
                 eprintfn "%s" (describeError error)
                 3
             | Ok report ->
-                eprintfn "Prepared run %s at score %M." (RunId.text report.RunId) report.BaselineScore
+                eprintfn
+                    "Prepared run %s at score %M (Codex write policy: %s)."
+                    (RunId.text report.RunId)
+                    report.BaselineScore
+                    (CodexWritePolicy.label report.Codex.WritePolicy)
+
                 executePrepared options runtime report config
 
     let private resume options =
@@ -289,7 +294,12 @@ module Program =
             eprintfn "%s" (describeError error)
             3
         | Ok report ->
-            eprintfn "Recovered run %s at score %M." (RunId.text report.RunId) report.BaselineScore
+            eprintfn
+                "Recovered run %s at score %M (Codex write policy: %s)."
+                (RunId.text report.RunId)
+                report.BaselineScore
+                (CodexWritePolicy.label report.Codex.WritePolicy)
+
             executePrepared options runtime report runtime.State.Value.Config
 
     let private status options =

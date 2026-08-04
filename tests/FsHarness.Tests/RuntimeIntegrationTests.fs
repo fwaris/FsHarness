@@ -28,6 +28,28 @@ module RuntimeIntegrationTests =
             let detail = error.Detail |> Option.defaultValue String.Empty
             failwith $"Unexpected error: {error.Summary} {detail}"
 
+    [<Fact>]
+    let ``idle runtime can switch data roots`` () =
+        let temporary =
+            Path.Combine(Path.GetTempPath(), $"fsharness-root-{Guid.NewGuid():N}")
+
+        let first = Path.Combine(temporary, "first")
+        let second = Path.Combine(temporary, "second")
+
+        try
+            use runtime = new HarnessRuntime(first, "codex")
+
+            let applied = runtime.TrySetDataRoot second
+
+            match applied with
+            | Ok path ->
+                Assert.Equal(Path.GetFullPath second, path)
+                Assert.Equal(Path.GetFullPath second, runtime.DataRoot)
+                Assert.True(Directory.Exists second)
+            | Error error -> Assert.Fail error
+        finally
+            deleteTree temporary
+
     let private runGit workingDirectory arguments =
         let startInfo = ProcessStartInfo()
         startInfo.FileName <- "git"

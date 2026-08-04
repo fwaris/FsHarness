@@ -67,6 +67,29 @@ module TokenUsageTests =
         Assert.Equal(0L, normalized.OutputTokens)
         Assert.Equal(0L, normalized.ReasoningOutputTokens)
 
+module CodexWritePolicyTests =
+    [<Fact>]
+    let ``missing policy defaults to unrestricted`` () =
+        Assert.Equal(Ok CodexWritePolicy.Unrestricted, CodexWritePolicy.parse None)
+
+    [<Theory>]
+    [<InlineData("unrestricted")>]
+    [<InlineData("UNRESTRICTED")>]
+    let ``unrestricted aliases parse case insensitively`` value =
+        Assert.Equal(Ok CodexWritePolicy.Unrestricted, CodexWritePolicy.parse (Some value))
+
+    [<Fact>]
+    let ``sandbox policies parse explicitly`` () =
+        Assert.Equal(Ok CodexWritePolicy.WorkspaceWrite, CodexWritePolicy.parse (Some "workspace-write"))
+
+        Assert.Equal(Ok CodexWritePolicy.ReadOnly, CodexWritePolicy.parse (Some "read-only"))
+
+    [<Fact>]
+    let ``unknown policy is rejected`` () =
+        match CodexWritePolicy.parse (Some "typo") with
+        | Ok _ -> Assert.Fail "An unknown write policy must not silently become read-only."
+        | Error detail -> Assert.Contains("FSHARNESS_CODEX_WRITE_POLICY", detail)
+
 module EvaluationTests =
     let private result score constraints =
         { SchemaVersion = 1

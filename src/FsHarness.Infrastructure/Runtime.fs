@@ -52,12 +52,12 @@ type RuntimeHealth =
       Issues: string list }
 
 type HarnessRuntime(dataRoot: string, codexExecutable: string) =
-    let root = Path.GetFullPath dataRoot
-    let gitStore = GitStore.create root
-    let git = GitStore.port gitStore
-    let sqlite = SqliteStore.create (Path.Combine(root, "fsharness.db"))
-    let journal = SqliteStore.journalPort sqlite
-    let memory = SqliteStore.memoryPort sqlite
+    let mutable root = Path.GetFullPath dataRoot
+    let mutable gitStore = GitStore.create root
+    let mutable git = GitStore.port gitStore
+    let mutable sqlite = SqliteStore.create (Path.Combine(root, "fsharness.db"))
+    let mutable journal = SqliteStore.journalPort sqlite
+    let mutable memory = SqliteStore.memoryPort sqlite
     let evaluator = Evaluator.port
     let codex = Cli.port
     let stateChanged = Event<RunState>()
@@ -1703,6 +1703,38 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     member _.Activity = activity.Publish
     member _.EvolutionChanged = evolutionChanged.Publish
     member _.DataRoot = root
+
+    member _.TrySetDataRoot(nextRoot: string) =
+        try
+            if String.IsNullOrWhiteSpace nextRoot then
+                Error "The FsHarness data root cannot be empty."
+            else
+                let normalized = Path.GetFullPath nextRoot
+
+                lock stateGate (fun () ->
+                    match runCancellation, worker, activeLock with
+                    | Some _, _, _
+                    | _, Some _, _
+                    | _, _, Some _ ->
+                        Error
+                            "The data root cannot change while a run is active or prepared. Stop or discard the run first."
+                    | None, None, None ->
+                        Directory.CreateDirectory normalized |> ignore
+
+                        if not (String.Equals(root, normalized, StringComparison.OrdinalIgnoreCase)) then
+                            root <- normalized
+                            gitStore <- GitStore.create root
+                            git <- GitStore.port gitStore
+                            sqlite <- SqliteStore.create (Path.Combine(root, "fsharness.db"))
+                            journal <- SqliteStore.journalPort sqlite
+                            memory <- SqliteStore.memoryPort sqlite
+                            state <- None
+                            prepared <- None
+                            evaluatorRetryCount <- 0
+
+                        Ok root)
+        with error ->
+            Error $"Unable to use data root '{nextRoot}': {error.Message}"
 
     member _.ListEvolutionRuns(cancellationToken: CancellationToken) =
         async {

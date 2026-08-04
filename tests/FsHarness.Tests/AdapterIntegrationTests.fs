@@ -44,6 +44,44 @@ module SanitizedEnvironmentTests =
             Assert.Equal(Environment.GetEnvironmentVariable("SystemDrive"), environment["SystemDrive"])
 
 module AdapterIntegrationTests =
+    let private request =
+        { Executable = "codex"
+          WorkingDirectory = "worktree"
+          Model = Defaults.model
+          Prompt = "prompt"
+          OutputSchemaPath = "schema.json"
+          Timeout = TimeSpan.FromSeconds 10.0
+          JsonlPath = "codex.jsonl"
+          StderrPath = "codex.stderr.log" }
+
+    let private writeSwitches arguments =
+        arguments
+        |> List.filter (fun argument ->
+            argument = "--dangerously-bypass-approvals-and-sandbox"
+            || argument = "--sandbox")
+
+    [<Fact>]
+    let ``unrestricted policy is the writable default argument`` () =
+        let arguments = Cli.argumentsFor CodexWritePolicy.Unrestricted request
+
+        Assert.Contains("--dangerously-bypass-approvals-and-sandbox", arguments)
+        Assert.DoesNotContain("--sandbox", arguments)
+        Assert.Single(writeSwitches arguments) |> ignore
+
+    [<Fact>]
+    let ``workspace and read-only policies remain explicit opt-ins`` () =
+        let workspaceArguments = Cli.argumentsFor CodexWritePolicy.WorkspaceWrite request
+        let readOnlyArguments = Cli.argumentsFor CodexWritePolicy.ReadOnly request
+
+        Assert.Contains("--sandbox", workspaceArguments)
+        Assert.Contains("workspace-write", workspaceArguments)
+        Assert.Contains("--sandbox", readOnlyArguments)
+        Assert.Contains("read-only", readOnlyArguments)
+        Assert.DoesNotContain("--dangerously-bypass-approvals-and-sandbox", workspaceArguments)
+        Assert.DoesNotContain("--dangerously-bypass-approvals-and-sandbox", readOnlyArguments)
+        Assert.Single(writeSwitches workspaceArguments) |> ignore
+        Assert.Single(writeSwitches readOnlyArguments) |> ignore
+
     [<Fact>]
     let ``Codex discovery falls back to the newest VS Code extension`` () =
         let root = AdapterFixture.temporaryDirectory ()
@@ -133,6 +171,7 @@ module AdapterIntegrationTests =
             | Ok report ->
                 Assert.Equal("codex-cli 0.fake", report.Version)
                 Assert.Contains(report.Models, fun model -> model.Id = "gpt-5.6-luna")
+                Assert.Equal(CodexWritePolicy.Unrestricted, report.WritePolicy)
 
             let schemaPath = Path.Combine(root, "schema.json")
             File.WriteAllText(schemaPath, "{}")

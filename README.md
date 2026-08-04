@@ -48,7 +48,7 @@ fsharness annotations --run-id <guid>
 fsharness health --run-id <guid>
 ```
 
-Use `--data-root <dir>` when the run is outside the platform-default data directory. `resume` verifies the source and Codex preflight, reconciles pending frontier operations, checks artifact hashes, restores usage and attempt counters, and refuses to exceed an already-consumed budget.
+Use `--data-root <dir>` when the run is outside the platform-default data directory. The desktop Setup page also shows the data root for the next run and lets you edit it or choose a folder; the selected root takes effect when you prepare the private run and cannot replace an active or prepared run. `FSHARNESS_DATA_DIR` can set the initial desktop root. `resume` verifies the source and Codex preflight, reconciles pending frontier operations, checks artifact hashes, restores usage and attempt counters, and refuses to exceed an already-consumed budget.
 
 ## Evaluator protocol
 
@@ -76,8 +76,10 @@ The executable and argument list are passed with `ProcessStartInfo.ArgumentList`
 - Frontier promotion is compare-and-swap and happens only after an `AcceptPending` journal event.
 - Promotion uses a durable intent. After the Git compare-and-swap, acceptance is journaled before terminal state becomes observable; an interrupted promotion is reconciled against the private frontier during recovery.
 - `.git`, `.fsharness`, `.gitmodules`, `.gitattributes`, gitlinks, and changed symlinks/reparse points are protected regardless of the editable allowlist.
+- Codex workers are writable by default through `--dangerously-bypass-approvals-and-sandbox`, but run from private generation worktrees and are still constrained by the editable-path snapshot validator. Set `FSHARNESS_CODEX_WRITE_POLICY=workspace-write` or `read-only` to opt into a stricter worker policy.
+- Unrestricted mode removes Codex's OS sandbox. It must only be used with FsHarness's isolated worktree workflow; prompt restrictions and post-generation protected-path validation remain active, but unrestricted mode is not a substitute for OS-level containment.
 - Immediate stop kills the complete process tree, attempts to preserve allowed partial changes, and cannot promote them.
-- Prompts contain the objective, policy, frontier score, evaluator feedback, and at most five distilled memories totaling 6,000 characters. Previous transcripts and private reasoning are never injected.
+- Prompts contain the objective, policy, frontier score, evaluator feedback, and the bounded distilled memories configured by the campaign. Previous transcripts and private reasoning are never injected.
 - Raw JSONL, stderr, prompts, diffs/evaluator results, SQLite records, and private Git lineage remain in app-owned storage.
 - SQLite schema migrations run atomically and currently persist work plans, durable operations, reproducibility manifests, provenance claims, and human annotations in addition to run history.
 
