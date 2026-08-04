@@ -292,6 +292,8 @@ module Views =
                                     muted
                                         "Private Git repositories, SQLite state, artifacts, and run worktrees are stored below this directory."
                                     muted
+                                        "Windows GPU runs should use a short path outside the source checkout, for example E:\\fsh\\r12, to avoid native DLL path-length failures."
+                                    muted
                                         "The selected root is used when you prepare the next private run. Active or prepared runs must be stopped first." ]
                               card
                                   [ overline "3 - EXPERIMENT CONTRACT"

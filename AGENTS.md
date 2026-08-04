@@ -113,6 +113,12 @@ Based on Microsoft F# style guidance and common community conventions:
 # Experimental Coding
 - Put temporary, exploratory and/or experimental code in the /temp directory of the project.
 - ß
+
+## Windows campaign storage
+
+- Start Windows FsHarness campaigns with a short data root outside the source checkout, for example `E:\fsh\r12` or `C:\fsh\r12`.
+- Never use a nested source path such as `<repository>\.fsharness\runs-...` as `--data-root`: native ONNX Runtime provider DLLs can exceed Windows path limits and fail with Error 206.
+- Keep run directory names compact, and verify the effective data root before starting a GPU benchmark.
 ## Parallelization
 For parallel processing, if feasible use FSharp.Control.AsyncSeq as in:
 ```fsharp

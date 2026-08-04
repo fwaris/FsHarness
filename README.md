@@ -48,7 +48,7 @@ fsharness annotations --run-id <guid>
 fsharness health --run-id <guid>
 ```
 
-Use `--data-root <dir>` when the run is outside the platform-default data directory. The desktop Setup page also shows the data root for the next run and lets you edit it or choose a folder; the selected root takes effect when you prepare the private run and cannot replace an active or prepared run. `FSHARNESS_DATA_DIR` can set the initial desktop root. `resume` verifies the source and Codex preflight, reconciles pending frontier operations, checks artifact hashes, restores usage and attempt counters, and refuses to exceed an already-consumed budget.
+Use `--data-root <dir>` when the run is outside the platform-default data directory. On Windows, use a short root outside the source checkout—such as `E:\fsh\r12`—and keep the run folder name short. Do not place private worktrees below `<repository>\.fsharness\runs-*`: native ONNX Runtime provider DLLs can otherwise exceed the Windows path limit (Error 206). The desktop Setup page also shows the data root for the next run and lets you edit it or choose a folder; the selected root takes effect when you prepare the private run and cannot replace an active or prepared run. `FSHARNESS_DATA_DIR` can set the initial desktop root. `resume` verifies the source and Codex preflight, reconciles pending frontier operations, checks artifact hashes, restores usage and attempt counters, and refuses to exceed an already-consumed budget.
 
 ## Evaluator protocol
 
