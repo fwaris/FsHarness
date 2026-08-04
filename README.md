@@ -1,6 +1,8 @@
 # FsHarness
 
-FsHarness is a .NET 10 Avalonia FuncUI desktop application that runs a single-worker Codex experiment ratchet. Each worker starts from the retained best commit, receives a bounded prompt, produces an immutable candidate, and is evaluated in a separate clean worktree. Only a constraint-passing strict metric improvement can advance the private frontier.
+FsHarness is a .NET 10 F# system for durable, branch-aware Codex experiment loops. The desktop campaign runs a conservative retained-frontier ratchet: each candidate starts from an immutable parent, receives a bounded prompt, is captured in private Git, and is evaluated in a separate clean worktree. Only a constraint-passing strict metric improvement can advance the frontier.
+
+The core and infrastructure layers also expose typed dependency plans and bounded multi-agent execution for custom orchestration. Independent ready work items run through throttled `AsyncSeq` workers; results are ordered deterministically, checked against token/tool budgets, and aggregated with changed-path conflict detection.
 
 The application never initializes, commits, checks out, merges, pushes, or otherwise changes the selected source repository. A dirty source worktree is allowed, but its uncommitted state is excluded from the pinned baseline.
 
@@ -49,10 +51,14 @@ The executable and argument list are passed with `ProcessStartInfo.ArgumentList`
 - Generation, assembly, and evaluation use separate app-owned worktrees.
 - Candidate refs are retained under `refs/fsharness/runs/<run>/candidates/...`; baseline and frontier have dedicated refs.
 - Frontier promotion is compare-and-swap and happens only after an `AcceptPending` journal event.
+- Promotion uses a durable intent. After the Git compare-and-swap, acceptance is journaled before terminal state becomes observable; an interrupted promotion is reconciled against the private frontier during recovery.
 - `.git`, `.fsharness`, `.gitmodules`, `.gitattributes`, gitlinks, and changed symlinks/reparse points are protected regardless of the editable allowlist.
+- Codex workers are writable by default through `--dangerously-bypass-approvals-and-sandbox`, but run from private generation worktrees and are still constrained by the editable-path snapshot validator. Set `FSHARNESS_CODEX_WRITE_POLICY=workspace-write` or `read-only` to opt into a stricter worker policy.
+- Unrestricted mode removes Codex's OS sandbox. It must only be used with FsHarness's isolated worktree workflow; prompt restrictions and post-generation protected-path validation remain active, but unrestricted mode is not a substitute for OS-level containment.
 - Immediate stop kills the complete process tree, attempts to preserve allowed partial changes, and cannot promote them.
-- Prompts contain the objective, policy, frontier score, evaluator feedback, and at most five distilled memories totaling 6,000 characters. Previous transcripts and private reasoning are never injected.
+- Prompts contain the objective, policy, frontier score, evaluator feedback, and the bounded distilled memories configured by the campaign. Previous transcripts and private reasoning are never injected.
 - Raw JSONL, stderr, prompts, diffs/evaluator results, SQLite records, and private Git lineage remain in app-owned storage.
+- SQLite schema migrations run atomically and currently persist work plans, durable operations, reproducibility manifests, provenance claims, and human annotations in addition to run history.
 
 Missing terminal token usage is not interpreted as zero: the active candidate is evaluated and then the run pauses because the remaining budget cannot be enforced. Raw and uncached totals use the Codex counters without double-counting cached input or reasoning output.
 
@@ -78,7 +84,7 @@ This smoke protocol does not establish statistical significance, causality, gene
 
 ## Memory
 
-V1 uses bounded SQLite recency/lineage retrieval through the functional `MemoryPort`. FsColBERT is intentionally not on the critical path: the small append-only experiment history does not yet justify a rebuild-oriented vector index. The port keeps an adapter possible after an equal-context A/B test demonstrates fewer duplicate attempts or lower tokens-to-quality without lower quality.
+Prompt memory uses bounded SQLite recency/lineage retrieval through the functional `MemoryPort`. The provenance graph is a separate durable layer for sourced facts and operational queries. FsColBERT is intentionally not on the critical path; the adapters leave room for a later retrieval backend after an equal-context A/B test demonstrates better quality or lower tokens-to-quality.
 
 ## Verify
 
@@ -89,6 +95,6 @@ dotnet build FsHarness.slnx -c Release --no-restore
 dotnet test tests/FsHarness.Tests/FsHarness.Tests.fsproj -c Release --no-build --no-restore
 ```
 
-Tests cover the pure reducer/comparator/token rules, JSONL and output schemas, real fake-process adapters, SQLite journaling/memory, source-preserving private Git candidate capture and frontier CAS, project locking, and an Avalonia.Headless render/keyboard smoke at 1024×680 and 1440×900.
+Tests cover the reducer/comparator/token rules, recovery races, target and restored-budget completion, typed dependency scheduling, bounded multi-agent execution, deterministic aggregation, provenance validation/retrieval, annotations and health checks, schema-v5 SQLite storage, artifact integrity, source-preserving private Git candidate capture/frontier CAS, graph queries/diffs, project locking, real fake-process adapters, and Avalonia.Headless rendering.
 
 The paid live Codex benchmark is deliberately opt-in and is not part of automated tests.

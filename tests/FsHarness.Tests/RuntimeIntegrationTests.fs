@@ -24,7 +24,31 @@ module RuntimeIntegrationTests =
     let private getResult result =
         match result with
         | Ok value -> value
-        | Error error -> failwith $"Unexpected error: {error.Summary}"
+        | Error error ->
+            let detail = error.Detail |> Option.defaultValue String.Empty
+            failwith $"Unexpected error: {error.Summary} {detail}"
+
+    [<Fact>]
+    let ``idle runtime can switch data roots`` () =
+        let temporary =
+            Path.Combine(Path.GetTempPath(), $"fsharness-root-{Guid.NewGuid():N}")
+
+        let first = Path.Combine(temporary, "first")
+        let second = Path.Combine(temporary, "second")
+
+        try
+            use runtime = new HarnessRuntime(first, "codex")
+
+            let applied = runtime.TrySetDataRoot second
+
+            match applied with
+            | Ok path ->
+                Assert.Equal(Path.GetFullPath second, path)
+                Assert.Equal(Path.GetFullPath second, runtime.DataRoot)
+                Assert.True(Directory.Exists second)
+            | Error error -> Assert.Fail error
+        finally
+            deleteTree temporary
 
     let private runGit workingDirectory arguments =
         let startInfo = ProcessStartInfo()
@@ -43,6 +67,108 @@ module RuntimeIntegrationTests =
             failwith $"git failed: {stderr}"
 
         stdout.Trim()
+
+    [<Fact>]
+    let ``multi agent executor is bounded and returns deterministic order`` () =
+        let parent = CommitOid.create (String('a', 40))
+        let gate = obj ()
+        let mutable active = 0
+        let mutable maximum = 0
+
+        let task index =
+            let assignment =
+                { AgentId = AgentId.create $"agent-{index:D2}"
+                  Role = AgentRole.Implementer
+                  WorkItemId = WorkItemId.create $"work-{index:D2}"
+                  Parent = parent
+                  Objective = "fixture" }
+
+            { Assignment = assignment
+              Execute =
+                fun _ ->
+                    async {
+                        lock gate (fun () ->
+                            active <- active + 1
+                            maximum <- max maximum active)
+
+                        do! Async.Sleep 40
+                        lock gate (fun () -> active <- active - 1)
+                        return Ok index
+                    } }
+
+        let results =
+            [ 4; 1; 3; 0; 2 ]
+            |> List.map task
+            |> MultiAgent.run 2 CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+        Assert.Equal(2, maximum)
+        Assert.Equal<int list>([ 0; 1; 2; 3; 4 ], results |> List.map (fun result -> result.Result |> getResult))
+
+    [<Fact>]
+    let ``plan executor runs independent work in parallel before dependent work`` () =
+        let now = DateTimeOffset.UtcNow
+        let firstId = WorkItemId.create "01-first"
+        let secondId = WorkItemId.create "02-second"
+        let finalId = WorkItemId.create "03-final"
+
+        let item id dependencies =
+            { Id = id
+              Title = WorkItemId.value id
+              Objective = "fixture"
+              Dependencies = Set.ofList dependencies
+              RequiredTools = Set.singleton ToolCapability.ReadRepository
+              Budget =
+                { MaxRawTokens = 10L
+                  MaxDuration = TimeSpan.FromSeconds 5.0
+                  MaxAttempts = 1 }
+              Priority = 1 }
+
+        let plan =
+            { Id = WorkPlanId.create ()
+              RunId = RunId.create ()
+              ExperimentId = ExperimentId.create ()
+              Objective = "fixture"
+              Items =
+                Map
+                    [ firstId, item firstId []
+                      secondId, item secondId []
+                      finalId, item finalId [ firstId; secondId ] ]
+              CreatedAt = now }
+
+        let gate = obj ()
+        let mutable active = 0
+        let mutable maximum = 0
+
+        let handler _ _ =
+            async {
+                lock gate (fun () ->
+                    active <- active + 1
+                    maximum <- max maximum active)
+
+                do! Async.Sleep 40
+                lock gate (fun () -> active <- active - 1)
+                return Ok(Some TokenUsage.zero)
+            }
+
+        let report =
+            PlanExecutor.run
+                2
+                (CommitOid.create (String('a', 40)))
+                (Set.singleton ToolCapability.ReadRepository)
+                100L
+                (now.AddMinutes 1.0)
+                handler
+                CancellationToken.None
+                plan
+            |> Async.RunSynchronously
+            |> getResult
+
+        Assert.Equal(2, maximum)
+        Assert.True(Scheduler.isTerminal report.Schedule)
+
+        Assert.Equal<WorkItemId list>([ firstId; secondId; finalId ], report.Assignments |> List.map _.WorkItemId)
 
     [<Fact>]
     let ``runtime retains one strict fake improvement without touching source`` () =

@@ -67,6 +67,29 @@ module TokenUsageTests =
         Assert.Equal(0L, normalized.OutputTokens)
         Assert.Equal(0L, normalized.ReasoningOutputTokens)
 
+module CodexWritePolicyTests =
+    [<Fact>]
+    let ``missing policy defaults to unrestricted`` () =
+        Assert.Equal(Ok CodexWritePolicy.Unrestricted, CodexWritePolicy.parse None)
+
+    [<Theory>]
+    [<InlineData("unrestricted")>]
+    [<InlineData("UNRESTRICTED")>]
+    let ``unrestricted aliases parse case insensitively`` value =
+        Assert.Equal(Ok CodexWritePolicy.Unrestricted, CodexWritePolicy.parse (Some value))
+
+    [<Fact>]
+    let ``sandbox policies parse explicitly`` () =
+        Assert.Equal(Ok CodexWritePolicy.WorkspaceWrite, CodexWritePolicy.parse (Some "workspace-write"))
+
+        Assert.Equal(Ok CodexWritePolicy.ReadOnly, CodexWritePolicy.parse (Some "read-only"))
+
+    [<Fact>]
+    let ``unknown policy is rejected`` () =
+        match CodexWritePolicy.parse (Some "typo") with
+        | Ok _ -> Assert.Fail "An unknown write policy must not silently become read-only."
+        | Error detail -> Assert.Contains("FSHARNESS_CODEX_WRITE_POLICY", detail)
+
 module EvaluationTests =
     let private result score constraints =
         { SchemaVersion = 1
@@ -245,16 +268,17 @@ module StateMachineTests =
         let afterStart, _ =
             RunState.transition started (StartRequested(experimentId, started)) initial
 
-        let afterPrepare, _ = RunState.transition started WorktreePrepared afterStart
+        let afterPrepare, _ =
+            RunState.transition started (WorktreePrepared experimentId) afterStart
 
         let afterGeneration, _ =
             RunState.transition
                 started
-                (GenerationCompleted("thread", Some TokenUsage.zero, Fixtures.summary))
+                (GenerationCompleted(experimentId, "thread", Some TokenUsage.zero, Fixtures.summary))
                 afterPrepare
 
         let afterCapture, _ =
-            RunState.transition started (CandidateCaptured candidate) afterGeneration
+            RunState.transition started (CandidateCaptured(experimentId, candidate)) afterGeneration
 
         let evaluation =
             { SchemaVersion = 1
@@ -265,12 +289,17 @@ module StateMachineTests =
               Evidence = [] }
 
         let pending, effects =
-            RunState.transition started (EvaluationCompleted evaluation) afterCapture
+            RunState.transition started (EvaluationCompleted(experimentId, evaluation)) afterCapture
 
         Assert.Equal(parent, pending.Frontier)
         Assert.Contains(effects, fun effect -> effect = PersistAccepted(experimentId, candidate, parent))
 
-        let accepted, _ = RunState.transition started FrontierAdvanced pending
+        let promoting, _ =
+            RunState.transition started (PromotionStarted experimentId) pending
+
+        let accepted, _ =
+            RunState.transition started (FrontierAdvanced experimentId) promoting
+
         Assert.Equal(candidate, accepted.Frontier)
         Assert.Equal(11M, accepted.FrontierScore)
 
@@ -281,16 +310,415 @@ module StateMachineTests =
         let initial =
             RunState.create (RunId.create ()) Fixtures.config Fixtures.config.BaseCommit 10M started
 
-        let active, _ =
-            RunState.transition started (StartRequested(ExperimentId.create (), started)) initial
+        let experimentId = ExperimentId.create ()
 
-        let generating, _ = RunState.transition started WorktreePrepared active
+        let active, _ =
+            RunState.transition started (StartRequested(experimentId, started)) initial
+
+        let generating, _ =
+            RunState.transition started (WorktreePrepared experimentId) active
 
         let withoutUsage, _ =
-            RunState.transition started (GenerationCompleted("thread", None, Fixtures.summary)) generating
+            RunState.transition started (GenerationCompleted(experimentId, "thread", None, Fixtures.summary)) generating
 
         Assert.False(withoutUsage.UsageKnown)
         Assert.Equal(PauseAfterCurrent, withoutUsage.Status)
+
+    [<Fact>]
+    let ``pause during worktree preparation still advances the current experiment`` () =
+        let started = DateTimeOffset.UtcNow
+        let experimentId = ExperimentId.create ()
+
+        let initial =
+            RunState.create (RunId.create ()) Fixtures.config Fixtures.config.BaseCommit 10M started
+
+        let preparing, _ =
+            RunState.transition started (StartRequested(experimentId, started)) initial
+
+        let pausing, _ = RunState.transition started PauseRequested preparing
+
+        let generating, effects =
+            RunState.transition started (WorktreePrepared experimentId) pausing
+
+        Assert.Equal(PauseAfterCurrent, generating.Status)
+        Assert.Equal(Some Generating, generating.Current |> Option.map _.Phase)
+        Assert.Contains(LaunchCodex experimentId, effects)
+
+    [<Fact>]
+    let ``stale asynchronous events cannot mutate the current experiment`` () =
+        let started = DateTimeOffset.UtcNow
+        let currentExperiment = ExperimentId.create ()
+        let staleExperiment = ExperimentId.create ()
+
+        let initial =
+            RunState.create (RunId.create ()) Fixtures.config Fixtures.config.BaseCommit 10M started
+
+        let preparing, _ =
+            RunState.transition started (StartRequested(currentExperiment, started)) initial
+
+        let unchanged, effects =
+            RunState.transition started (WorktreePrepared staleExperiment) preparing
+
+        Assert.Equal(preparing, unchanged)
+        Assert.Empty effects
+
+    [<Fact>]
+    let ``unknown usage cannot be resumed because the token budget is unenforceable`` () =
+        let started = DateTimeOffset.UtcNow
+
+        let paused =
+            { RunState.create (RunId.create ()) Fixtures.config Fixtures.config.BaseCommit 10M started with
+                Status = Paused "Unknown usage."
+                UsageKnown = false }
+
+        let unchanged, effects = RunState.transition started ResumeRequested paused
+        Assert.Equal(paused, unchanged)
+        Assert.Empty effects
+
+    [<Fact>]
+    let ``stop before promotion authorization prevents frontier advancement`` () =
+        let started = DateTimeOffset.UtcNow
+        let experimentId = ExperimentId.create ()
+        let parent = Fixtures.config.BaseCommit
+        let candidate = CommitOid.create (String('b', 40))
+        let initial = RunState.create (RunId.create ()) Fixtures.config parent 10M started
+
+        let preparing, _ =
+            RunState.transition started (StartRequested(experimentId, started)) initial
+
+        let generating, _ =
+            RunState.transition started (WorktreePrepared experimentId) preparing
+
+        let generated, _ =
+            RunState.transition
+                started
+                (GenerationCompleted(experimentId, "thread", Some TokenUsage.zero, Fixtures.summary))
+                generating
+
+        let evaluating, _ =
+            RunState.transition started (CandidateCaptured(experimentId, candidate)) generated
+
+        let evaluation =
+            { SchemaVersion = 1
+              Status = EvaluationStatus.Complete
+              Constraints = Map [ "build", true; "tests", true ]
+              Metrics = Map [ "primary", 11M ]
+              Summary = "ok"
+              Evidence = [] }
+
+        let pending, _ =
+            RunState.transition started (EvaluationCompleted(experimentId, evaluation)) evaluating
+
+        let stopping, _ = RunState.transition started StopRequested pending
+
+        let notPromoting, promotionEffects =
+            RunState.transition started (PromotionStarted experimentId) stopping
+
+        let unchanged, frontierEffects =
+            RunState.transition started (FrontierAdvanced experimentId) notPromoting
+
+        Assert.Equal(Stopping, unchanged.Status)
+        Assert.Equal(parent, unchanged.Frontier)
+        Assert.Empty promotionEffects
+        Assert.Empty frontierEffects
+
+    [<Fact>]
+    let ``accepted target score completes the campaign`` () =
+        let started = DateTimeOffset.UtcNow
+        let experimentId = ExperimentId.create ()
+        let candidate = CommitOid.create (String('b', 40))
+
+        let config =
+            { Fixtures.config with
+                Metric =
+                    { Fixtures.metric with
+                        Target = Some 11M } }
+
+        let initial = RunState.create (RunId.create ()) config config.BaseCommit 10M started
+
+        let preparing, _ =
+            RunState.transition started (StartRequested(experimentId, started)) initial
+
+        let generating, _ =
+            RunState.transition started (WorktreePrepared experimentId) preparing
+
+        let generated, _ =
+            RunState.transition
+                started
+                (GenerationCompleted(experimentId, "thread", Some TokenUsage.zero, Fixtures.summary))
+                generating
+
+        let evaluating, _ =
+            RunState.transition started (CandidateCaptured(experimentId, candidate)) generated
+
+        let evaluation =
+            { SchemaVersion = 1
+              Status = EvaluationStatus.Complete
+              Constraints = Map [ "build", true; "tests", true ]
+              Metrics = Map [ "primary", 11M ]
+              Summary = "target"
+              Evidence = [] }
+
+        let pending, _ =
+            RunState.transition started (EvaluationCompleted(experimentId, evaluation)) evaluating
+
+        let promoting, _ =
+            RunState.transition started (PromotionStarted experimentId) pending
+
+        let completed, effects =
+            RunState.transition started (FrontierAdvanced experimentId) promoting
+
+        Assert.Equal(Completed "Metric target reached.", completed.Status)
+        Assert.Equal(candidate, completed.Frontier)
+        Assert.DoesNotContain(ScheduleNext, effects)
+
+    [<Fact>]
+    let ``start does not exceed a restored experiment budget`` () =
+        let started = DateTimeOffset.UtcNow
+
+        let config =
+            { Fixtures.config with
+                Budgets =
+                    { Fixtures.config.Budgets with
+                        MaxExperiments = 1 } }
+
+        let restored =
+            { RunState.create (RunId.create ()) config config.BaseCommit 10M started with
+                Attempted = 1 }
+
+        let completed, effects =
+            RunState.transition started (StartRequested(ExperimentId.create (), started)) restored
+
+        Assert.Equal(Completed "Experiment budget exhausted.", completed.Status)
+        Assert.True(completed.Current.IsNone)
+        Assert.Equal(1, completed.Attempted)
+        Assert.DoesNotContain(ScheduleNext, effects)
+
+    [<Fact>]
+    let ``work graph exposes branch children leaves and root lineage`` () =
+        let now = DateTimeOffset.UtcNow
+        let baseline = CommitOid.create (String('a', 40))
+        let first = CommitOid.create (String('b', 40))
+        let sibling = CommitOid.create (String('c', 40))
+        let grandchild = CommitOid.create (String('d', 40))
+
+        let node sequence parent commit =
+            { Id = ExperimentNode(ExperimentId.create ())
+              Kind = EvolutionNodeKind.Candidate
+              Sequence = sequence
+              Parent = Some parent
+              Commit = Some commit
+              Outcome = EvolutionOutcome.Rejected "fixture"
+              Metric = Some(decimal sequence)
+              RetainedScore = Some 1M
+              Summary = None
+              EvaluationSummary = None
+              Usage = None
+              StartedAt = now
+              UpdatedAt = now
+              Label = $"Candidate {sequence}" }
+
+        let snapshot =
+            { Run =
+                { Id = RunId.create ()
+                  SourcePath = "/tmp/source"
+                  Status = "Completed"
+                  CreatedAt = now
+                  UpdatedAt = now
+                  MetricName = "primary"
+                  Direction = Maximize
+                  BaselineCommit = Some baseline
+                  BaselineScore = Some 1M
+                  FrontierScore = Some 1M
+                  AttemptCount = 3
+                  AcceptedCount = 0 }
+              Nodes = [ node 1 baseline first; node 2 baseline sibling; node 3 first grandchild ]
+              Frontier = Some baseline
+              Warnings = [] }
+
+        let graph =
+            match WorkGraph.ofEvolution snapshot with
+            | Ok value -> value
+            | Error error -> failwith error.Summary
+
+        Assert.Equal<CommitOid list>([ first; sibling ], WorkGraph.children baseline graph |> List.map _.Commit)
+        Assert.Equal<CommitOid list>([ sibling; grandchild ], WorkGraph.leaves graph |> List.map _.Commit)
+
+        let lineage =
+            match WorkGraph.lineage grandchild graph with
+            | Ok value -> value
+            | Error error -> failwith error.Summary
+
+        Assert.Equal<CommitOid list>([ baseline; first; grandchild ], lineage |> List.map _.Commit)
+
+    [<Fact>]
+    let ``typed plan schedules only dependency ready work within tool and token budgets`` () =
+        let now = DateTimeOffset.UtcNow
+
+        let plan =
+            WorkPlan.standardExperiment
+                (RunId.create ())
+                (ExperimentId.create ())
+                "Improve the fixture."
+                Fixtures.config.Budgets
+                Fixtures.config.Evaluator.Timeout
+                now
+            |> WorkPlan.validate
+
+        let plan =
+            match plan with
+            | Ok value -> value
+            | Error errors -> failwith (String.concat " " errors)
+
+        let allTools = plan.Items |> Map.values |> Seq.collect _.RequiredTools |> Set.ofSeq
+
+        let capacity =
+            { MaxParallelism = 2
+              RawTokensRemaining = Fixtures.config.Budgets.MaxRawTokens
+              Deadline = now.AddHours 1.0
+              AvailableTools = allTools }
+
+        let initial = WorkPlan.initialSchedule plan
+        let first = Scheduler.ready now capacity plan initial |> Assert.Single
+        Assert.EndsWith("/generate", WorkItemId.value first.Id)
+
+        let generated =
+            initial
+            |> Scheduler.start now first.Id
+            |> Result.bind (Scheduler.succeed now first.Id (Some TokenUsage.zero))
+
+        let generated =
+            match generated with
+            | Ok value -> value
+            | Error error -> failwith error
+
+        let second = Scheduler.ready now capacity plan generated |> Assert.Single
+        Assert.EndsWith("/snapshot", WorkItemId.value second.Id)
+
+        let unavailable =
+            Scheduler.ready
+                now
+                { capacity with
+                    AvailableTools = Set.empty }
+                plan
+                initial
+
+        Assert.Empty unavailable
+
+    [<Fact>]
+    let ``typed plan validation rejects dependency cycles`` () =
+        let now = DateTimeOffset.UtcNow
+        let leftId = WorkItemId.create "left"
+        let rightId = WorkItemId.create "right"
+
+        let item id dependency =
+            { Id = id
+              Title = WorkItemId.value id
+              Objective = "fixture"
+              Dependencies = Set.singleton dependency
+              RequiredTools = Set.empty
+              Budget =
+                { MaxRawTokens = 0L
+                  MaxDuration = TimeSpan.FromMinutes 1.0
+                  MaxAttempts = 1 }
+              Priority = 1 }
+
+        let plan =
+            { Id = WorkPlanId.create ()
+              RunId = RunId.create ()
+              ExperimentId = ExperimentId.create ()
+              Objective = "fixture"
+              Items = Map [ leftId, item leftId rightId; rightId, item rightId leftId ]
+              CreatedAt = now }
+
+        Assert.True(WorkPlan.validate plan |> Result.isError)
+
+    [<Fact>]
+    let ``agent aggregation ranks deterministically and reports overlapping paths`` () =
+        let parent = Fixtures.config.BaseCommit
+        let workItemId = WorkItemId.create "generate"
+
+        let candidate agentId commit metric paths =
+            { Assignment =
+                { AgentId = AgentId.create agentId
+                  Role = AgentRole.Implementer
+                  WorkItemId = workItemId
+                  Parent = parent
+                  Objective = "fixture" }
+              Commit = CommitOid.create commit
+              Metric = Some metric
+              ChangedPaths = Set.ofList paths
+              Summary = Fixtures.summary }
+
+        let first = candidate "agent-b" (String('b', 40)) 12M [ "src/shared.fs" ]
+
+        let second =
+            candidate "agent-a" (String('c', 40)) 12M [ "src/shared.fs"; "src/a.fs" ]
+
+        let third = candidate "agent-c" (String('d', 40)) 11M [ "src/c.fs" ]
+        let aggregation = AgentAggregation.aggregate Maximize [ first; third; second ]
+
+        Assert.Equal(AgentId.create "agent-a", aggregation.Preferred.Value.Assignment.AgentId)
+
+        Assert.Equal<AgentId list>(
+            [ AgentId.create "agent-a"; AgentId.create "agent-b" ],
+            aggregation.ConflictingPaths["src/shared.fs"]
+        )
+
+    [<Fact>]
+    let ``knowledge graph requires provenance and retrieves claims through aliases`` () =
+        let runId = RunId.create ()
+
+        let entity =
+            { Id = KnowledgeEntityId.create ()
+              Kind = KnowledgeEntityKind.Symbol
+              CanonicalName = "FsHarness.Core.Scheduler.ready"
+              Attributes = Map [ "file", "Planning.fs" ] }
+
+        let source =
+            { Id = KnowledgeSourceId.create ()
+              RunId = runId
+              ExperimentId = None
+              Kind = KnowledgeSourceKind.Artifact
+              Location = "/artifacts/evaluation.json"
+              Sha256 = Some(String('a', 64))
+              CapturedAt = DateTimeOffset.UtcNow }
+
+        let claim =
+            { Id = KnowledgeClaimId.create ()
+              RunId = runId
+              Subject = entity.Id
+              Predicate = "enforces"
+              Object = KnowledgeValue.Text "dependency and tool budgets"
+              Confidence = 0.95M
+              Sources = Set.singleton source.Id
+              Supersedes = None
+              CreatedAt = DateTimeOffset.UtcNow }
+
+        let graph =
+            KnowledgeGraph.empty
+            |> KnowledgeGraph.addEntity entity
+            |> Result.bind (KnowledgeGraph.addAlias entity.Id "ready scheduler")
+            |> Result.bind (KnowledgeGraph.addSource source)
+            |> Result.bind (KnowledgeGraph.addClaim claim)
+
+        let graph =
+            match graph with
+            | Ok value -> value
+            | Error error -> failwith error
+
+        let hit = KnowledgeGraph.search "scheduler budgets" 5 graph |> Assert.Single
+        Assert.Equal(claim.Id, hit.Claim.Id)
+        Assert.Equal(source.Id, hit.Sources.Head.Id)
+
+        let unsupported =
+            KnowledgeGraph.addClaim
+                { claim with
+                    Id = KnowledgeClaimId.create ()
+                    Sources = Set.empty }
+                graph
+
+        Assert.True(Result.isError unsupported)
 
 module BenchmarkTests =
     let private episodes rawSol rawRatchet =

@@ -303,7 +303,19 @@ module Cli =
                     false
             )
 
-    let preflight (executable: string) (cancellationToken: CancellationToken) =
+    let private parseWritePolicy () =
+        CodexWritePolicy.parse (
+            Environment.GetEnvironmentVariable "FSHARNESS_CODEX_WRITE_POLICY"
+            |> Option.ofObj
+        )
+        |> Result.mapError (fun detail ->
+            processError "codex.write_policy_invalid" "The Codex write policy is invalid." detail false)
+
+    let private preflightWithPolicy
+        (policy: CodexWritePolicy)
+        (executable: string)
+        (cancellationToken: CancellationToken)
+        =
         async {
             let timeout = TimeSpan.FromSeconds 30.0
 
@@ -351,7 +363,8 @@ module Cli =
                                         { Version = versionText.Trim()
                                           LoginStatus = loginText.Trim()
                                           DoctorJson = doctorJson
-                                          Models = models }
+                                          Models = models
+                                          WritePolicy = policy }
         }
 
     let private codexArguments (request: CodexRequest) =
@@ -402,7 +415,11 @@ module Cli =
           "mcp_servers={}"
           "-" ]
 
-    let run (request: CodexRequest) (cancellationToken: CancellationToken) =
+    let private runWithPolicy
+        (policy: CodexWritePolicy)
+        (request: CodexRequest)
+        (cancellationToken: CancellationToken)
+        =
         async {
             Directory.CreateDirectory(Path.GetDirectoryName request.JsonlPath) |> ignore
             Directory.CreateDirectory(Path.GetDirectoryName request.StderrPath) |> ignore
@@ -420,7 +437,7 @@ module Cli =
             startInfo.CreateNoWindow <- true
             startInfo.Environment["GIT_OPTIONAL_LOCKS"] <- "0"
             startInfo.Environment["GIT_TERMINAL_PROMPT"] <- "0"
-            codexArguments request |> List.iter startInfo.ArgumentList.Add
+            argumentsFor policy request |> List.iter startInfo.ArgumentList.Add
 
             use childProcess = new Process(StartInfo = startInfo)
 
@@ -553,6 +570,13 @@ module Cli =
             with error ->
                 killProcessTree childProcess
                 return Error(processError "codex.process_error" "Codex process failed." error.Message true)
+        }
+
+    let run (request: CodexRequest) (cancellationToken: CancellationToken) =
+        async {
+            match parseWritePolicy () with
+            | Error error -> return Error error
+            | Ok policy -> return! runWithPolicy policy request cancellationToken
         }
 
     let port = { Preflight = preflight; Run = run }

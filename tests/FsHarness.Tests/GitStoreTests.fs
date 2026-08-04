@@ -129,7 +129,16 @@ module GitStoreTests =
             let candidateOid =
                 runGit directory [ "--git-dir"; privateRepo; "rev-parse"; candidateRef ]
 
-            Assert.Equal(CommitOid.value snapshot.Commit, candidateOid))
+            Assert.Equal(CommitOid.value snapshot.Commit, candidateOid)
+
+            let lineage =
+                GitStore.loadLineage store runId CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.Equal(Some inspection.Head, lineage.Baseline)
+            Assert.Equal(Some inspection.Head, lineage.Frontier)
+            Assert.Equal(Some(snapshot.Commit, Some inspection.Head), lineage.Candidates |> Map.tryFind experimentId))
 
     [<Fact>]
     let ``frontier update is compare and swap`` () =

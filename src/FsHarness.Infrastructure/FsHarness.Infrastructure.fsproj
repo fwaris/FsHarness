@@ -6,11 +6,14 @@
     <Compile Include="GitStore.fs" />
     <Compile Include="Evaluator.fs" />
     <Compile Include="SqliteStore.fs" />
+    <Compile Include="MultiAgent.fs" />
+    <Compile Include="PlanExecutor.fs" />
     <Compile Include="Runtime.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" />
+    <PackageReference Include="FSharp.Control.AsyncSeq" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../FsHarness.Core/FsHarness.Core.fsproj" />

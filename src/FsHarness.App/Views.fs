@@ -204,7 +204,10 @@ module Views =
                 else
                     "Luna / Max unavailable"
 
-            text $"{value.Version} · {value.LoginStatus} · {capability}" 12.0 Theme.text
+            text
+                $"{value.Version} | {value.LoginStatus} | {capability} | write policy: {CodexWritePolicy.label value.WritePolicy}"
+                12.0
+                Theme.text
 
     let private setupView (model: Model) (dispatch: Msg -> unit) : IView =
         let canLoadExperiment = not model.Busy && model.Prepared.IsNone && model.Run.IsNone
@@ -258,7 +261,14 @@ module Views =
                                     repositorySummary model.Repository
                                     secondaryButton "Inspect committed HEAD" (not model.Busy) InspectRepository dispatch ]
                               card
-                                  [ overline "2 · EXPERIMENT CONTRACT"
+                                  [ overline "2 - STORAGE"
+                                    dataRootField model.DataRoot (not model.Busy) dispatch
+                                    muted
+                                        "Private Git repositories, SQLite state, artifacts, and run worktrees are stored below this directory."
+                                    muted
+                                        "The selected root is used when you prepare the next private run. Active or prepared runs must be stopped first." ]
+                              card
+                                  [ overline "3 - EXPERIMENT CONTRACT"
                                     multilineField "Objective" model.Draft.Objective DraftField.Objective 84.0 dispatch
                                     field
                                         "Editable path globs (semicolon-separated)"
@@ -287,7 +297,7 @@ module Views =
                                         DraftField.RequiredConstraints
                                         dispatch ]
                               card
-                                  [ overline "3 · METRIC AND AGENT"
+                                  [ overline "4 - METRIC AND AGENT"
                                     Grid.create
                                         [ Grid.columnDefinitions "*,*"
                                           Grid.columnSpacing 12.0
@@ -320,7 +330,7 @@ module Views =
                                         CheckCodex
                                         dispatch ]
                               card
-                                  [ overline "4 · BUDGETS AND BASELINE"
+                                  [ overline "5 - BUDGETS AND BASELINE"
                                     Grid.create
                                         [ Grid.columnDefinitions "*,*"
                                           Grid.columnSpacing 12.0
@@ -383,6 +393,7 @@ module Views =
         | Evaluating -> "Verify"
         | Deciding -> "Decide"
         | AcceptPending -> "Persist"
+        | Promoting -> "Promote"
         | AwaitingReview -> "Review"
 
     let private metricCard (label: string) (value: string) (detail: string) : IView =
@@ -903,6 +914,11 @@ module Views =
                                     ) ] ] ] ]
 
     let private settingsView (model: Model) : IView =
+        let writePolicy =
+            model.CodexHealth
+            |> Option.map (fun report -> CodexWritePolicy.label report.WritePolicy)
+            |> Option.defaultValue (CodexWritePolicy.label CodexWritePolicy.defaultValue + " (default)")
+
         StackPanel.create
             [ StackPanel.margin (Thickness 24.0)
               StackPanel.spacing 16.0
@@ -911,19 +927,20 @@ module Views =
                     card
                         [ overline "NON-INTERACTIVE CODEX POLICY"
                           text
-                              "workspace-write · approval_policy=never · web search disabled · command network disabled"
+                              $"{writePolicy} | approval_policy=never | web search disabled | command network disabled"
                               13.0
                               Theme.text
                           muted
                               "Apps, hooks, subagents, goals, remote plugins, user config, and MCP servers are disabled for experiment workers. Project AGENTS.md guidance remains active." ]
                     card
                         [ overline "LOCAL DATA"
+                          text $"Data root for the next run: {model.DataRoot}" 13.0 Theme.text
                           text
                               "SQLite is the run journal; private Git refs are candidate lineage; JSONL and evaluator results are artifacts."
                               13.0
                               Theme.text
                           muted
-                              "FsColBERT is not enabled. Prompts use at most five recent distilled memories and 6,000 characters." ]
+                              "FsColBERT is not enabled. Prompt memory limits are controlled by each campaign configuration." ]
                     card
                         [ overline "OPT-IN HYPOTHESIS BENCHMARK"
                           text "4 frozen F# tasks × 3 arms = 12 episodes" 13.0 Theme.text

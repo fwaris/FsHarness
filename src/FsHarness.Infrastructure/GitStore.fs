@@ -825,6 +825,27 @@ module GitStore =
                         )
         }
 
+    let diffCommits store runId fromCommit toCommit cancellationToken =
+        async {
+            let! diff =
+                requireSuccess
+                    store
+                    "diff_commits"
+                    None
+                    [ "--git-dir"
+                      repoPath store runId
+                      "diff"
+                      "--binary"
+                      "--full-index"
+                      CommitOid.value fromCommit
+                      CommitOid.value toCommit ]
+                    None
+                    Map.empty
+                    cancellationToken
+
+            return diff
+        }
+
     let port store =
         { InspectSource = inspectSource store
           CreateRun = createRun store

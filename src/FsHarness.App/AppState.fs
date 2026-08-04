@@ -43,6 +43,7 @@ type DraftConfig =
 
 type Model =
     { Page: Page
+      DataRoot: string
       Draft: DraftConfig
       Repository: RepositoryInspection option
       CodexHealth: CodexPreflight option
@@ -180,6 +181,7 @@ module AppState =
 
     let init (runtime: HarnessRuntime) =
         { Page = Setup
+          DataRoot = runtime.DataRoot
           Draft = defaultDraft
           Repository = None
           CodexHealth = None
@@ -424,11 +426,17 @@ module AppState =
                     Error = Some(errorText error) },
                 Cmd.none
         | PrepareRun ->
-            match createConfig model with
+            match runtime.TrySetDataRoot model.DataRoot with
             | Error error -> { model with Error = Some error }, Cmd.none
-            | Ok config ->
-                { model with Busy = true; Error = None },
-                Cmd.OfAsync.perform (fun () -> runtime.Prepare(config, CancellationToken.None)) () RunPrepared
+            | Ok appliedRoot ->
+                match createConfig model with
+                | Error error -> { model with Error = Some error }, Cmd.none
+                | Ok config ->
+                    { model with
+                        DataRoot = appliedRoot
+                        Busy = true
+                        Error = None },
+                    Cmd.OfAsync.perform (fun () -> runtime.Prepare(config, CancellationToken.None)) () RunPrepared
         | RunPrepared result ->
             match result with
             | Ok report ->

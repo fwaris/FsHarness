@@ -17,11 +17,40 @@ type ModelCapability =
     { Id: string
       SupportedReasoningEfforts: ReasoningEffort list }
 
+[<RequireQualifiedAccess>]
+type CodexWritePolicy =
+    | Unrestricted
+    | WorkspaceWrite
+    | ReadOnly
+
+[<RequireQualifiedAccess>]
+module CodexWritePolicy =
+    let defaultValue = CodexWritePolicy.Unrestricted
+
+    let parse (value: string option) =
+        match value |> Option.map (fun text -> text.Trim().ToLowerInvariant()) with
+        | None
+        | Some ""
+        | Some "unrestricted" -> Ok CodexWritePolicy.Unrestricted
+        | Some "workspace-write" -> Ok CodexWritePolicy.WorkspaceWrite
+        | Some "read-only" -> Ok CodexWritePolicy.ReadOnly
+        | Some invalid ->
+            Error(
+                $"FSHARNESS_CODEX_WRITE_POLICY must be 'unrestricted', 'workspace-write', or 'read-only'; received '{invalid}'."
+            )
+
+    let label policy =
+        match policy with
+        | CodexWritePolicy.Unrestricted -> "unrestricted"
+        | CodexWritePolicy.WorkspaceWrite -> "workspace-write"
+        | CodexWritePolicy.ReadOnly -> "read-only"
+
 type CodexPreflight =
     { Version: string
       LoginStatus: string
       DoctorJson: string
-      Models: ModelCapability list }
+      Models: ModelCapability list
+      WritePolicy: CodexWritePolicy }
 
 type CodexRequest =
     { Executable: string
