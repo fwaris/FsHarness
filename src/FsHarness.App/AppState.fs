@@ -78,8 +78,11 @@ type DraftField =
 type Msg =
     | Navigate of Page
     | DraftChanged of DraftField * string
+    | DataRootChanged of string
     | BrowseRepository
     | RepositoryFolderSelected of Result<string option, string>
+    | BrowseDataRoot
+    | DataRootSelected of Result<string option, string>
     | LoadExperiment
     | ExperimentLoaded of Result<(string * HarnessConfig) option, string>
     | SaveExperiment
@@ -283,6 +286,7 @@ module AppState =
     let update
         (runtime: HarnessRuntime)
         (pickRepositoryFolder: unit -> Async<Result<string option, string>>)
+        (pickDataRootFolder: unit -> Async<Result<string option, string>>)
         (loadExperiment: unit -> Async<Result<(string * HarnessConfig) option, string>>)
         (saveExperiment: HarnessConfig -> Async<Result<string option, string>>)
         (message: Msg)
@@ -311,6 +315,11 @@ module AppState =
             match field with
             | DraftField.SourcePath -> { updated with Repository = None }, Cmd.none
             | _ -> updated, Cmd.none
+        | DataRootChanged value ->
+            { model with
+                DataRoot = value
+                Error = None },
+            Cmd.none
         | BrowseRepository ->
             { model with Error = None },
             Cmd.OfAsync.perform (fun () -> pickRepositoryFolder ()) () RepositoryFolderSelected
@@ -322,6 +331,17 @@ module AppState =
                     Repository = None
                     Prepared = None
                     ExperimentFile = None
+                    Error = None },
+                Cmd.none
+            | Ok None -> model, Cmd.none
+            | Error error -> { model with Error = Some error }, Cmd.none
+        | BrowseDataRoot ->
+            { model with Error = None }, Cmd.OfAsync.perform (fun () -> pickDataRootFolder ()) () DataRootSelected
+        | DataRootSelected result ->
+            match result with
+            | Ok(Some path) ->
+                { model with
+                    DataRoot = path
                     Error = None },
                 Cmd.none
             | Ok None -> model, Cmd.none
