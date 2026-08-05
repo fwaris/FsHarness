@@ -112,15 +112,11 @@ module Evaluator =
         else
             executable
 
-    let run
-        (spec: EvaluatorSpec)
-        (frontierWorktree: string)
-        (worktree: string)
-        (resultPath: string)
-        (cancellationToken: CancellationToken)
-        =
+    let run (request: EvaluationRequest) (cancellationToken: CancellationToken) =
         async {
-            let evaluationRoot = Path.GetFullPath worktree
+            let spec = request.Spec
+            let resultPath = request.ResultPath
+            let evaluationRoot = Path.GetFullPath request.CandidatePath
 
             let workingDirectory =
                 Path.GetFullPath(Path.Combine(evaluationRoot, spec.WorkingDirectory))
@@ -151,7 +147,9 @@ module Evaluator =
                         SanitizedEnvironment.core ()
                         |> Map.add "FSHARNESS_RESULT_PATH" resultPath
                         |> Map.add "FSHARNESS_CANDIDATE_PATH" evaluationRoot
-                        |> Map.add "FSHARNESS_FRONTIER_PATH" (Path.GetFullPath frontierWorktree)
+                        |> Map.add "FSHARNESS_PARENT_PATH" (Path.GetFullPath request.DerivationParentPath)
+                        |> Map.add "FSHARNESS_CHAMPION_PATH" (Path.GetFullPath request.ChampionPath)
+                        |> Map.add "FSHARNESS_FRONTIER_PATH" (Path.GetFullPath request.ChampionPath)
                         |> Map.add "GIT_OPTIONAL_LOCKS" "0"
                         |> Map.add "GIT_TERMINAL_PROMPT" "0"
 
@@ -182,7 +180,7 @@ module Evaluator =
                                     "evaluator.nonzero_exit"
                                     $"Evaluator exited with code {value.ExitCode}; nonzero means evaluator infrastructure failure."
                                     value.Stderr
-                                    false
+                                    true
                             )
                     | Ok _ when not (File.Exists resultPath) ->
                         return
@@ -191,7 +189,7 @@ module Evaluator =
                                     "evaluator.result_missing"
                                     "Evaluator completed without writing FSHARNESS_RESULT_PATH."
                                     resultPath
-                                    false
+                                    true
                             )
                     | Ok _ ->
                         match parseResult resultPath with
@@ -200,7 +198,7 @@ module Evaluator =
                             return
                                 Error(error "evaluator.result_invalid" "Evaluator result JSON is invalid." detail false)
                 with exceptionValue ->
-                    return Error(error "evaluator.failed" "Evaluator execution failed." exceptionValue.Message false)
+                    return Error(error "evaluator.failed" "Evaluator execution failed." exceptionValue.Message true)
         }
 
     let port = { Run = run }

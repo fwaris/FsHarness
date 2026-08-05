@@ -72,14 +72,36 @@ type CodexResult =
 type CandidateWorkspace =
     { ExperimentId: ExperimentId
       GenerationPath: string
-      Parent: CommitOid }
+      Parents: ExperimentParent list
+      Champion: CommitOid }
 
 type CandidateSnapshot =
     { Commit: CommitOid
       ChangedPaths: string list
       ProtectedPaths: string list
       EvaluationPath: string
-      FrontierEvaluationPath: string }
+      ParentEvaluationPath: string
+      ChampionEvaluationPath: string }
+
+type SynthesisConflict =
+    { Files: string list
+      ConflictText: string }
+
+type SynthesisAnalysis =
+    { CleanMerge: bool
+      ChangedPathOverlap: int }
+
+[<RequireQualifiedAccess>]
+type SynthesisPreparation =
+    | Clean of CandidateWorkspace
+    | Conflicted of CandidateWorkspace * SynthesisConflict
+
+type EvaluationRequest =
+    { Spec: EvaluatorSpec
+      DerivationParentPath: string
+      ChampionPath: string
+      CandidatePath: string
+      ResultPath: string }
 
 type CodexPort =
     { Preflight: string -> CancellationToken -> Async<Result<CodexPreflight, HarnessError>>
@@ -89,7 +111,22 @@ type GitPort =
     { InspectSource: string -> CancellationToken -> Async<Result<RepositoryInspection, HarnessError>>
       CreateRun: RunId -> RepositoryInspection -> CancellationToken -> Async<Result<unit, HarnessError>>
       PrepareCandidate:
-          RunId -> ExperimentId -> CommitOid -> CancellationToken -> Async<Result<CandidateWorkspace, HarnessError>>
+          RunId
+              -> ExperimentId
+              -> ExperimentParent list
+              -> CommitOid
+              -> CancellationToken
+              -> Async<Result<CandidateWorkspace, HarnessError>>
+      PrepareSynthesis:
+          RunId
+              -> ExperimentId
+              -> CommitOid
+              -> CommitOid
+              -> CommitOid
+              -> CancellationToken
+              -> Async<Result<SynthesisPreparation, HarnessError>>
+      AnalyzeSynthesis:
+          RunId -> CommitOid -> CommitOid -> CancellationToken -> Async<Result<SynthesisAnalysis, HarnessError>>
       ApplySeedPatch: CandidateWorkspace -> string -> CancellationToken -> Async<Result<unit, HarnessError>>
       CaptureCandidate:
           RunId
@@ -101,13 +138,7 @@ type GitPort =
       ExportPatch: RunId -> CommitOid -> string -> CancellationToken -> Async<Result<string, HarnessError>> }
 
 type EvaluatorPort =
-    { Run:
-        EvaluatorSpec
-            -> string
-            -> string
-            -> string
-            -> CancellationToken
-            -> Async<Result<EvaluationResult, HarnessError>> }
+    { Run: EvaluationRequest -> CancellationToken -> Async<Result<EvaluationResult, HarnessError>> }
 
 type JournalPort =
     { Initialize: CancellationToken -> Async<Result<unit, HarnessError>>

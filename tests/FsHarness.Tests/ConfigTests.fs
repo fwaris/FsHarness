@@ -80,6 +80,8 @@ module ConfigTests =
             | Ok config ->
                 Assert.Equal(EvaluationMetric "frontier_speed_index", config.Metric.Comparison)
                 Assert.Equal(2, config.Evaluator.MaxInconclusiveRetries)
+                Assert.Equal(Defaults.evaluatorMaxInfrastructureRetries, config.Evaluator.MaxInfrastructureRetries)
+                Assert.Equal(Defaults.evaluatorInfrastructureRetryDelay, config.Evaluator.InfrastructureRetryDelay)
                 Assert.Equal<string list>([ ".fsharness/seeds/seed.patch" ], config.SeedPatches)
         finally
             File.Delete path
@@ -130,7 +132,40 @@ module ConfigTests =
 
             match ConfigFile.read destination with
             | Error errors -> Assert.Fail(String.concat " " errors)
-            | Ok actual -> Assert.Equal(expected, actual)
+            | Ok actual ->
+                Assert.Equal(
+                    { expected with
+                        SchemaVersion = HarnessConfig.currentSchemaVersion },
+                    actual
+                )
+        finally
+            File.Delete source
+
+            if File.Exists destination then
+                File.Delete destination
+
+    [<Fact>]
+    let ``experiment data root round trips as portable metadata`` () =
+        let source = writeConfig 2 ", \"comparison\": \"retainedScore\"" 0 "[]" ""
+
+        let destination =
+            Path.Combine(Path.GetTempPath(), $"fsharness-data-root-{Guid.NewGuid():N}.json")
+
+        let dataRoot =
+            Path.Combine(Path.GetTempPath(), $"fsharness-runs-{Guid.NewGuid():N}")
+
+        try
+            let config =
+                ConfigFile.read source |> Result.defaultWith (String.concat " " >> failwith)
+
+            ConfigFile.writeWithDataRoot (Some dataRoot) destination config
+            |> Result.defaultWith (String.concat " " >> failwith)
+            |> ignore
+
+            match ConfigFile.readDataRoot destination with
+            | Ok(Some actual) -> Assert.Equal(Path.GetFullPath dataRoot, actual)
+            | Ok None -> Assert.Fail("Expected a campaign-linked data root.")
+            | Error errors -> Assert.Fail(String.concat " " errors)
         finally
             File.Delete source
 

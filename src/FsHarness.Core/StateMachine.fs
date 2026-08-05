@@ -25,7 +25,9 @@ type ExperimentOutcome =
 type ActiveExperiment =
     { Id: ExperimentId
       Sequence: int
-      Parent: CommitOid
+      Kind: ExperimentKind
+      Parents: ExperimentParent list
+      ChampionAtStart: CommitOid
       Phase: ExperimentPhase
       Candidate: CommitOid option
       ThreadId: string option
@@ -47,8 +49,9 @@ type RunState =
     { Id: RunId
       Config: HarnessConfig
       Status: RunStatus
-      Frontier: CommitOid
-      FrontierScore: decimal
+      Champion: CommitOid
+      ChampionScore: decimal
+      ActiveHeads: Set<CommitOid>
       Current: ActiveExperiment option
       Attempted: int
       AcceptedCount: int
@@ -58,10 +61,17 @@ type RunState =
       UsageAtFirstAcceptance: TokenUsage option
       UsageKnown: bool
       PreviousEvaluation: EvaluationResult option
+      LastExperimentKind: ExperimentKind option
       StartedAt: DateTimeOffset }
 
 type RunEvent =
     | StartRequested of ExperimentId * DateTimeOffset
+    | GraphExperimentRequested of
+        ExperimentId *
+        ExperimentKind *
+        ExperimentParent list *
+        championAtStart: CommitOid *
+        DateTimeOffset
     | WorktreePrepared of ExperimentId
     | GenerationCompleted of ExperimentId * threadId: string * usage: TokenUsage option * summary: ExperimentSummary
     | CandidateCaptured of ExperimentId * CommitOid
@@ -69,7 +79,7 @@ type RunEvent =
     | EvaluationCompleted of ExperimentId * EvaluationResult
     | EvaluationInconclusive of ExperimentId * string
     | PromotionStarted of ExperimentId
-    | FrontierAdvanced of ExperimentId
+    | ChampionAdvanced of ExperimentId
     | ReviewAccepted of ExperimentId
     | ReviewRejected of ExperimentId
     | ExperimentFailed of ExperimentId * HarnessError
@@ -79,11 +89,11 @@ type RunEvent =
     | CancellationCompleted of ExperimentId
 
 type RunEffect =
-    | PrepareCandidate of ExperimentId * CommitOid
+    | PrepareCandidate of ExperimentId * ExperimentParent list * championAtStart: CommitOid
     | LaunchCodex of ExperimentId
     | CaptureCandidate of ExperimentId
     | RunEvaluator of ExperimentId * CommitOid
-    | PersistAccepted of ExperimentId * CommitOid * expectedParent: CommitOid
+    | PersistAccepted of ExperimentId * CommitOid * expectedChampion: CommitOid
     | PersistRejected of ExperimentId * ExperimentOutcome
     | PublishState
     | ScheduleNext
@@ -91,12 +101,13 @@ type RunEffect =
 
 [<RequireQualifiedAccess>]
 module RunState =
-    let create runId config frontier frontierScore startedAt =
+    let create runId config champion championScore startedAt =
         { Id = runId
           Config = config
           Status = Ready
-          Frontier = frontier
-          FrontierScore = frontierScore
+          Champion = champion
+          ChampionScore = championScore
+          ActiveHeads = Set.singleton champion
           Current = None
           Attempted = 0
           AcceptedCount = 0
@@ -106,6 +117,7 @@ module RunState =
           UsageAtFirstAcceptance = None
           UsageKnown = true
           PreviousEvaluation = None
+          LastExperimentKind = None
           StartedAt = startedAt }
 
     let private budgetStopReason now state =
@@ -118,6 +130,10 @@ module RunState =
         elif
             state.ConsecutiveNonImprovements
             >= state.Config.Budgets.MaxConsecutiveNonImprovements
+            && (state.LastExperimentKind = Some ExperimentKind.Synthesis
+                || state.ConsecutiveNonImprovements
+                   >= state.Config.Budgets.MaxConsecutiveNonImprovements
+                      + state.Config.GraphSearch.BeamWidth)
         then
             Some "Non-improvement limit reached."
         elif state.ConsecutiveFailures >= state.Config.Budgets.MaxConsecutiveFailures then
@@ -131,23 +147,49 @@ module RunState =
             |> Option.bind _.Evaluation
             |> Option.orElse state.PreviousEvaluation
 
+        let lastExperimentKind = state.Current |> Option.map _.Kind
+
         let nextState =
             match outcome with
             | Accepted score ->
                 { state with
-                    FrontierScore = score
+                    ChampionScore = score
                     AcceptedCount = state.AcceptedCount + 1
                     UsageAtFirstAcceptance = state.UsageAtFirstAcceptance |> Option.orElse (Some state.Usage)
                     ConsecutiveFailures = 0
                     ConsecutiveNonImprovements = 0
                     PreviousEvaluation = previousEvaluation
+                    LastExperimentKind = lastExperimentKind
                     Current = None }
-            | RejectedNotBetter _
+            | RejectedNotBetter reason ->
+                let retainCandidate =
+                    match reason with
+                    | ConstraintFailed _
+                    | MetricMissing _ -> false
+                    | NotStrictlyBetter _ -> true
+
+                let activeHeads =
+                    if retainCandidate then
+                        state.Current
+                        |> Option.bind _.Candidate
+                        |> Option.map (fun candidate -> Set.add candidate state.ActiveHeads)
+                        |> Option.defaultValue state.ActiveHeads
+                    else
+                        state.ActiveHeads
+
+                { state with
+                    ConsecutiveFailures = 0
+                    ConsecutiveNonImprovements = state.ConsecutiveNonImprovements + 1
+                    PreviousEvaluation = previousEvaluation
+                    ActiveHeads = activeHeads
+                    LastExperimentKind = lastExperimentKind
+                    Current = None }
             | RejectedByUser ->
                 { state with
                     ConsecutiveFailures = 0
                     ConsecutiveNonImprovements = state.ConsecutiveNonImprovements + 1
                     PreviousEvaluation = previousEvaluation
+                    LastExperimentKind = lastExperimentKind
                     Current = None }
             | Failed _
             | InvalidProtectedPath _
@@ -156,16 +198,18 @@ module RunState =
                 { state with
                     ConsecutiveFailures = state.ConsecutiveFailures + 1
                     PreviousEvaluation = previousEvaluation
+                    LastExperimentKind = lastExperimentKind
                     Current = None }
             | InconclusiveEvaluation _ ->
                 { state with
                     ConsecutiveFailures = 0
                     PreviousEvaluation = previousEvaluation
+                    LastExperimentKind = lastExperimentKind
                     Current = None }
 
         match
             nextState.Status,
-            Evaluation.targetReached nextState.Config.Metric nextState.FrontierScore,
+            Evaluation.targetReached nextState.Config.Metric nextState.ChampionScore,
             budgetStopReason now nextState
         with
         | PauseAfterCurrent, _, _ ->
@@ -186,10 +230,22 @@ module RunState =
             [ PublishState ]
         | _, _, None -> { nextState with Status = Ready }, [ PublishState; ScheduleNext ]
 
-    let transition now event state =
+    let rec transition now event state =
         match event, state.Status, state.Current with
         | StartRequested(experimentId, startedAt), Ready, None ->
-            match Evaluation.targetReached state.Config.Metric state.FrontierScore, budgetStopReason now state with
+            transition
+                now
+                (GraphExperimentRequested(
+                    experimentId,
+                    ExperimentKind.Expansion,
+                    [ { Commit = state.Champion
+                        Role = ExperimentParentRole.Primary } ],
+                    state.Champion,
+                    startedAt
+                ))
+                state
+        | GraphExperimentRequested(experimentId, kind, parents, championAtStart, startedAt), Ready, None ->
+            match Evaluation.targetReached state.Config.Metric state.ChampionScore, budgetStopReason now state with
             | true, _ ->
                 { state with
                     Status = Completed "Metric target reached." },
@@ -199,7 +255,9 @@ module RunState =
                 let active =
                     { Id = experimentId
                       Sequence = state.Attempted + 1
-                      Parent = state.Frontier
+                      Kind = kind
+                      Parents = parents
+                      ChampionAtStart = championAtStart
                       Phase = PreparingWorktree
                       Candidate = None
                       ThreadId = None
@@ -212,7 +270,7 @@ module RunState =
                     Status = Running
                     Current = Some active
                     Attempted = state.Attempted + 1 },
-                [ PrepareCandidate(experimentId, state.Frontier); PublishState ]
+                [ PrepareCandidate(experimentId, parents, championAtStart); PublishState ]
         | WorktreePrepared experimentId, (Running | PauseAfterCurrent), Some active when
             active.Id = experimentId && active.Phase = PreparingWorktree
             ->
@@ -281,7 +339,7 @@ module RunState =
                 Evaluation.decide
                     state.Config.Metric
                     state.Config.Evaluator.RequiredConstraints
-                    state.FrontierScore
+                    state.ChampionScore
                     evaluation
             with
             | Rejected reason ->
@@ -296,7 +354,7 @@ module RunState =
                                 { active with
                                     Phase = AcceptPending
                                     Evaluation = Some evaluation } },
-                    [ PersistAccepted(active.Id, candidate, active.Parent); PublishState ]
+                    [ PersistAccepted(active.Id, candidate, active.ChampionAtStart); PublishState ]
                 | ReviewStrictWinners, _ ->
                     { evaluatedState with
                         Current =
@@ -318,11 +376,16 @@ module RunState =
             { state with
                 Current = Some { active with Phase = Promoting } },
             [ PublishState ]
-        | FrontierAdvanced experimentId, _, Some active when active.Id = experimentId && active.Phase = Promoting ->
+        | ChampionAdvanced experimentId, _, Some active when active.Id = experimentId && active.Phase = Promoting ->
             match active.Candidate, active.Evaluation with
             | Some candidate, Some evaluation ->
                 let score = evaluation.Metrics[state.Config.Metric.Name]
-                let updated = { state with Frontier = candidate }
+
+                let updated =
+                    { state with
+                        Champion = candidate
+                        ActiveHeads = Set.add candidate state.ActiveHeads }
+
                 finishExperiment now (Accepted score) updated
             | _ ->
                 let error =
@@ -338,7 +401,7 @@ module RunState =
             | Some candidate ->
                 { state with
                     Current = Some { active with Phase = AcceptPending } },
-                [ PersistAccepted(active.Id, candidate, active.Parent); PublishState ]
+                [ PersistAccepted(active.Id, candidate, active.ChampionAtStart); PublishState ]
             | None -> state, []
         | ReviewRejected experimentId, (Running | PauseAfterCurrent), Some active when
             active.Id = experimentId && active.Phase = AwaitingReview

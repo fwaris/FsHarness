@@ -408,37 +408,203 @@ module GitStore =
                                 return refs |> Result.map ignore
         }
 
-    let prepareCandidate store runId experimentId parent cancellationToken =
+    let prepareCandidate store runId experimentId (parents: ExperimentParent list) champion cancellationToken =
         async {
             let repository = repoPath store runId
 
-            let generation =
-                Path.Combine(DataPaths.experiment store.Root runId experimentId, "generation")
+            let primary =
+                parents
+                |> List.tryFind (fun parent -> parent.Role = ExperimentParentRole.Primary)
 
-            Directory.CreateDirectory(Path.GetDirectoryName generation) |> ignore
+            match primary with
+            | None ->
+                return
+                    Error(
+                        HarnessError.create
+                            "git.primary_parent_missing"
+                            HarnessErrorCategory.Git
+                            "A candidate workspace requires one primary parent."
+                    )
+            | Some primaryParent ->
 
-            let! result =
+                let generation =
+                    Path.Combine(DataPaths.experiment store.Root runId experimentId, "generation")
+
+                Directory.CreateDirectory(Path.GetDirectoryName generation) |> ignore
+
+                let! result =
+                    requireSuccess
+                        store
+                        "prepare_candidate"
+                        None
+                        [ "--git-dir"
+                          repository
+                          "worktree"
+                          "add"
+                          "--detach"
+                          generation
+                          CommitOid.value primaryParent.Commit ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                return
+                    result
+                    |> Result.map (fun _ ->
+                        { ExperimentId = experimentId
+                          GenerationPath = generation
+                          Parents = parents
+                          Champion = champion })
+        }
+
+    let prepareSynthesis store runId experimentId primary contributor champion cancellationToken =
+        async {
+            let parents: ExperimentParent list =
+                [ { Commit = primary
+                    Role = ExperimentParentRole.Primary }
+                  { Commit = contributor
+                    Role = ExperimentParentRole.Contributor } ]
+
+            match! prepareCandidate store runId experimentId parents champion cancellationToken with
+            | Error error -> return Error error
+            | Ok workspace ->
+                let! mergeResult =
+                    execute
+                        store
+                        (Some workspace.GenerationPath)
+                        [ "merge"; "--no-commit"; "--no-ff"; CommitOid.value contributor ]
+                        None
+                        (Map.ofList
+                            [ "GIT_AUTHOR_NAME", "FsHarness"
+                              "GIT_AUTHOR_EMAIL", "fsharness@localhost"
+                              "GIT_COMMITTER_NAME", "FsHarness"
+                              "GIT_COMMITTER_EMAIL", "fsharness@localhost" ])
+                        cancellationToken
+
+                match mergeResult with
+                | Error error -> return Error(mapGitError "prepare_synthesis" error)
+                | Ok result when result.ExitCode = 0 -> return Ok(SynthesisPreparation.Clean workspace)
+                | Ok _ ->
+                    let! filesResult =
+                        requireSuccess
+                            store
+                            "synthesis_conflict_files"
+                            (Some workspace.GenerationPath)
+                            [ "diff"; "--name-only"; "--diff-filter=U" ]
+                            None
+                            Map.empty
+                            cancellationToken
+
+                    let! diffResult =
+                        requireSuccess
+                            store
+                            "synthesis_conflict_diff"
+                            (Some workspace.GenerationPath)
+                            [ "diff"; "--cc" ]
+                            None
+                            Map.empty
+                            cancellationToken
+
+                    match filesResult, diffResult with
+                    | Ok files, Ok conflictText ->
+                        return
+                            Ok(
+                                SynthesisPreparation.Conflicted(
+                                    workspace,
+                                    { Files =
+                                        files.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                                        |> List.ofArray
+                                      ConflictText = conflictText }
+                                )
+                            )
+                    | Error error, _
+                    | _, Error error -> return Error error
+        }
+
+    let analyzeSynthesis store runId primary contributor cancellationToken =
+        async {
+            let repository = repoPath store runId
+            let primaryText = CommitOid.value primary
+            let contributorText = CommitOid.value contributor
+
+            let! mergeBase =
                 requireSuccess
                     store
-                    "prepare_candidate"
+                    "synthesis_merge_base"
                     None
-                    [ "--git-dir"
-                      repository
-                      "worktree"
-                      "add"
-                      "--detach"
-                      generation
-                      CommitOid.value parent ]
+                    [ "--git-dir"; repository; "merge-base"; primaryText; contributorText ]
                     None
                     Map.empty
                     cancellationToken
 
-            return
-                result
-                |> Result.map (fun _ ->
-                    { ExperimentId = experimentId
-                      GenerationPath = generation
-                      Parent = parent })
+            match mergeBase with
+            | Error error -> return Error error
+            | Ok baseText ->
+                let baseCommit = baseText.Trim()
+
+                let! primaryPaths =
+                    requireSuccess
+                        store
+                        "synthesis_primary_paths"
+                        None
+                        [ "--git-dir"
+                          repository
+                          "diff"
+                          "--name-only"
+                          "-z"
+                          baseCommit
+                          primaryText
+                          "--" ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                let! contributorPaths =
+                    requireSuccess
+                        store
+                        "synthesis_contributor_paths"
+                        None
+                        [ "--git-dir"
+                          repository
+                          "diff"
+                          "--name-only"
+                          "-z"
+                          baseCommit
+                          contributorText
+                          "--" ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                let! mergeTree =
+                    execute
+                        store
+                        None
+                        [ "--git-dir"
+                          repository
+                          "merge-tree"
+                          "--write-tree"
+                          primaryText
+                          contributorText ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                match primaryPaths, contributorPaths, mergeTree with
+                | Ok primaryText, Ok contributorText, Ok merge ->
+                    let paths (text: string) =
+                        text.Split('\000', StringSplitOptions.RemoveEmptyEntries) |> Set.ofArray
+
+                    let primarySet = paths primaryText
+                    let contributorSet = paths contributorText
+
+                    return
+                        Ok
+                            { CleanMerge = merge.ExitCode = 0
+                              ChangedPathOverlap = Set.intersect primarySet contributorSet |> Set.count }
+                | Error error, _, _
+                | _, Error error, _ -> return Error error
+                | _, _, Error error -> return Error(mapGitError "synthesis_merge_tree" error)
         }
 
     let private nulValues (text: string) =
@@ -500,7 +666,12 @@ module GitStore =
         =
         async {
             let repository = repoPath store runId
-            let parentText = CommitOid.value workspace.Parent
+
+            let primaryParent =
+                workspace.Parents
+                |> List.find (fun parent -> parent.Role = ExperimentParentRole.Primary)
+
+            let parentText = CommitOid.value primaryParent.Commit
 
             let! tracked =
                 requireSuccess
@@ -529,13 +700,37 @@ module GitStore =
                     |> List.map PathPolicy.normalize
                     |> List.distinct
 
-                let editable, initiallyProtected = PathPolicy.partition editableGlobs changed
+                let unresolvedMarkers =
+                    changed
+                    |> List.filter (fun relativePath ->
+                        let path = Path.Combine(workspace.GenerationPath, relativePath)
+
+                        try
+                            if File.Exists path then
+                                let text = File.ReadAllText path
+
+                                text.Contains("<<<<<<<", StringComparison.Ordinal)
+                                || text.Contains("=======", StringComparison.Ordinal)
+                                || text.Contains(">>>>>>>", StringComparison.Ordinal)
+                            else
+                                false
+                        with _ ->
+                            false)
+
+                let policyEditable, policyProtected = PathPolicy.partition editableGlobs changed
+
+                let editable =
+                    policyEditable
+                    |> List.filter (fun path -> not (List.contains path unresolvedMarkers))
+
+                let initiallyProtected = policyProtected @ unresolvedMarkers |> List.distinct
 
                 let experimentRoot = DataPaths.experiment store.Root runId workspace.ExperimentId
 
                 let assembly = Path.Combine(experimentRoot, "assembly")
                 let evaluation = Path.Combine(experimentRoot, "evaluation")
-                let frontierEvaluation = Path.Combine(experimentRoot, "frontier-evaluation")
+                let parentEvaluation = Path.Combine(experimentRoot, "parent-evaluation")
+                let championEvaluation = Path.Combine(experimentRoot, "champion-evaluation")
 
                 let! assemblyResult =
                     requireSuccess
@@ -638,14 +833,25 @@ module GitStore =
                                       "GIT_COMMITTER_DATE", timestamp ]
 
                             let message =
-                                $"FsHarness experiment {ExperimentId.text workspace.ExperimentId}\n\nFsHarness-Run: {RunId.text runId}\nFsHarness-Experiment: {ExperimentId.text workspace.ExperimentId}\nFsHarness-Parent: {parentText}\n"
+                                let parentLines =
+                                    workspace.Parents
+                                    |> List.map (fun parent ->
+                                        $"FsHarness-Parent-{parent.Role}: {CommitOid.value parent.Commit}")
+                                    |> String.concat "\n"
+
+                                $"FsHarness experiment {ExperimentId.text workspace.ExperimentId}\n\nFsHarness-Run: {RunId.text runId}\nFsHarness-Experiment: {ExperimentId.text workspace.ExperimentId}\n{parentLines}\n"
+
+                            let commitArguments =
+                                [ "commit-tree"; treeText.Trim() ]
+                                @ (workspace.Parents
+                                   |> List.collect (fun parent -> [ "-p"; CommitOid.value parent.Commit ]))
 
                             let! commit =
                                 requireSuccess
                                     store
                                     "commit_candidate"
                                     (Some assembly)
-                                    [ "commit-tree"; treeText.Trim(); "-p"; parentText ]
+                                    commitArguments
                                     (Some message)
                                     commitEnvironment
                                     cancellationToken
@@ -689,21 +895,40 @@ module GitStore =
                                             Map.empty
                                             cancellationToken
 
-                                    let! frontierEvaluationResult =
+                                    let! parentEvaluationResult =
                                         match evaluationResult with
                                         | Error error -> async { return Error error }
                                         | Ok _ ->
                                             requireSuccess
                                                 store
-                                                "prepare_frontier_evaluation"
+                                                "prepare_parent_evaluation"
                                                 None
                                                 [ "--git-dir"
                                                   repository
                                                   "worktree"
                                                   "add"
                                                   "--detach"
-                                                  frontierEvaluation
+                                                  parentEvaluation
                                                   parentText ]
+                                                None
+                                                Map.empty
+                                                cancellationToken
+
+                                    let! championEvaluationResult =
+                                        match parentEvaluationResult with
+                                        | Error error -> async { return Error error }
+                                        | Ok _ ->
+                                            requireSuccess
+                                                store
+                                                "prepare_champion_evaluation"
+                                                None
+                                                [ "--git-dir"
+                                                  repository
+                                                  "worktree"
+                                                  "add"
+                                                  "--detach"
+                                                  championEvaluation
+                                                  CommitOid.value workspace.Champion ]
                                                 None
                                                 Map.empty
                                                 cancellationToken
@@ -718,13 +943,14 @@ module GitStore =
                                             cancellationToken
 
                                     return
-                                        frontierEvaluationResult
+                                        championEvaluationResult
                                         |> Result.map (fun _ ->
                                             { Commit = CommitOid.create candidateText
                                               ChangedPaths = changed
                                               ProtectedPaths = protectedPaths |> List.distinct
                                               EvaluationPath = evaluation
-                                              FrontierEvaluationPath = frontierEvaluation })
+                                              ParentEvaluationPath = parentEvaluation
+                                              ChampionEvaluationPath = championEvaluation })
             | Error error, _
             | _, Error error -> return Error error
         }
@@ -850,6 +1076,8 @@ module GitStore =
         { InspectSource = inspectSource store
           CreateRun = createRun store
           PrepareCandidate = prepareCandidate store
+          PrepareSynthesis = prepareSynthesis store
+          AnalyzeSynthesis = analyzeSynthesis store
           ApplySeedPatch = applySeedPatch store
           CaptureCandidate = captureCandidate store
           AdvanceFrontier = advanceFrontier store

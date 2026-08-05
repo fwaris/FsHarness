@@ -51,6 +51,25 @@ type RuntimeHealth =
       KnowledgeClaimCount: int
       Issues: string list }
 
+type private ScheduledGraphExperiment =
+    { Kind: ExperimentKind
+      Parents: ExperimentParent list
+      Champion: CommitOid
+      ActiveHeads: Set<CommitOid>
+      SynthesisPair: SynthesisPair option
+      PreparedSynthesis: (CandidateWorkspace * SynthesisConflict option * bool) option }
+
+type private PendingEvaluationLease =
+    { Candidate: CommitOid
+      Parents: ExperimentParent list
+      Champion: CommitOid
+      ChampionScore: decimal
+      ParentPath: string
+      ChampionPath: string
+      CandidatePath: string
+      ResultPath: string
+      Summary: ExperimentSummary }
+
 type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     let mutable root = Path.GetFullPath dataRoot
     let mutable gitStore = GitStore.create root
@@ -101,6 +120,10 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
     let notifyEvolution runId = evolutionChanged.Trigger runId
 
+    let expansionParents commit : ExperimentParent list =
+        [ { Commit = commit
+            Role = ExperimentParentRole.Primary } ]
+
     let enterRecovery (error: HarnessError) (experimentId: ExperimentId option) =
         let correlated =
             { error with
@@ -128,9 +151,24 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         publish $"Persistence recovery required: {error.Summary}" experimentId
         updated |> Option.iter stateChanged.Trigger
 
-    let persistExperimentStart runId experimentId sequence parent outcome cancellationToken =
+    let persistExperimentStart runId experimentId sequence kind parents championAtStart outcome cancellationToken =
         async {
-            match! SqliteStore.beginExperiment sqlite runId experimentId sequence parent outcome cancellationToken with
+            let! result =
+                match parents with
+                | [] -> SqliteStore.beginExperiment sqlite runId experimentId sequence None outcome cancellationToken
+                | values ->
+                    SqliteStore.beginGraphExperiment
+                        sqlite
+                        runId
+                        experimentId
+                        sequence
+                        kind
+                        values
+                        championAtStart
+                        outcome
+                        cancellationToken
+
+            match result with
             | Ok() -> notifyEvolution runId
             | Error error -> enterRecovery error (Some experimentId)
         }
@@ -138,6 +176,38 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     let persistCandidate runId experimentId candidate cancellationToken =
         async {
             match! SqliteStore.updateExperimentCandidate sqlite experimentId candidate cancellationToken with
+            | Ok() -> notifyEvolution runId
+            | Error error -> enterRecovery error (Some experimentId)
+        }
+
+    let persistGraphState
+        runId
+        experimentId
+        kind
+        championAtStart
+        hypothesisFamily
+        validity
+        decision
+        searchStatus
+        cancellationToken
+        =
+        async {
+            let synthesisDepth = if kind = ExperimentKind.Synthesis then 1 else 0
+
+            match!
+                SqliteStore.saveExperimentGraphState
+                    sqlite
+                    runId
+                    experimentId
+                    kind
+                    validity
+                    decision
+                    searchStatus
+                    championAtStart
+                    hypothesisFamily
+                    synthesisDepth
+                    cancellationToken
+            with
             | Ok() -> notifyEvolution runId
             | Error error -> enterRecovery error (Some experimentId)
         }
@@ -231,14 +301,20 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     let recordExperimentKnowledge
         runId
         experimentId
-        parent
+        (parents: ExperimentParent list)
         candidate
         evaluationPath
         (evaluation: EvaluationResult)
         (summary: ExperimentSummary)
+        (config: HarnessConfig)
         cancellationToken
         =
         async {
+            let primary =
+                parents
+                |> List.find (fun parent -> parent.Role = ExperimentParentRole.Primary)
+                |> _.Commit
+
             let entity =
                 { Id = KnowledgeEntityId.create ()
                   Kind = KnowledgeEntityKind.Experiment
@@ -246,7 +322,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                   Attributes =
                     Map
                         [ "experimentId", ExperimentId.text experimentId
-                          "parent", CommitOid.value parent
+                          "parent", CommitOid.value primary
                           "candidate", CommitOid.value candidate ] }
 
             let source =
@@ -295,6 +371,131 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         match! SqliteStore.saveKnowledgeClaim sqlite claim cancellationToken with
                         | Ok() -> ()
                         | Error error -> publish $"Knowledge graph warning: {error.Summary}" (Some experimentId)
+
+                    match SqliteStore.projectIdForRun sqlite runId with
+                    | Error error -> enterRecovery error (Some experimentId)
+                    | Ok projectId ->
+                        match SqliteStore.loadRepositoryKnowledgeGraph sqlite projectId with
+                        | Error error -> enterRecovery error (Some experimentId)
+                        | Ok repositoryGraph ->
+                            let now = DateTimeOffset.UtcNow
+                            let runText = RunId.text runId
+                            let experimentText = ExperimentId.text experimentId
+                            let nodeId prefix value = GraphNodeId.create $"{prefix}:{value}"
+
+                            let edgeId relation fromValue toValue =
+                                GraphEdgeId.create $"{relation}:{fromValue}:{toValue}"
+
+                            let runNode = nodeId "agent-run" runText
+                            let taskNode = nodeId "task" runText
+                            let sourceNode = nodeId "source" experimentText
+                            let artifactNode = nodeId "artifact" $"{experimentText}:evaluation"
+                            let evaluationNode = nodeId "evaluation" experimentText
+                            let claimNode = nodeId "claim" $"{experimentText}:hypothesis"
+                            let candidateNode = nodeId "commit" (CommitOid.value candidate)
+
+                            let node kind id name attributes =
+                                { Id = id
+                                  Kind = kind
+                                  CanonicalName = name
+                                  Attributes = attributes
+                                  Version = 1
+                                  OriginRunId = runId
+                                  CreatedAt = now }
+
+                            let sourced relation fromNode toNode =
+                                { Id = edgeId (string relation) (GraphNodeId.value fromNode) (GraphNodeId.value toNode)
+                                  From = fromNode
+                                  Relation = relation
+                                  To = toNode
+                                  Confidence = 1M
+                                  Provenance = GraphProvenance.Sourced(Set.singleton source.Id)
+                                  OriginRunId = runId
+                                  ValidFrom = now
+                                  ValidTo = None }
+
+                            let parentNodes =
+                                parents
+                                |> List.map (fun parent ->
+                                    let id = nodeId "commit" (CommitOid.value parent.Commit)
+
+                                    node GraphNodeKind.Commit id (CommitOid.value parent.Commit) Map.empty)
+
+                            let metricNodes =
+                                evaluation.Metrics
+                                |> Map.toList
+                                |> List.map (fun (name, value) ->
+                                    let id = nodeId "metric" $"{experimentText}:{name}"
+
+                                    node GraphNodeKind.Metric id name (Map [ "name", name; "value", string value ]))
+
+                            let constraintNames = String.concat "," config.Evaluator.RequiredConstraints
+
+                            let rubric =
+                                $"constraints={constraintNames}; metric={config.Metric.Name}; direction={config.Metric.Direction}"
+
+                            let update =
+                                { ProjectId = projectId
+                                  RunId = runId
+                                  AgentId = "fsharness-headless"
+                                  IdempotencyKey = $"experiment-evaluated:{experimentText}"
+                                  Nodes =
+                                    [ node GraphNodeKind.AgentRun runNode $"Run {runText}" Map.empty
+                                      node
+                                          GraphNodeKind.Task
+                                          taskNode
+                                          config.Objective
+                                          (Map [ "objective", config.Objective ])
+                                      node
+                                          GraphNodeKind.Source
+                                          sourceNode
+                                          evaluationPath
+                                          (Map [ "location", evaluationPath ])
+                                      node
+                                          GraphNodeKind.Artifact
+                                          artifactNode
+                                          $"Evaluation artifact {experimentText}"
+                                          (Map
+                                              [ "authoringRun", runText
+                                                "artifactVersion", "1"
+                                                "path", evaluationPath ])
+                                      node
+                                          GraphNodeKind.Evaluation
+                                          evaluationNode
+                                          $"Evaluation {experimentText}"
+                                          (Map [ "rubric", rubric; "status", string evaluation.Status ])
+                                      node
+                                          GraphNodeKind.Claim
+                                          claimNode
+                                          summary.Hypothesis
+                                          (Map [ "hypothesisFamily", summary.HypothesisFamily ])
+                                      node GraphNodeKind.Commit candidateNode (CommitOid.value candidate) Map.empty
+                                      yield! parentNodes
+                                      yield! metricNodes ]
+                                  Edges =
+                                    [ yield sourced GraphRelationKind.Produced runNode candidateNode
+                                      yield sourced GraphRelationKind.DependsOn candidateNode taskNode
+                                      yield sourced GraphRelationKind.Evaluates evaluationNode candidateNode
+                                      yield sourced GraphRelationKind.Supports artifactNode evaluationNode
+                                      yield sourced GraphRelationKind.Supports claimNode candidateNode
+                                      for parent in parents do
+                                          let parentNode = nodeId "commit" (CommitOid.value parent.Commit)
+                                          yield sourced GraphRelationKind.ParentOf parentNode candidateNode
+                                      for metricNode in metricNodes do
+                                          yield sourced GraphRelationKind.Produced evaluationNode metricNode.Id ] }
+
+                            match RepositoryKnowledgeGraph.apply update repositoryGraph with
+                            | Error errors ->
+                                enterRecovery
+                                    (HarnessError.create
+                                        "runtime.repository_graph_invalid"
+                                        HarnessErrorCategory.Persistence
+                                        (String.concat " " errors))
+                                    (Some experimentId)
+                            | Ok _ ->
+                                match! SqliteStore.saveRepositoryGraphUpdate sqlite update cancellationToken with
+                                | Ok _ -> ()
+                                | Error error -> enterRecovery error (Some experimentId)
         }
 
     let experimentSchema =
@@ -305,14 +506,65 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
           "additionalProperties": false,
           "properties": {
             "hypothesis": { "type": "string", "minLength": 1 },
+            "hypothesisFamily": { "type": "string", "minLength": 1 },
             "changeSummary": { "type": "string", "minLength": 1 },
             "expectedEffect": { "type": "string", "minLength": 1 },
             "validationNotes": { "type": "array", "items": { "type": "string" } },
             "reusableLesson": { "type": "string", "minLength": 1 }
           },
-          "required": ["hypothesis", "changeSummary", "expectedEffect", "validationNotes", "reusableLesson"]
+          "required": ["hypothesisFamily", "hypothesis", "changeSummary", "expectedEffect", "validationNotes", "reusableLesson"]
         }
         """
+
+    let repositoryGraphContext runId objective parent champion maxCharacters =
+        SqliteStore.projectIdForRun sqlite runId
+        |> Result.bind (fun projectId ->
+            SqliteStore.loadRepositoryKnowledgeGraph sqlite projectId
+            |> Result.map (fun graph ->
+                let commitSeed commit =
+                    GraphNodeId.create $"commit:{CommitOid.value commit}"
+
+                let seeds =
+                    Set
+                        [ GraphNodeId.create $"task:{RunId.text runId}"
+                          commitSeed parent
+                          commitSeed champion ]
+
+                let context =
+                    RepositoryKnowledgeGraph.query
+                        { Seeds = seeds
+                          MaxHops = 2
+                          MaxEdges = 80
+                          MaxCharacters = maxCharacters
+                          AllowedRelations =
+                            Set
+                                [ GraphRelationKind.Supports
+                                  GraphRelationKind.Contradicts
+                                  GraphRelationKind.DerivedFrom
+                                  GraphRelationKind.Produced
+                                  GraphRelationKind.Evaluates
+                                  GraphRelationKind.Supersedes
+                                  GraphRelationKind.DependsOn
+                                  GraphRelationKind.ParentOf
+                                  GraphRelationKind.ResolvedTo ]
+                          AsOf = None
+                          IncludeConflicts = true }
+                        graph
+
+                [ if not (String.IsNullOrWhiteSpace context.Serialized) then
+                      yield context.Serialized
+                  if context.Truncated then
+                      yield "[graph-context truncated]"
+                  if not (List.isEmpty context.MissingEvidence) then
+                      let ids =
+                          context.MissingEvidence |> List.map GraphEdgeId.value |> String.concat ", "
+
+                      yield $"[uncertain/inferred edges: {ids}]"
+                  if graph.Nodes.IsEmpty then
+                      yield $"[no prior repository graph evidence for objective: {objective}]" ]
+                |> function
+                    | [] -> None
+                    | lines -> Some(String.concat Environment.NewLine lines)))
 
     let reproducibilityManifest
         runId
@@ -422,7 +674,17 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
               Summary = summary }
             cancellationToken
 
-    let promoteCandidate runId experimentId parent candidate score summary acceptedEvent =
+    let promoteCandidate
+        runId
+        experimentId
+        parent
+        candidate
+        score
+        summary
+        acceptedEvent
+        experimentKind
+        championAtStart
+        =
         async {
             let operationKind = "advance-frontier"
 
@@ -519,19 +781,54 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                     saveMemory runId experimentId "Accepted" (Some score) summary CancellationToken.None
                                     |> Async.Ignore
 
-                                dispatch (FrontierAdvanced experimentId) |> ignore
+                                let championSequence =
+                                    tryCurrent ()
+                                    |> Option.map (fun current -> current.AcceptedCount + 1)
+                                    |> Option.defaultValue 1
 
                                 do!
-                                    SqliteStore.completeDurableOperation
+                                    SqliteStore.saveChampion
                                         sqlite
                                         runId
-                                        experimentId
-                                        operationKind
-                                        "completed"
+                                        championSequence
+                                        candidate
+                                        (Some score)
+                                        (Some experimentId)
                                         CancellationToken.None
                                     |> Async.Ignore
 
-                                return Ok()
+                                let synthesisDepth = if experimentKind = ExperimentKind.Synthesis then 1 else 0
+
+                                match!
+                                    SqliteStore.saveExperimentGraphState
+                                        sqlite
+                                        runId
+                                        experimentId
+                                        experimentKind
+                                        EvaluationValidity.Valid
+                                        ChampionDecision.Promoted
+                                        SearchStatus.ActiveHead
+                                        championAtStart
+                                        summary.HypothesisFamily
+                                        synthesisDepth
+                                        CancellationToken.None
+                                with
+                                | Error error ->
+                                    enterRecovery error (Some experimentId)
+                                    return Error error
+                                | Ok() ->
+                                    do!
+                                        SqliteStore.completeDurableOperation
+                                            sqlite
+                                            runId
+                                            experimentId
+                                            operationKind
+                                            "completed"
+                                            CancellationToken.None
+                                        |> Async.Ignore
+
+                                    dispatch (ChampionAdvanced experimentId) |> ignore
+                                    return Ok()
                 | Ok() ->
                     let error =
                         HarnessError.create
@@ -553,27 +850,141 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                     return Error error
         }
 
-    let runEvaluatorWithRetries (spec: EvaluatorSpec) frontierPath candidatePath resultPath cancellationToken =
-        let rec loop attempt =
+    let runEvaluatorWithRetries
+        runId
+        experimentId
+        (spec: EvaluatorSpec)
+        parentPath
+        championPath
+        candidatePath
+        resultPath
+        (cancellationToken: CancellationToken)
+        =
+        let cancelledError () =
+            HarnessError.create
+                "evaluator.retry_cancelled"
+                HarnessErrorCategory.Evaluation
+                "Evaluator retry wait was cancelled."
+
+        let waitForInfrastructure () =
             async {
-                let! result = evaluator.Run spec frontierPath candidatePath resultPath cancellationToken
+                try
+                    do! Task.Delay(spec.InfrastructureRetryDelay, cancellationToken) |> Async.AwaitTask
+                    return true
+                with :? OperationCanceledException ->
+                    return false
+            }
+
+        let rec loop inconclusiveRetries infrastructureRetries =
+            async {
+                let! result =
+                    evaluator.Run
+                        { Spec = spec
+                          DerivationParentPath = parentPath
+                          ChampionPath = championPath
+                          CandidatePath = candidatePath
+                          ResultPath = resultPath }
+                        cancellationToken
 
                 match result with
                 | Ok evaluation when
                     evaluation.Status = EvaluationStatus.Inconclusive
-                    && attempt < spec.MaxInconclusiveRetries
+                    && inconclusiveRetries < spec.MaxInconclusiveRetries
                     ->
                     evaluatorRetryCount <- evaluatorRetryCount + 1
 
                     publish
-                        $"Evaluator was inconclusive; retrying the same candidate ({attempt + 1}/{spec.MaxInconclusiveRetries})."
-                        None
+                        $"Evaluator was inconclusive; retrying the same candidate ({inconclusiveRetries + 1}/{spec.MaxInconclusiveRetries})."
+                        (Some experimentId)
 
-                    return! loop (attempt + 1)
+                    return! loop (inconclusiveRetries + 1) infrastructureRetries
+                | Error error when error.Retryable && infrastructureRetries < spec.MaxInfrastructureRetries ->
+                    let retryNumber = infrastructureRetries + 1
+                    evaluatorRetryCount <- evaluatorRetryCount + 1
+
+                    let detail =
+                        $"{error.Code}: {error.Summary} Retrying preserved candidate in {spec.InfrastructureRetryDelay.TotalSeconds:N0}s ({retryNumber}/{spec.MaxInfrastructureRetries})."
+
+                    do! journalEvent runId (Some experimentId) "EvaluatorRetryScheduled" detail CancellationToken.None
+
+                    publish detail (Some experimentId)
+                    let! shouldContinue = waitForInfrastructure ()
+
+                    if shouldContinue then
+                        return! loop inconclusiveRetries retryNumber
+                    else
+                        return Error(cancelledError ())
                 | _ -> return result
             }
 
-        loop 0
+        loop 0 0
+
+    let evaluationLeasePayload
+        (snapshot: CandidateSnapshot)
+        (schedule: ScheduledGraphExperiment)
+        championScore
+        resultPath
+        (summary: ExperimentSummary)
+        =
+        JsonSerializer.Serialize
+            {| candidate = CommitOid.value snapshot.Commit
+               parents =
+                schedule.Parents
+                |> List.map (fun parent ->
+                    {| commit = CommitOid.value parent.Commit
+                       role = string parent.Role |})
+               champion = CommitOid.value schedule.Champion
+               championScore = championScore
+               parentPath = snapshot.ParentEvaluationPath
+               championPath = snapshot.ChampionEvaluationPath
+               candidatePath = snapshot.EvaluationPath
+               resultPath = resultPath
+               summary =
+                {| hypothesisFamily = summary.HypothesisFamily
+                   hypothesis = summary.Hypothesis
+                   changeSummary = summary.ChangeSummary
+                   expectedEffect = summary.ExpectedEffect
+                   validationNotes = summary.ValidationNotes
+                   reusableLesson = summary.ReusableLesson |} |}
+
+    let parseEvaluationLease (operation: DurableOperation) =
+        try
+            use document = JsonDocument.Parse operation.Payload
+            let root = document.RootElement
+            let summary = root.GetProperty "summary"
+
+            let parents =
+                root.GetProperty("parents").EnumerateArray()
+                |> Seq.map (fun parent ->
+                    { Commit = CommitOid.create (parent.GetProperty("commit").GetString())
+                      Role =
+                        if parent.GetProperty("role").GetString() = "Contributor" then
+                            ExperimentParentRole.Contributor
+                        else
+                            ExperimentParentRole.Primary })
+                |> List.ofSeq
+
+            Some
+                { Candidate = CommitOid.create (root.GetProperty("candidate").GetString())
+                  Parents = parents
+                  Champion = CommitOid.create (root.GetProperty("champion").GetString())
+                  ChampionScore = root.GetProperty("championScore").GetDecimal()
+                  ParentPath = root.GetProperty("parentPath").GetString()
+                  ChampionPath = root.GetProperty("championPath").GetString()
+                  CandidatePath = root.GetProperty("candidatePath").GetString()
+                  ResultPath = root.GetProperty("resultPath").GetString()
+                  Summary =
+                    { HypothesisFamily = summary.GetProperty("hypothesisFamily").GetString()
+                      Hypothesis = summary.GetProperty("hypothesis").GetString()
+                      ChangeSummary = summary.GetProperty("changeSummary").GetString()
+                      ExpectedEffect = summary.GetProperty("expectedEffect").GetString()
+                      ValidationNotes =
+                        summary.GetProperty("validationNotes").EnumerateArray()
+                        |> Seq.map _.GetString()
+                        |> List.ofSeq
+                      ReusableLesson = summary.GetProperty("reusableLesson").GetString() } }
+        with _ ->
+            None
 
     let evaluateSeedPatches runId (config: HarnessConfig) initialFrontier initialScore cancellationToken =
         let rec loop index frontier score remaining =
@@ -588,7 +999,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             runId
                             experimentId
                             (index + 1)
-                            (Some frontier)
+                            ExperimentKind.Expansion
+                            (expansionParents frontier)
+                            frontier
                             "SeedActive"
                             cancellationToken
 
@@ -596,7 +1009,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         $"Evaluating protected seed candidate '{patchPath}' at zero Codex-token cost."
                         (Some experimentId)
 
-                    match! git.PrepareCandidate runId experimentId frontier cancellationToken with
+                    match!
+                        git.PrepareCandidate runId experimentId (expansionParents frontier) frontier cancellationToken
+                    with
                     | Error error ->
                         do! journalEvent runId (Some experimentId) "SeedPrepareFailed" error.Summary cancellationToken
                         return Error error
@@ -647,8 +1062,11 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
                                 match!
                                     runEvaluatorWithRetries
+                                        runId
+                                        experimentId
                                         config.Evaluator
-                                        snapshot.FrontierEvaluationPath
+                                        snapshot.ParentEvaluationPath
+                                        snapshot.ChampionEvaluationPath
                                         snapshot.EvaluationPath
                                         resultPath
                                         cancellationToken
@@ -856,7 +1274,252 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         with _ ->
             None
 
-    let reconcilePendingOperations runId cancellationToken =
+    let resumeEvaluationLease
+        runId
+        (config: HarnessConfig)
+        (operation: DurableOperation)
+        (lease: PendingEvaluationLease)
+        cancellationToken
+        =
+        async {
+            let cachedEvaluation =
+                if File.Exists lease.ResultPath then
+                    try
+                        File.ReadAllText lease.ResultPath |> parseStoredEvaluation
+                    with _ ->
+                        None
+                else
+                    None
+
+            let! evaluationResult =
+                match cachedEvaluation with
+                | Some evaluation -> async { return Ok evaluation }
+                | None ->
+                    runEvaluatorWithRetries
+                        runId
+                        operation.ExperimentId
+                        config.Evaluator
+                        lease.ParentPath
+                        lease.ChampionPath
+                        lease.CandidatePath
+                        lease.ResultPath
+                        cancellationToken
+
+            match evaluationResult with
+            | Error error -> return Error error
+            | Ok evaluation ->
+                let existingEvaluation =
+                    SqliteStore.loadEvaluationsForRun sqlite runId
+                    |> Result.map (List.exists (fun stored -> stored.ExperimentId = operation.ExperimentId))
+
+                match existingEvaluation with
+                | Error error -> raise (RuntimePersistenceAbort error)
+                | Ok false ->
+                    match!
+                        SqliteStore.saveEvaluation sqlite runId operation.ExperimentId evaluation CancellationToken.None
+                    with
+                    | Error error -> raise (RuntimePersistenceAbort error)
+                    | Ok() -> ()
+                | Ok true -> ()
+
+                do!
+                    recordArtifact
+                        runId
+                        (Some operation.ExperimentId)
+                        "evaluation"
+                        lease.ResultPath
+                        CancellationToken.None
+
+                do!
+                    recordExperimentKnowledge
+                        runId
+                        operation.ExperimentId
+                        lease.Parents
+                        lease.Candidate
+                        lease.ResultPath
+                        evaluation
+                        lease.Summary
+                        config
+                        CancellationToken.None
+
+                let! decisionResult =
+                    async {
+                        match evaluation.Status with
+                        | EvaluationStatus.Inconclusive ->
+                            let reason =
+                                if String.IsNullOrWhiteSpace evaluation.Summary then
+                                    "Recovered evaluator result remained inconclusive."
+                                else
+                                    evaluation.Summary
+
+                            match!
+                                SqliteStore.completeExperiment
+                                    sqlite
+                                    operation.ExperimentId
+                                    $"Inconclusive: {reason}"
+                                    CancellationToken.None
+                            with
+                            | Error error -> return Error error
+                            | Ok() ->
+                                do!
+                                    journalEvent
+                                        runId
+                                        (Some operation.ExperimentId)
+                                        "EvaluationInconclusive"
+                                        reason
+                                        CancellationToken.None
+
+                                return Ok()
+                        | EvaluationStatus.Complete ->
+                            match
+                                Evaluation.decide
+                                    config.Metric
+                                    config.Evaluator.RequiredConstraints
+                                    lease.ChampionScore
+                                    evaluation
+                            with
+                            | StrictImprovement score ->
+                                match! GitStore.loadLineage gitStore runId cancellationToken with
+                                | Error error -> return Error error
+                                | Ok lineage when lineage.Frontier <> Some lease.Champion ->
+                                    return
+                                        Error(
+                                            HarnessError.create
+                                                "recovery.evaluation_champion_changed"
+                                                HarnessErrorCategory.Recovery
+                                                "The champion changed while an evaluator lease was interrupted; fresh champion evidence is required."
+                                        )
+                                | Ok _ ->
+                                    match!
+                                        git.AdvanceFrontier runId lease.Champion lease.Candidate CancellationToken.None
+                                    with
+                                    | Error error -> return Error error
+                                    | Ok() ->
+                                        match!
+                                            SqliteStore.completeExperiment
+                                                sqlite
+                                                operation.ExperimentId
+                                                "Accepted"
+                                                CancellationToken.None
+                                        with
+                                        | Error error -> return Error error
+                                        | Ok() ->
+                                            let sequence =
+                                                SqliteStore.loadExperiments sqlite runId
+                                                |> Result.map List.length
+                                                |> Result.defaultValue 0
+
+                                            do!
+                                                SqliteStore.saveChampion
+                                                    sqlite
+                                                    runId
+                                                    sequence
+                                                    lease.Candidate
+                                                    (Some score)
+                                                    (Some operation.ExperimentId)
+                                                    CancellationToken.None
+                                                |> Async.Ignore
+
+                                            let recoveredHeads =
+                                                SqliteStore.loadActiveHeads sqlite runId
+                                                |> Result.map (fun stored ->
+                                                    lease.Candidate :: (stored |> List.map _.Commit)
+                                                    |> List.distinct
+                                                    |> List.truncate config.GraphSearch.BeamWidth)
+
+                                            match recoveredHeads with
+                                            | Error error -> raise (RuntimePersistenceAbort error)
+                                            | Ok heads ->
+                                                match!
+                                                    SqliteStore.replaceActiveHeads
+                                                        sqlite
+                                                        runId
+                                                        sequence
+                                                        heads
+                                                        CancellationToken.None
+                                                with
+                                                | Error error -> raise (RuntimePersistenceAbort error)
+                                                | Ok() -> ()
+
+                                            do!
+                                                journalEvent
+                                                    runId
+                                                    (Some operation.ExperimentId)
+                                                    "AcceptedRecoveredEvaluation"
+                                                    (string score)
+                                                    CancellationToken.None
+
+                                            return Ok()
+                            | Rejected reason ->
+                                let outcome, retain =
+                                    match reason with
+                                    | NotStrictlyBetter _ ->
+                                        "Rejected: Recovered valid non-winning candidate; retained for graph search.",
+                                        true
+                                    | ConstraintFailed names ->
+                                        let constraintNames = String.concat "," names
+                                        $"Rejected: Constraint failed ({constraintNames}).", false
+                                    | MetricMissing name -> $"Rejected: Metric missing ({name}).", false
+
+                                match!
+                                    SqliteStore.completeExperiment
+                                        sqlite
+                                        operation.ExperimentId
+                                        outcome
+                                        CancellationToken.None
+                                with
+                                | Error error -> return Error error
+                                | Ok() ->
+                                    if retain then
+                                        let heads =
+                                            SqliteStore.loadActiveHeads sqlite runId
+                                            |> Result.map (fun stored ->
+                                                lease.Candidate :: (stored |> List.map _.Commit)
+                                                |> List.distinct
+                                                |> List.truncate config.GraphSearch.BeamWidth)
+
+                                        match heads with
+                                        | Error error -> raise (RuntimePersistenceAbort error)
+                                        | Ok values ->
+                                            match!
+                                                SqliteStore.replaceActiveHeads
+                                                    sqlite
+                                                    runId
+                                                    0
+                                                    values
+                                                    CancellationToken.None
+                                            with
+                                            | Error error -> raise (RuntimePersistenceAbort error)
+                                            | Ok() -> ()
+
+                                    do!
+                                        journalEvent
+                                            runId
+                                            (Some operation.ExperimentId)
+                                            "RejectedRecoveredEvaluation"
+                                            outcome
+                                            CancellationToken.None
+
+                                    return Ok()
+                    }
+
+                match decisionResult with
+                | Error error -> return Error error
+                | Ok() ->
+                    match!
+                        SqliteStore.completeDurableOperation
+                            sqlite
+                            runId
+                            operation.ExperimentId
+                            operation.Kind
+                            "completed"
+                            CancellationToken.None
+                    with
+                    | Error error -> return Error error
+                    | Ok() -> return Ok()
+        }
+
+    let reconcilePendingOperations runId config cancellationToken =
         async {
             match SqliteStore.loadPendingOperations sqlite runId with
             | Error error -> return Error error
@@ -869,52 +1532,90 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
                     for operation in operations do
                         if reconciliationError.IsNone then
-                            match operation.Kind, parseAdvanceFrontierOperation operation with
-                            | "advance-frontier", Some(parent, candidate, score) ->
-                                match lineage.Frontier with
-                                | Some frontier when frontier = candidate ->
-                                    do!
-                                        journalEvent
-                                            runId
-                                            (Some operation.ExperimentId)
-                                            "Accepted"
-                                            (string score)
-                                            cancellationToken
-
-                                    do!
-                                        SqliteStore.completeDurableOperation
-                                            sqlite
-                                            runId
-                                            operation.ExperimentId
-                                            operation.Kind
-                                            "completed"
-                                            cancellationToken
-                                        |> Async.Ignore
-                                | Some frontier when frontier = parent ->
-                                    do!
-                                        journalEvent
-                                            runId
-                                            (Some operation.ExperimentId)
-                                            "Cancelled"
-                                            "Recovered before frontier promotion."
-                                            cancellationToken
-
-                                    do!
-                                        SqliteStore.completeDurableOperation
-                                            sqlite
-                                            runId
-                                            operation.ExperimentId
-                                            operation.Kind
-                                            "cancelled"
-                                            cancellationToken
-                                        |> Async.Ignore
-                                | _ ->
+                            match operation.Kind with
+                            | "evaluate-candidate" ->
+                                match parseEvaluationLease operation with
+                                | None ->
                                     reconciliationError <-
                                         Some(
                                             HarnessError.create
-                                                "recovery.frontier_conflict"
+                                                "recovery.evaluation_lease_invalid"
                                                 HarnessErrorCategory.Recovery
-                                                "The private Git frontier does not match either side of a pending promotion."
+                                                "A pending evaluator lease could not be parsed."
+                                        )
+                                | Some lease ->
+                                    let! resumed =
+                                        resumeEvaluationLease runId config operation lease cancellationToken
+                                        |> Async.Catch
+
+                                    match resumed with
+                                    | Choice1Of2(Ok()) -> ()
+                                    | Choice1Of2(Error error) -> reconciliationError <- Some error
+                                    | Choice2Of2(RuntimePersistenceAbort error) -> reconciliationError <- Some error
+                                    | Choice2Of2 error ->
+                                        reconciliationError <-
+                                            Some(
+                                                HarnessError.create
+                                                    "recovery.evaluation_resume_failed"
+                                                    HarnessErrorCategory.Recovery
+                                                    "The pending evaluator lease could not be resumed."
+                                                |> HarnessError.withDetail error.Message
+                                            )
+                            | "advance-frontier" ->
+                                match parseAdvanceFrontierOperation operation with
+                                | Some(parent, candidate, score) ->
+                                    match lineage.Frontier with
+                                    | Some frontier when frontier = candidate ->
+                                        do!
+                                            journalEvent
+                                                runId
+                                                (Some operation.ExperimentId)
+                                                "Accepted"
+                                                (string score)
+                                                cancellationToken
+
+                                        do!
+                                            SqliteStore.completeDurableOperation
+                                                sqlite
+                                                runId
+                                                operation.ExperimentId
+                                                operation.Kind
+                                                "completed"
+                                                cancellationToken
+                                            |> Async.Ignore
+                                    | Some frontier when frontier = parent ->
+                                        do!
+                                            journalEvent
+                                                runId
+                                                (Some operation.ExperimentId)
+                                                "Cancelled"
+                                                "Recovered before frontier promotion."
+                                                cancellationToken
+
+                                        do!
+                                            SqliteStore.completeDurableOperation
+                                                sqlite
+                                                runId
+                                                operation.ExperimentId
+                                                operation.Kind
+                                                "cancelled"
+                                                cancellationToken
+                                            |> Async.Ignore
+                                    | _ ->
+                                        reconciliationError <-
+                                            Some(
+                                                HarnessError.create
+                                                    "recovery.frontier_conflict"
+                                                    HarnessErrorCategory.Recovery
+                                                    "The private Git frontier does not match either side of a pending promotion."
+                                            )
+                                | None ->
+                                    reconciliationError <-
+                                        Some(
+                                            HarnessError.create
+                                                "recovery.operation_invalid"
+                                                HarnessErrorCategory.Recovery
+                                                "A pending frontier operation could not be parsed."
                                         )
                             | _ ->
                                 reconciliationError <-
@@ -1004,6 +1705,16 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
             let storedExperiments, experimentWarnings =
                 match SqliteStore.loadExperiments sqlite storedRun.Id with
+                | Ok value -> value, []
+                | Error error -> [], [ error.Summary ]
+
+            let storedEdges, edgeWarnings =
+                match SqliteStore.loadExperimentEdges sqlite storedRun.Id with
+                | Ok value -> value, []
+                | Error error -> [], [ error.Summary ]
+
+            let storedHeads, headWarnings =
+                match SqliteStore.loadActiveHeads sqlite storedRun.Id with
                 | Ok value -> value, []
                 | Error error -> [], [ error.Summary ]
 
@@ -1242,6 +1953,8 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
             let warnings =
                 experimentWarnings
+                @ edgeWarnings
+                @ headWarnings
                 @ evaluationWarnings
                 @ memoryWarnings
                 @ usageWarnings
@@ -1260,11 +1973,526 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                    else
                        [])
 
+            let champion = lineage |> Option.bind _.Frontier |> Option.orElse baselineCommit
+
+            let edges =
+                storedEdges
+                |> List.choose (fun edge ->
+                    edge.Child
+                    |> Option.map (fun child ->
+                        { Id = edge.Id
+                          Parent = edge.Parent
+                          Child = child
+                          Kind = edge.Kind
+                          Role = edge.Role }))
+
+            let activeHeads =
+                match storedHeads |> List.map _.Commit |> Set.ofList with
+                | heads when not (Set.isEmpty heads) -> heads
+                | _ -> champion |> Option.map Set.singleton |> Option.defaultValue Set.empty
+
             return
                 { Run = runSummary
                   Nodes = nodes
-                  Frontier = lineage |> Option.bind _.Frontier |> Option.orElse baselineCommit
+                  Frontier = champion
+                  Edges = edges
+                  Champion = champion
+                  ActiveHeads = activeHeads
                   Warnings = warnings }
+        }
+
+    let searchGraphFromEvolution (graphStates: StoredExperimentGraphState list) (snapshot: EvolutionSnapshot) =
+        match snapshot.Run.BaselineCommit, snapshot.Champion with
+        | Some baseline, Some champion ->
+            let stateByExperiment =
+                graphStates |> List.map (fun state -> state.ExperimentId, state) |> Map.ofList
+
+            let baselineNode =
+                { Commit = baseline
+                  Parents = []
+                  Metric = snapshot.Run.BaselineScore
+                  HypothesisFamily = "baseline"
+                  Validity = EvaluationValidity.Valid
+                  ChampionDecision = ChampionDecision.Promoted
+                  SearchStatus =
+                    if Set.contains baseline snapshot.ActiveHeads then
+                        SearchStatus.ActiveHead
+                    else
+                        SearchStatus.Retained
+                  Sequence = 0
+                  SynthesisDepth = 0 }
+
+            let edgesByChild = snapshot.Edges |> List.groupBy _.Child |> Map.ofList
+
+            let rec synthesisDepth visited commit =
+                if commit = baseline || Set.contains commit visited then
+                    0
+                else
+                    match Map.tryFind commit edgesByChild with
+                    | None
+                    | Some [] -> 0
+                    | Some parentEdges ->
+                        let parentDepth =
+                            parentEdges
+                            |> List.map (fun edge -> synthesisDepth (Set.add commit visited) edge.Parent)
+                            |> List.max
+
+                        if parentEdges |> List.exists (fun edge -> edge.Kind = ExperimentKind.Synthesis) then
+                            parentDepth + 1
+                        else
+                            parentDepth
+
+            let nodes =
+                snapshot.Nodes
+                |> List.sortBy _.Sequence
+                |> List.choose (fun node ->
+                    node.Commit
+                    |> Option.map (fun commit ->
+                        let storedState =
+                            match node.Id with
+                            | ExperimentNode experimentId -> Map.tryFind experimentId stateByExperiment
+                            | BaselineNode -> None
+
+                        let parentEdges = snapshot.Edges |> List.filter (fun edge -> edge.Child = commit)
+
+                        let parents =
+                            if List.isEmpty parentEdges then
+                                node.Parent
+                                |> Option.map (fun parent ->
+                                    [ { Commit = parent
+                                        Role = ExperimentParentRole.Primary } ])
+                                |> Option.defaultValue []
+                            else
+                                parentEdges
+                                |> List.map (fun edge ->
+                                    { Commit = edge.Parent
+                                      Role = edge.Role })
+
+                        let validity, status =
+                            match storedState with
+                            | Some state -> state.Validity, state.SearchStatus
+                            | None ->
+                                match node.Outcome with
+                                | EvolutionOutcome.Accepted -> EvaluationValidity.Valid, SearchStatus.Retained
+                                | EvolutionOutcome.Rejected reason when
+                                    node.Metric.IsSome
+                                    && not (reason.Contains("Constraint", StringComparison.OrdinalIgnoreCase))
+                                    && not (reason.Contains("Protected", StringComparison.OrdinalIgnoreCase))
+                                    ->
+                                    EvaluationValidity.Valid, SearchStatus.Retained
+                                | EvolutionOutcome.Inconclusive reason ->
+                                    EvaluationValidity.Inconclusive reason, SearchStatus.Archived
+                                | EvolutionOutcome.Failed reason ->
+                                    EvaluationValidity.InfrastructureFailed reason, SearchStatus.Archived
+                                | EvolutionOutcome.Cancelled ->
+                                    EvaluationValidity.InfrastructureFailed "Cancelled", SearchStatus.Archived
+                                | EvolutionOutcome.Active _ -> EvaluationValidity.Pending, SearchStatus.Archived
+                                | _ -> EvaluationValidity.ConstraintFailed [], SearchStatus.Archived
+
+                        let status =
+                            if Set.contains commit snapshot.ActiveHeads && validity = EvaluationValidity.Valid then
+                                SearchStatus.ActiveHead
+                            else
+                                status
+
+                        { Commit = commit
+                          Parents = parents
+                          Metric = node.Metric
+                          HypothesisFamily =
+                            storedState
+                            |> Option.map _.HypothesisFamily
+                            |> Option.orElseWith (fun () -> node.Summary |> Option.map _.HypothesisFamily)
+                            |> Option.defaultValue "legacy"
+                          Validity = validity
+                          ChampionDecision =
+                            storedState
+                            |> Option.map _.ChampionDecision
+                            |> Option.defaultWith (fun () ->
+                                if commit = champion then
+                                    ChampionDecision.Promoted
+                                else
+                                    ChampionDecision.NotPromoted)
+                          SearchStatus = status
+                          Sequence = node.Sequence
+                          SynthesisDepth = synthesisDepth Set.empty commit }))
+
+            let graph =
+                { Baseline = baseline
+                  Champion = champion
+                  Direction = snapshot.Run.Direction
+                  Nodes =
+                    nodes
+                    |> List.map (fun node -> node.Commit, node)
+                    |> Map.ofList
+                    |> Map.add baseline baselineNode }
+
+            GraphSearch.validate graph
+        | _ ->
+            Error(
+                HarnessError.create
+                    "runtime.search_graph_root_missing"
+                    HarnessErrorCategory.Recovery
+                    "Cannot schedule graph work without a baseline and champion."
+            )
+
+    let storedRunFor runId =
+        SqliteStore.loadRuns sqlite
+        |> Result.bind (fun runs ->
+            match runs |> List.tryFind (fun run -> run.Id = runId) with
+            | Some run -> Ok run
+            | None ->
+                Error(
+                    HarnessError.create
+                        "runtime.search_run_missing"
+                        HarnessErrorCategory.Recovery
+                        "The persisted run for graph scheduling is missing."
+                ))
+
+    let rec scheduleGraphExperiment (current: RunState) experimentId cancellationToken =
+        async {
+            match storedRunFor current.Id with
+            | Error error -> return Error error
+            | Ok storedRun ->
+                let! snapshot = loadEvolutionSnapshot storedRun cancellationToken
+
+                match SqliteStore.loadExperimentGraphStates sqlite current.Id with
+                | Error error -> return Error error
+                | Ok graphStates ->
+                    match searchGraphFromEvolution graphStates snapshot with
+                    | Error error -> return Error error
+                    | Ok graph ->
+                        let ordinaryNodes =
+                            snapshot.Nodes
+                            |> List.filter (fun node -> node.Sequence > current.Config.SeedPatches.Length)
+                            |> List.sortBy _.Sequence
+
+                        if ordinaryNodes.Length < current.Config.GraphSearch.InitialFanOut then
+                            let bootstrapRoot =
+                                ordinaryNodes
+                                |> List.tryHead
+                                |> Option.bind (fun first ->
+                                    first.Commit
+                                    |> Option.bind (fun child ->
+                                        snapshot.Edges
+                                        |> List.tryFind (fun edge ->
+                                            edge.Child = child && edge.Role = ExperimentParentRole.Primary)
+                                        |> Option.map _.Parent)
+                                    |> Option.orElse first.Parent)
+                                |> Option.defaultValue graph.Champion
+
+                            let heads =
+                                GraphSearch.selectActiveHeads current.Config.GraphSearch.BeamWidth graph
+                                |> Set.ofList
+
+                            return
+                                Ok
+                                    { Kind = ExperimentKind.Expansion
+                                      Parents = expansionParents bootstrapRoot
+                                      Champion = graph.Champion
+                                      ActiveHeads = heads
+                                      SynthesisPair = None
+                                      PreparedSynthesis = None }
+                        else
+                            let latestRound = SqliteStore.loadLatestSearchRound sqlite current.Id
+
+                            match latestRound with
+                            | Error error -> return Error error
+                            | Ok(Some round) when
+                                round.Status = "active"
+                                && round.Heads
+                                   |> List.exists (fun head -> not (Set.contains head round.CompletedHeads))
+                                ->
+                                let parent =
+                                    round.Heads
+                                    |> List.find (fun head -> not (Set.contains head round.CompletedHeads))
+
+                                let updated =
+                                    { round with
+                                        CompletedHeads = Set.add parent round.CompletedHeads
+                                        OrdinarySinceSynthesis = round.OrdinarySinceSynthesis + 1
+                                        UpdatedAt = DateTimeOffset.UtcNow }
+
+                                match! SqliteStore.saveSearchRound sqlite updated cancellationToken with
+                                | Error error -> return Error error
+                                | Ok() ->
+                                    return
+                                        Ok
+                                            { Kind = ExperimentKind.Expansion
+                                              Parents = expansionParents parent
+                                              Champion = graph.Champion
+                                              ActiveHeads = Set.ofList round.Heads
+                                              SynthesisPair = None
+                                              PreparedSynthesis = None }
+                            | Ok latest ->
+                                let previousNumber = latest |> Option.map _.Round |> Option.defaultValue 0
+
+                                let ordinarySince =
+                                    latest
+                                    |> Option.map _.OrdinarySinceSynthesis
+                                    |> Option.defaultValue ordinaryNodes.Length
+
+                                let heads = GraphSearch.selectActiveHeads current.Config.GraphSearch.BeamWidth graph
+                                let attempts = SqliteStore.loadSynthesisAttempts sqlite current.Id
+
+                                match attempts with
+                                | Error error -> return Error error
+                                | Ok attempts ->
+                                    let attemptedPairs =
+                                        attempts
+                                        |> List.filter (fun attempt -> attempt.PolicyVersion = 1)
+                                        |> List.map (fun attempt ->
+                                            if
+                                                StringComparer.Ordinal.Compare(
+                                                    CommitOid.value attempt.Primary,
+                                                    CommitOid.value attempt.Contributor
+                                                )
+                                                <= 0
+                                            then
+                                                attempt.Primary, attempt.Contributor
+                                            else
+                                                attempt.Contributor, attempt.Primary)
+                                        |> Set.ofList
+
+                                    let synthesisLimit =
+                                        GraphSearch.reservedSynthesisSlots
+                                            current.Config.GraphSearch
+                                            current.Config.Budgets.MaxExperiments
+
+                                    let lastWasSynthesis =
+                                        snapshot.Nodes
+                                        |> List.sortBy _.Sequence
+                                        |> List.tryLast
+                                        |> Option.bind _.Commit
+                                        |> Option.exists (fun commit ->
+                                            snapshot.Edges
+                                            |> List.exists (fun edge ->
+                                                edge.Child = commit && edge.Kind = ExperimentKind.Synthesis))
+
+                                    let shouldSynthesize =
+                                        GraphSearch.shouldSynthesize
+                                            current.Config.GraphSearch
+                                            ordinarySince
+                                            current.ConsecutiveNonImprovements
+                                        && (attempts
+                                            |> List.filter (fun attempt -> attempt.ExperimentId.IsSome)
+                                            |> List.length) < synthesisLimit
+                                        && not lastWasSynthesis
+
+                                    let candidatePairs =
+                                        if shouldSynthesize then
+                                            GraphSearch.synthesisPairs
+                                                current.Config.GraphSearch.MaxSynthesisDepth
+                                                attemptedPairs
+                                                heads
+                                                graph
+                                        else
+                                            []
+
+                                    let rec analyzePairs pending collected =
+                                        async {
+                                            match pending with
+                                            | [] -> return Ok(List.rev collected)
+                                            | pair :: rest ->
+                                                match!
+                                                    git.AnalyzeSynthesis
+                                                        current.Id
+                                                        pair.Primary
+                                                        pair.Contributor
+                                                        cancellationToken
+                                                with
+                                                | Error error -> return Error error
+                                                | Ok analysis ->
+                                                    return! analyzePairs rest ((pair, analysis) :: collected)
+                                        }
+
+                                    let pairRank (pair, analysis) =
+                                        let primary = Map.find pair.Primary graph.Nodes
+                                        let contributor = Map.find pair.Contributor graph.Nodes
+
+                                        let distinctFamily =
+                                            if
+                                                String.Equals(
+                                                    primary.HypothesisFamily,
+                                                    contributor.HypothesisFamily,
+                                                    StringComparison.OrdinalIgnoreCase
+                                                )
+                                            then
+                                                1
+                                            else
+                                                0
+
+                                        let values = [ primary.Metric; contributor.Metric ] |> List.choose id
+
+                                        let worst, best =
+                                            match graph.Direction, values with
+                                            | _, [] -> None, None
+                                            | Maximize, metrics -> Some(List.min metrics), Some(List.max metrics)
+                                            | Minimize, metrics -> Some(List.max metrics), Some(List.min metrics)
+
+                                        let metricKey =
+                                            match graph.Direction with
+                                            | Maximize -> Option.map (~-) >> Option.defaultValue Decimal.MaxValue
+                                            | Minimize -> Option.defaultValue Decimal.MaxValue
+
+                                        (if analysis.CleanMerge then 0 else 1),
+                                        distinctFamily,
+                                        analysis.ChangedPathOverlap,
+                                        metricKey worst,
+                                        metricKey best,
+                                        CommitOid.value pair.Primary,
+                                        CommitOid.value pair.Contributor
+
+                                    let! synthesisPairResult =
+                                        async {
+                                            match! analyzePairs candidatePairs [] with
+                                            | Error error -> return Error error
+                                            | Ok analyzedPairs ->
+                                                return
+                                                    analyzedPairs
+                                                    |> List.sortBy pairRank
+                                                    |> List.tryHead
+                                                    |> Option.map fst
+                                                    |> Ok
+                                        }
+
+                                    match synthesisPairResult with
+                                    | Error error -> return Error error
+                                    | Ok(Some pair) ->
+                                        let attempt =
+                                            { RunId = current.Id
+                                              Primary = pair.Primary
+                                              Contributor = pair.Contributor
+                                              PolicyVersion = 1
+                                              Status = "scheduled"
+                                              ExperimentId = None
+                                              FailureDetail = None
+                                              UpdatedAt = DateTimeOffset.UtcNow }
+
+                                        match! SqliteStore.saveSynthesisAttempt sqlite attempt cancellationToken with
+                                        | Error error -> return Error error
+                                        | Ok() ->
+                                            let closedRound =
+                                                { RunId = current.Id
+                                                  Round = previousNumber
+                                                  Heads = heads
+                                                  CompletedHeads = Set.ofList heads
+                                                  OrdinarySinceSynthesis = 0
+                                                  Status = "synthesis-scheduled"
+                                                  UpdatedAt = DateTimeOffset.UtcNow }
+
+                                            match! SqliteStore.saveSearchRound sqlite closedRound cancellationToken with
+                                            | Error error -> return Error error
+                                            | Ok() ->
+                                                let! prepared =
+                                                    git.PrepareSynthesis
+                                                        current.Id
+                                                        experimentId
+                                                        pair.Primary
+                                                        pair.Contributor
+                                                        graph.Champion
+                                                        cancellationToken
+
+                                                let acceptedPreparation, rejection =
+                                                    match prepared with
+                                                    | Error error -> None, Some error
+                                                    | Ok(SynthesisPreparation.Clean workspace) ->
+                                                        Some(workspace, None, true), None
+                                                    | Ok(SynthesisPreparation.Conflicted(_, _)) when
+                                                        current.Config.GraphSearch.ConflictResolutionAttempts <= 0
+                                                        ->
+                                                        None,
+                                                        Some(
+                                                            HarnessError.create
+                                                                "git.synthesis_conflict_repair_disabled"
+                                                                HarnessErrorCategory.Git
+                                                                "The synthesis merge conflicted and automatic repair is disabled."
+                                                        )
+                                                    | Ok(SynthesisPreparation.Conflicted(workspace, conflict)) when
+                                                        conflict.Files.Length
+                                                        <= current.Config.GraphSearch.MaxConflictFiles
+                                                        && conflict.ConflictText.Length
+                                                           <= current.Config.GraphSearch.MaxConflictCharacters
+                                                        ->
+                                                        Some(workspace, Some conflict, false), None
+                                                    | Ok(SynthesisPreparation.Conflicted(_, conflict)) ->
+                                                        None,
+                                                        Some(
+                                                            HarnessError.create
+                                                                "git.synthesis_conflict_limit"
+                                                                HarnessErrorCategory.Git
+                                                                "The synthesis conflict exceeded the configured automatic-repair limit."
+                                                            |> HarnessError.withDetail
+                                                                $"files={conflict.Files.Length}; characters={conflict.ConflictText.Length}"
+                                                        )
+
+                                                match acceptedPreparation, rejection, prepared with
+                                                | Some preparation, _, _ ->
+                                                    return
+                                                        Ok
+                                                            { Kind = ExperimentKind.Synthesis
+                                                              Parents =
+                                                                [ { Commit = pair.Primary
+                                                                    Role = ExperimentParentRole.Primary }
+                                                                  { Commit = pair.Contributor
+                                                                    Role = ExperimentParentRole.Contributor } ]
+                                                              Champion = graph.Champion
+                                                              ActiveHeads = Set.ofList heads
+                                                              SynthesisPair = Some pair
+                                                              PreparedSynthesis = Some preparation }
+                                                | None, Some error, Error _ -> return Error error
+                                                | None, Some error, _ ->
+                                                    match!
+                                                        SqliteStore.saveSynthesisAttempt
+                                                            sqlite
+                                                            { attempt with
+                                                                Status = "rejected-preflight"
+                                                                FailureDetail = Some error.Summary
+                                                                UpdatedAt = DateTimeOffset.UtcNow }
+                                                            cancellationToken
+                                                    with
+                                                    | Error persistenceError -> return Error persistenceError
+                                                    | Ok() ->
+                                                        publish
+                                                            $"Synthesis preflight rejected without consuming an experiment slot: {error.Summary}"
+                                                            None
+
+                                                        return!
+                                                            scheduleGraphExperiment
+                                                                current
+                                                                experimentId
+                                                                cancellationToken
+                                                | _ ->
+                                                    return
+                                                        Error(
+                                                            HarnessError.create
+                                                                "git.synthesis_preflight"
+                                                                HarnessErrorCategory.Git
+                                                                "Synthesis preflight failed."
+                                                        )
+                                    | Ok None ->
+                                        let nextRound =
+                                            { RunId = current.Id
+                                              Round = previousNumber + 1
+                                              Heads = heads
+                                              CompletedHeads = Set.empty
+                                              OrdinarySinceSynthesis = ordinarySince
+                                              Status = "active"
+                                              UpdatedAt = DateTimeOffset.UtcNow }
+
+                                        match!
+                                            SqliteStore.replaceActiveHeads
+                                                sqlite
+                                                current.Id
+                                                nextRound.Round
+                                                heads
+                                                cancellationToken
+                                        with
+                                        | Error error -> return Error error
+                                        | Ok() ->
+                                            match! SqliteStore.saveSearchRound sqlite nextRound cancellationToken with
+                                            | Error error -> return Error error
+                                            | Ok() ->
+                                                return! scheduleGraphExperiment current experimentId cancellationToken
         }
 
     let rec runLoop (cancellationToken: CancellationToken) =
@@ -1273,7 +2501,30 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
             | Some current when current.Status = Ready ->
                 let experimentId = ExperimentId.create ()
                 let startedAt = DateTimeOffset.UtcNow
-                let transition = dispatch (StartRequested(experimentId, startedAt))
+                let! scheduleResult = scheduleGraphExperiment current experimentId cancellationToken
+
+                match scheduleResult with
+                | Error error ->
+                    enterRecovery error None
+                    return ()
+                | Ok _ -> ()
+
+                let schedule = scheduleResult |> Result.toOption |> Option.get
+
+                setState
+                    { current with
+                        ActiveHeads = schedule.ActiveHeads }
+
+                let transition =
+                    dispatch (
+                        GraphExperimentRequested(
+                            experimentId,
+                            schedule.Kind,
+                            schedule.Parents,
+                            schedule.Champion,
+                            startedAt
+                        )
+                    )
 
                 match transition with
                 | None -> return ()
@@ -1285,7 +2536,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             startedState.Id
                             experimentId
                             (startedState.Config.SeedPatches.Length + startedState.Attempted)
-                            (Some startedState.Frontier)
+                            schedule.Kind
+                            schedule.Parents
+                            schedule.Champion
                             "Active"
                             cancellationToken
 
@@ -1326,41 +2579,89 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             startedState.Id
                             (Some experimentId)
                             "CandidatePlanned"
-                            (CommitOid.value startedState.Frontier)
+                            (schedule.Parents
+                             |> List.map (fun parent -> CommitOid.value parent.Commit)
+                             |> String.concat ",")
                             cancellationToken
 
-                    publish $"Preparing experiment {startedState.Attempted} from retained frontier." (Some experimentId)
+                    publish
+                        $"Preparing {schedule.Kind} experiment {startedState.Attempted} against champion {CommitOid.value schedule.Champion}."
+                        (Some experimentId)
 
-                    match!
-                        git.PrepareCandidate startedState.Id experimentId startedState.Frontier cancellationToken
-                    with
+                    let! preparationResult =
+                        async {
+                            match schedule.PreparedSynthesis with
+                            | Some preparation -> return Ok preparation
+                            | _ ->
+                                let! prepared =
+                                    git.PrepareCandidate
+                                        startedState.Id
+                                        experimentId
+                                        schedule.Parents
+                                        schedule.Champion
+                                        cancellationToken
+
+                                return prepared |> Result.map (fun workspace -> workspace, None, false)
+                        }
+
+                    match preparationResult with
                     | Error error -> do! handleExperimentError startedState.Id experimentId "PrepareFailed" error
-                    | Ok workspace ->
+                    | Ok(workspace, synthesisConflict, cleanSynthesis) ->
                         dispatch (WorktreePrepared experimentId) |> ignore
 
-                        let! memoryResult =
-                            memory.Select
-                                startedState.Id
-                                startedState.Config.PromptProfile.MaxMemoryCount
-                                startedState.Config.PromptProfile.MaxMemoryCharacters
-                                cancellationToken
+                        let primary =
+                            schedule.Parents
+                            |> List.find (fun parent -> parent.Role = ExperimentParentRole.Primary)
+                            |> _.Commit
 
-                        let memories =
-                            match memoryResult with
-                            | Ok values -> values
+                        let repositoryContext =
+                            match
+                                repositoryGraphContext
+                                    startedState.Id
+                                    startedState.Config.Objective
+                                    primary
+                                    schedule.Champion
+                                    startedState.Config.PromptProfile.MaxMemoryCharacters
+                            with
+                            | Ok context -> context
                             | Error error ->
-                                publish $"Memory warning: {error.Summary}" (Some experimentId)
-                                []
+                                publish $"Repository graph warning: {error.Summary}" (Some experimentId)
+                                None
+
+                        let synthesisGraphContext =
+                            synthesisConflict
+                            |> Option.map (fun conflict ->
+                                let files = String.concat ", " conflict.Files
+                                $"Conflicted files: {files}\n\n{conflict.ConflictText}")
+
+                        let graphContext =
+                            [ repositoryContext; synthesisGraphContext ]
+                            |> List.choose id
+                            |> function
+                                | [] -> None
+                                | sections -> Some(String.concat "\n\n" sections)
 
                         let prompt =
                             Prompt.build
-                                { Objective = startedState.Config.Objective
+                                { Objective =
+                                    match schedule.Kind with
+                                    | ExperimentKind.Expansion -> startedState.Config.Objective
+                                    | ExperimentKind.Synthesis ->
+                                        $"Resolve the prepared two-parent synthesis while preserving both compatible improvements. {startedState.Config.Objective}"
                                   EditablePaths = startedState.Config.EditablePaths
-                                  FrontierScore = startedState.FrontierScore
+                                  ParentCommit =
+                                    startedState.Current
+                                    |> Option.bind (fun active ->
+                                        active.Parents
+                                        |> List.tryFind (fun parent -> parent.Role = ExperimentParentRole.Primary)
+                                        |> Option.map _.Commit)
+                                  ChampionCommit = Some startedState.Champion
+                                  ChampionScore = startedState.ChampionScore
                                   Metric = startedState.Config.Metric
                                   Profile = startedState.Config.PromptProfile
                                   PreviousEvaluation = startedState.PreviousEvaluation
-                                  Memories = memories }
+                                  Memories = []
+                                  GraphContext = graphContext }
 
                         let artifactRoot =
                             Path.Combine(DataPaths.artifacts root startedState.Id, ExperimentId.text experimentId)
@@ -1387,35 +2688,67 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                 promptPath
                                 CancellationToken.None
 
-                        publish "Starting fresh Codex JSONL worker." (Some experimentId)
+                        if cleanSynthesis then
+                            publish
+                                "Clean two-parent merge prepared; skipping generation and evaluating directly."
+                                (Some experimentId)
+                        else
+                            publish "Starting fresh Codex JSONL worker." (Some experimentId)
 
                         let! codexResult =
-                            codex.Run
-                                { Executable = codexExecutable
-                                  WorkingDirectory = workspace.GenerationPath
-                                  Model = startedState.Config.Model
-                                  Prompt = prompt
-                                  OutputSchemaPath = schemaPath
-                                  Timeout = startedState.Config.Budgets.CodexTimeout
-                                  JsonlPath = Path.Combine(artifactRoot, "codex.jsonl")
-                                  StderrPath = Path.Combine(artifactRoot, "codex.stderr.log") }
-                                cancellationToken
+                            if cleanSynthesis then
+                                async {
+                                    let parentLabels =
+                                        schedule.Parents
+                                        |> List.map (fun parent -> CommitOid.value parent.Commit)
+                                        |> String.concat " + "
 
-                        do!
-                            recordArtifact
-                                startedState.Id
-                                (Some experimentId)
-                                "codex-jsonl"
-                                (Path.Combine(artifactRoot, "codex.jsonl"))
-                                CancellationToken.None
+                                    return
+                                        Ok
+                                            { ThreadId = $"synthesis:{ExperimentId.text experimentId}"
+                                              Usage = Some TokenUsage.zero
+                                              Summary =
+                                                { HypothesisFamily = "automatic-synthesis"
+                                                  Hypothesis = $"Combine compatible retained lineages {parentLabels}."
+                                                  ChangeSummary =
+                                                    "Created a deterministic two-parent Git merge candidate."
+                                                  ExpectedEffect =
+                                                    "Preserve compatible improvements from both parent lineages."
+                                                  ValidationNotes =
+                                                    [ "Clean three-way merge; full evaluator required." ]
+                                                  ReusableLesson =
+                                                    "Automatic synthesis is retained only after champion-relative evaluation." }
+                                              ExitCode = 0
+                                              SawThreadStarted = true }
+                                }
+                            else
+                                codex.Run
+                                    { Executable = codexExecutable
+                                      WorkingDirectory = workspace.GenerationPath
+                                      Model = startedState.Config.Model
+                                      Prompt = prompt
+                                      OutputSchemaPath = schemaPath
+                                      Timeout = startedState.Config.Budgets.CodexTimeout
+                                      JsonlPath = Path.Combine(artifactRoot, "codex.jsonl")
+                                      StderrPath = Path.Combine(artifactRoot, "codex.stderr.log") }
+                                    cancellationToken
 
-                        do!
-                            recordArtifact
-                                startedState.Id
-                                (Some experimentId)
-                                "codex-stderr"
-                                (Path.Combine(artifactRoot, "codex.stderr.log"))
-                                CancellationToken.None
+                        if not cleanSynthesis then
+                            do!
+                                recordArtifact
+                                    startedState.Id
+                                    (Some experimentId)
+                                    "codex-jsonl"
+                                    (Path.Combine(artifactRoot, "codex.jsonl"))
+                                    CancellationToken.None
+
+                            do!
+                                recordArtifact
+                                    startedState.Id
+                                    (Some experimentId)
+                                    "codex-stderr"
+                                    (Path.Combine(artifactRoot, "codex.stderr.log"))
+                                    CancellationToken.None
 
                         match codexResult with
                         | Error error ->
@@ -1428,6 +2761,18 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
                             dispatch (GenerationCompleted(experimentId, result.ThreadId, result.Usage, result.Summary))
                             |> ignore
+
+                            do!
+                                persistGraphState
+                                    startedState.Id
+                                    experimentId
+                                    schedule.Kind
+                                    schedule.Champion
+                                    result.Summary.HypothesisFamily
+                                    EvaluationValidity.Pending
+                                    ChampionDecision.Pending
+                                    SearchStatus.Archived
+                                    CancellationToken.None
 
                             do!
                                 journalEvent
@@ -1453,8 +2798,28 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             with
                             | Error error ->
                                 do! handleExperimentError startedState.Id experimentId "CaptureFailed" error
+                            | Ok snapshot when List.isEmpty snapshot.ChangedPaths ->
+                                let error =
+                                    HarnessError.create
+                                        "git.candidate_empty"
+                                        HarnessErrorCategory.Git
+                                        "The candidate did not produce any editable changes."
+
+                                do! handleExperimentError startedState.Id experimentId "CaptureFailed" error
                             | Ok snapshot when not (List.isEmpty snapshot.ProtectedPaths) ->
                                 do! persistCandidate startedState.Id experimentId snapshot.Commit CancellationToken.None
+
+                                do!
+                                    persistGraphState
+                                        startedState.Id
+                                        experimentId
+                                        schedule.Kind
+                                        schedule.Champion
+                                        result.Summary.HypothesisFamily
+                                        (EvaluationValidity.ConstraintFailed snapshot.ProtectedPaths)
+                                        ChampionDecision.NotPromoted
+                                        SearchStatus.Archived
+                                        CancellationToken.None
 
                                 dispatch (ProtectedPathDetected(experimentId, snapshot.ProtectedPaths))
                                 |> ignore
@@ -1487,15 +2852,85 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                 publish "Running deterministic evaluator in a clean worktree." (Some experimentId)
                                 let evaluatorPath = Path.Combine(artifactRoot, "evaluation.json")
 
-                                match!
-                                    runEvaluatorWithRetries
-                                        startedState.Config.Evaluator
-                                        snapshot.FrontierEvaluationPath
-                                        snapshot.EvaluationPath
+                                let evaluationOperation = "evaluate-candidate"
+
+                                let leasePayload =
+                                    evaluationLeasePayload
+                                        snapshot
+                                        schedule
+                                        startedState.ChampionScore
                                         evaluatorPath
-                                        cancellationToken
-                                with
+                                        result.Summary
+
+                                let! leaseResult =
+                                    SqliteStore.beginDurableOperation
+                                        sqlite
+                                        startedState.Id
+                                        experimentId
+                                        evaluationOperation
+                                        leasePayload
+                                        CancellationToken.None
+
+                                let! evaluationResult =
+                                    async {
+                                        match leaseResult with
+                                        | Error error -> return Error error
+                                        | Ok() ->
+                                            let! evaluated =
+                                                runEvaluatorWithRetries
+                                                    startedState.Id
+                                                    experimentId
+                                                    startedState.Config.Evaluator
+                                                    snapshot.ParentEvaluationPath
+                                                    snapshot.ChampionEvaluationPath
+                                                    snapshot.EvaluationPath
+                                                    evaluatorPath
+                                                    cancellationToken
+
+                                            match evaluated with
+                                            | Ok evaluation ->
+                                                match!
+                                                    SqliteStore.saveEvaluation
+                                                        sqlite
+                                                        startedState.Id
+                                                        experimentId
+                                                        evaluation
+                                                        CancellationToken.None
+                                                with
+                                                | Error error -> return Error error
+                                                | Ok() -> return Ok evaluation
+                                            | Error error when error.Retryable -> return Error error
+                                            | Error error ->
+                                                do!
+                                                    SqliteStore.completeDurableOperation
+                                                        sqlite
+                                                        startedState.Id
+                                                        experimentId
+                                                        evaluationOperation
+                                                        "failed"
+                                                        CancellationToken.None
+                                                    |> Async.Ignore
+
+                                                return Error error
+                                    }
+
+                                match evaluationResult with
+                                | Error error when error.Retryable ->
+                                    enterRecovery error (Some experimentId)
+                                    publish "Evaluator lease remains pending for recovery." (Some experimentId)
                                 | Error error ->
+                                    do!
+                                        persistGraphState
+                                            startedState.Id
+                                            experimentId
+                                            schedule.Kind
+                                            schedule.Champion
+                                            result.Summary.HypothesisFamily
+                                            (EvaluationValidity.InfrastructureFailed error.Summary)
+                                            ChampionDecision.NotPromoted
+                                            SearchStatus.Archived
+                                            CancellationToken.None
+
                                     do! handleExperimentError startedState.Id experimentId "EvaluationFailed" error
 
                                     do!
@@ -1517,6 +2952,18 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                     dispatch (EvaluationInconclusive(experimentId, reason)) |> ignore
 
                                     do!
+                                        persistGraphState
+                                            startedState.Id
+                                            experimentId
+                                            schedule.Kind
+                                            schedule.Champion
+                                            result.Summary.HypothesisFamily
+                                            (EvaluationValidity.Inconclusive reason)
+                                            ChampionDecision.NotPromoted
+                                            SearchStatus.Archived
+                                            CancellationToken.None
+
+                                    do!
                                         journalEvent
                                             startedState.Id
                                             (Some experimentId)
@@ -1534,26 +2981,16 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             evaluatorPath
                                             CancellationToken.None
 
-                                    match!
-                                        SqliteStore.saveEvaluation
-                                            sqlite
-                                            startedState.Id
-                                            experimentId
-                                            evaluation
-                                            CancellationToken.None
-                                    with
-                                    | Ok() -> ()
-                                    | Error error -> enterRecovery error (Some experimentId)
-
                                     do!
                                         recordExperimentKnowledge
                                             startedState.Id
                                             experimentId
-                                            startedState.Frontier
+                                            schedule.Parents
                                             snapshot.Commit
                                             evaluatorPath
                                             evaluation
                                             result.Summary
+                                            startedState.Config
                                             CancellationToken.None
 
                                     let candidateMetric =
@@ -1563,8 +3000,37 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         Evaluation.decide
                                             startedState.Config.Metric
                                             startedState.Config.Evaluator.RequiredConstraints
-                                            startedState.FrontierScore
+                                            startedState.ChampionScore
                                             evaluation
+
+                                    let validity, championDecision, searchStatus =
+                                        match decision with
+                                        | StrictImprovement _ ->
+                                            EvaluationValidity.Valid, ChampionDecision.Pending, SearchStatus.Retained
+                                        | CandidateDecision.Rejected(NotStrictlyBetter _) ->
+                                            EvaluationValidity.Valid,
+                                            ChampionDecision.NotPromoted,
+                                            SearchStatus.ActiveHead
+                                        | CandidateDecision.Rejected(ConstraintFailed constraints) ->
+                                            EvaluationValidity.ConstraintFailed constraints,
+                                            ChampionDecision.NotPromoted,
+                                            SearchStatus.Archived
+                                        | CandidateDecision.Rejected(MetricMissing name) ->
+                                            EvaluationValidity.Inconclusive $"Metric missing: {name}",
+                                            ChampionDecision.NotPromoted,
+                                            SearchStatus.Archived
+
+                                    do!
+                                        persistGraphState
+                                            startedState.Id
+                                            experimentId
+                                            schedule.Kind
+                                            schedule.Champion
+                                            result.Summary.HypothesisFamily
+                                            validity
+                                            championDecision
+                                            searchStatus
+                                            CancellationToken.None
 
                                     let decisionTransition = dispatch (EvaluationCompleted(experimentId, evaluation))
 
@@ -1586,12 +3052,14 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                     score
                                                     result.Summary
                                                     "Accepted"
+                                                    schedule.Kind
+                                                    schedule.Champion
                                             with
                                             | Error error ->
                                                 publish $"Acceptance failed safely: {error.Summary}" (Some experimentId)
                                             | Ok() ->
                                                 publish
-                                                    $"Accepted strict improvement: {startedState.FrontierScore} → {score}."
+                                                    $"Accepted strict improvement: {startedState.ChampionScore} → {score}."
                                                     (Some experimentId)
                                         | None ->
                                             let awaitingReview =
@@ -1658,12 +3126,42 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         do! handleExperimentError startedState.Id experimentId "EvaluationFailed" error
                                     | _ -> ()
 
+                                match evaluationResult with
+                                | Ok _ ->
+                                    do!
+                                        SqliteStore.completeDurableOperation
+                                            sqlite
+                                            startedState.Id
+                                            experimentId
+                                            evaluationOperation
+                                            "completed"
+                                            CancellationToken.None
+                                        |> Async.Ignore
+                                | _ -> ()
+
                     let planStatus =
                         match tryCurrent () |> Option.bind _.Current with
                         | Some active when active.Id = experimentId && active.Phase = AwaitingReview ->
                             "awaiting-review"
                         | Some active when active.Id = experimentId -> "active"
                         | _ -> "finished"
+
+                    match schedule.SynthesisPair with
+                    | Some pair ->
+                        do!
+                            SqliteStore.saveSynthesisAttempt
+                                sqlite
+                                { RunId = startedState.Id
+                                  Primary = pair.Primary
+                                  Contributor = pair.Contributor
+                                  PolicyVersion = 1
+                                  Status = planStatus
+                                  ExperimentId = Some experimentId
+                                  FailureDetail = None
+                                  UpdatedAt = DateTimeOffset.UtcNow }
+                                CancellationToken.None
+                            |> Async.Ignore
+                    | None -> ()
 
                     match! SqliteStore.updateWorkPlanStatus sqlite workPlan.Id planStatus CancellationToken.None with
                     | Ok() -> ()
@@ -1806,6 +3304,16 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         return Ok snapshot
         }
 
+    member _.LoadRepositoryKnowledge(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() ->
+                match SqliteStore.projectIdForRun sqlite runId with
+                | Error error -> return Error error
+                | Ok projectId -> return SqliteStore.loadRepositoryKnowledgeGraph sqlite projectId
+        }
+
     member this.LoadWorkGraph(runId: RunId, cancellationToken: CancellationToken) =
         async {
             match! this.LoadEvolution(runId, cancellationToken) with
@@ -1826,6 +3334,75 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             HarnessErrorCategory.Recovery
                             "The requested parent commit is not present in the work graph."
                     )
+        }
+
+    member this.WorkGraphParents(runId: RunId, child: CommitOid, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph when WorkGraph.contains child graph -> return Ok(WorkGraph.parents child graph)
+            | Ok _ ->
+                return
+                    Error(
+                        HarnessError.create
+                            "work_graph.child_unknown"
+                            HarnessErrorCategory.Recovery
+                            "The requested child commit is not present in the work graph."
+                    )
+        }
+
+    member this.WorkGraphAncestors(runId: RunId, commit: CommitOid, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph when WorkGraph.contains commit graph ->
+                return
+                    WorkGraph.ancestors commit graph
+                    |> Set.toList
+                    |> List.choose (fun ancestor -> WorkGraph.tryFind ancestor graph)
+                    |> Ok
+            | Ok _ ->
+                return
+                    Error(
+                        HarnessError.create
+                            "work_graph.commit_unknown"
+                            HarnessErrorCategory.Recovery
+                            "The requested commit is not present in the work graph."
+                    )
+        }
+
+    member this.WorkGraphDescendants(runId: RunId, commit: CommitOid, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph when WorkGraph.contains commit graph ->
+                return
+                    WorkGraph.descendants commit graph
+                    |> Set.toList
+                    |> List.choose (fun descendant -> WorkGraph.tryFind descendant graph)
+                    |> Ok
+            | Ok _ ->
+                return
+                    Error(
+                        HarnessError.create
+                            "work_graph.commit_unknown"
+                            HarnessErrorCategory.Recovery
+                            "The requested commit is not present in the work graph."
+                    )
+        }
+
+    member this.WorkGraphActiveHeads(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! this.LoadWorkGraph(runId, cancellationToken) with
+            | Error error -> return Error error
+            | Ok graph -> return Ok(WorkGraph.activeHeads graph)
+        }
+
+    member _.SynthesisAttempts(runId: RunId, cancellationToken: CancellationToken) =
+        async {
+            match! SqliteStore.initialize sqlite cancellationToken with
+            | Error error -> return Error error
+            | Ok() -> return SqliteStore.loadSynthesisAttempts sqlite runId
         }
 
     member this.WorkGraphLeaves(runId: RunId, cancellationToken: CancellationToken) =
@@ -2126,7 +3703,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         releaseRunLock ()
                                         return Error error
                                     | Ok() ->
-                                        match! reconcilePendingOperations runId cancellationToken with
+                                        match! reconcilePendingOperations runId config cancellationToken with
                                         | Error error ->
                                             releaseRunLock ()
                                             return Error error
@@ -2181,15 +3758,15 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                             loadEvolutionSnapshot storedRun cancellationToken
 
                                                         match
-                                                            snapshot.Frontier,
+                                                            snapshot.Champion,
                                                             snapshot.Run.FrontierScore,
                                                             snapshot.Run.BaselineScore,
                                                             SqliteStore.loadExperiments sqlite runId,
                                                             SqliteStore.loadEvaluationsForRun sqlite runId,
                                                             SqliteStore.loadUsageForRun sqlite runId
                                                         with
-                                                        | Some frontier,
-                                                          Some frontierScore,
+                                                        | Some champion,
+                                                          Some championScore,
                                                           Some baselineScore,
                                                           Ok experiments,
                                                           Ok evaluations,
@@ -2263,15 +3840,20 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                                     { RunState.create
                                                                           runId
                                                                           config
-                                                                          frontier
-                                                                          frontierScore
+                                                                          champion
+                                                                          championScore
                                                                           DateTimeOffset.UtcNow with
                                                                         Status = Ready
                                                                         Attempted = snapshot.Run.AttemptCount
                                                                         AcceptedCount = snapshot.Run.AcceptedCount
                                                                         Usage = usage
                                                                         UsageKnown = usageKnown
-                                                                        PreviousEvaluation = previousEvaluation }
+                                                                        PreviousEvaluation = previousEvaluation
+                                                                        ActiveHeads =
+                                                                            if Set.isEmpty snapshot.ActiveHeads then
+                                                                                Set.singleton champion
+                                                                            else
+                                                                                snapshot.ActiveHeads }
 
                                                                 let report =
                                                                     { RunId = runId
@@ -2289,11 +3871,11 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                                         runId
                                                                         None
                                                                         "RunRecovered"
-                                                                        (CommitOid.value frontier)
+                                                                        (CommitOid.value champion)
                                                                         cancellationToken
 
                                                                 publish
-                                                                    "Recovered persisted run from its verified frontier."
+                                                                    "Recovered persisted run from its verified champion and active heads."
                                                                     None
 
                                                                 return Ok report
@@ -2435,6 +4017,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             git.PrepareCandidate
                                                 runId
                                                 baselineExperiment
+                                                (expansionParents validated.BaseCommit)
                                                 validated.BaseCommit
                                                 cancellationToken
                                         with
@@ -2451,7 +4034,10 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
                                             match!
                                                 runEvaluatorWithRetries
+                                                    runId
+                                                    baselineExperiment
                                                     validated.Evaluator
+                                                    baselineWorkspace.GenerationPath
                                                     baselineWorkspace.GenerationPath
                                                     baselineWorkspace.GenerationPath
                                                     baselineResultPath
@@ -2595,7 +4181,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         match prepared, tryCurrent () with
         | Some _, Some current when
             current.Status = Ready
-            && Evaluation.targetReached current.Config.Metric current.FrontierScore
+            && Evaluation.targetReached current.Config.Metric current.ChampionScore
             ->
             setState
                 { current with
@@ -2649,11 +4235,13 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                 promoteCandidate
                                     current.Id
                                     active.Id
-                                    active.Parent
+                                    active.ChampionAtStart
                                     candidate
                                     metric
                                     summary
                                     "AcceptedAfterReview"
+                                    active.Kind
+                                    active.ChampionAtStart
                             with
                             | Error error ->
                                 publish $"Reviewed candidate acceptance failed safely: {error.Summary}" (Some active.Id)
@@ -2661,7 +4249,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                 return Error error
                             | Ok() ->
                                 publish
-                                    $"Accepted reviewed strict improvement: {current.FrontierScore} → {metric}."
+                                    $"Accepted reviewed strict improvement: {current.ChampionScore} → {metric}."
                                     (Some active.Id)
 
                                 startWorkerIfReady ()
@@ -2729,8 +4317,8 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                     | 0M -> 0M
                     | value ->
                         match current.Config.Metric.Direction with
-                        | Maximize -> (current.FrontierScore - value) / abs value * 100M
-                        | Minimize -> (value - current.FrontierScore) / abs value * 100M
+                        | Maximize -> (current.ChampionScore - value) / abs value * 100M
+                        | Minimize -> (value - current.ChampionScore) / abs value * 100M
 
                 let raw = TokenUsage.rawTotal current.Usage
 

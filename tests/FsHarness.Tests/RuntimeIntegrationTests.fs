@@ -202,6 +202,11 @@ module RuntimeIntegrationTests =
             let evaluator =
                 AdapterFixture.executable "FsHarness.FakeEvaluator" "FsHarness.FakeEvaluator"
 
+            let evaluatorAvailability =
+                Path.Combine(temporary, "evaluator-failures-remaining.txt")
+
+            File.WriteAllText(evaluatorAvailability, "1")
+
             use runtime = new HarnessRuntime(dataRoot, codex)
 
             let inspection =
@@ -218,11 +223,13 @@ module RuntimeIntegrationTests =
                   SeedPatches = []
                   Evaluator =
                     { Executable = evaluator
-                      Arguments = []
+                      Arguments = [ "--fail-count-file"; evaluatorAvailability ]
                       WorkingDirectory = "."
                       Timeout = TimeSpan.FromSeconds 10.0
                       RequiredConstraints = [ "build"; "tests" ]
-                      MaxInconclusiveRetries = 2 }
+                      MaxInconclusiveRetries = 2
+                      MaxInfrastructureRetries = 2
+                      InfrastructureRetryDelay = TimeSpan.FromMilliseconds 10.0 }
                   Metric =
                     { Name = "primary"
                       Direction = Maximize
@@ -231,6 +238,7 @@ module RuntimeIntegrationTests =
                       Comparison = RetainedScore }
                   Model = Defaults.model
                   PromptProfile = Defaults.promptProfile
+                  GraphSearch = Defaults.graphSearch
                   Budgets =
                     { Defaults.budgets with
                         MaxExperiments = 1
@@ -260,12 +268,14 @@ module RuntimeIntegrationTests =
             let finalState = runtime.State |> Option.get
             Assert.Equal(1, finalState.Attempted)
             Assert.Equal(1, finalState.AcceptedCount)
-            Assert.Equal(2M, finalState.FrontierScore)
+            Assert.Equal(2M, finalState.ChampionScore)
             Assert.Equal(120L, TokenUsage.rawTotal finalState.Usage)
             Assert.Equal("1", File.ReadAllText(Path.Combine(source, "src", "score.txt")))
             Assert.Equal(sourceHead, runGit source [ "rev-parse"; "HEAD" ])
 
             let history = runtime.History 100 |> getResult |> List.rev
+            Assert.Contains(history, fun event -> event.Kind = "EvaluatorRetryScheduled")
+            Assert.Equal("0", File.ReadAllText evaluatorAvailability)
             let pending = history |> List.findIndex (fun event -> event.Kind = "AcceptPending")
             let accepted = history |> List.findIndex (fun event -> event.Kind = "Accepted")
             Assert.True(pending < accepted)
@@ -288,9 +298,27 @@ module RuntimeIntegrationTests =
             Assert.Equal(2M, snapshot.Run.FrontierScore.Value)
             Assert.Equal(sourceHead, CommitOid.value snapshot.Run.BaselineCommit.Value)
             Assert.Equal(sourceHead, CommitOid.value snapshot.Nodes.Head.Parent.Value)
-            Assert.Equal(Some finalState.Frontier, snapshot.Frontier)
+            Assert.Equal(Some finalState.Champion, snapshot.Frontier)
+            Assert.Equal(Some finalState.Champion, snapshot.Champion)
+            Assert.Contains(finalState.Champion, snapshot.ActiveHeads)
+            Assert.Single snapshot.Edges |> ignore
             Assert.DoesNotContain(snapshot.Warnings, fun warning -> warning.Contains("private Git repository"))
             Assert.Contains(snapshot.Nodes, fun node -> node.Outcome = EvolutionOutcome.Accepted)
+
+            let graphState =
+                let experimentId =
+                    match snapshot.Nodes.Head.Id with
+                    | ExperimentNode id -> id
+                    | BaselineNode -> failwith "Expected an experiment node."
+
+                SqliteStore.create (Path.Combine(dataRoot, "fsharness.db"))
+                |> fun store -> SqliteStore.loadExperimentGraphStates store listed.Id
+                |> getResult
+                |> List.find (fun state -> state.ExperimentId = experimentId)
+
+            Assert.Equal(EvaluationValidity.Valid, graphState.Validity)
+            Assert.Equal(ChampionDecision.Promoted, graphState.ChampionDecision)
+            Assert.Equal(SearchStatus.ActiveHead, graphState.SearchStatus)
 
             let children =
                 runtime.WorkGraphChildren(listed.Id, inspection.Head, CancellationToken.None)
@@ -298,24 +326,39 @@ module RuntimeIntegrationTests =
                 |> getResult
 
             Assert.Single children |> ignore
-            Assert.Equal(finalState.Frontier, children.Head.Commit)
+            Assert.Equal(finalState.Champion, children.Head.Commit)
 
             let leaves =
                 runtime.WorkGraphLeaves(listed.Id, CancellationToken.None)
                 |> Async.RunSynchronously
                 |> getResult
 
-            Assert.Equal<CommitOid list>([ finalState.Frontier ], leaves |> List.map _.Commit)
+            Assert.Equal<CommitOid list>([ finalState.Champion ], leaves |> List.map _.Commit)
 
             let lineage =
-                runtime.WorkGraphLineage(listed.Id, finalState.Frontier, CancellationToken.None)
+                runtime.WorkGraphLineage(listed.Id, finalState.Champion, CancellationToken.None)
                 |> Async.RunSynchronously
                 |> getResult
 
-            Assert.Equal<CommitOid list>([ inspection.Head; finalState.Frontier ], lineage |> List.map _.Commit)
+            Assert.Equal<CommitOid list>([ inspection.Head; finalState.Champion ], lineage |> List.map _.Commit)
+
+            let parents =
+                runtime.WorkGraphParents(listed.Id, finalState.Champion, CancellationToken.None)
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.Single parents |> ignore
+            Assert.Equal(inspection.Head, parents.Head.Parent)
+
+            let ancestors =
+                runtime.WorkGraphAncestors(listed.Id, finalState.Champion, CancellationToken.None)
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.Contains(ancestors, fun node -> node.Commit = inspection.Head)
 
             let diff =
-                runtime.WorkGraphDiff(listed.Id, inspection.Head, finalState.Frontier, CancellationToken.None)
+                runtime.WorkGraphDiff(listed.Id, inspection.Head, finalState.Champion, CancellationToken.None)
                 |> Async.RunSynchronously
                 |> getResult
 
@@ -331,6 +374,15 @@ module RuntimeIntegrationTests =
 
             Assert.Equal(KnowledgeValue.Number 2M, metricClaim.Claim.Object)
             Assert.Equal(KnowledgeSourceKind.Evaluation, metricClaim.Sources.Head.Kind)
+
+            let repositoryKnowledge =
+                runtime.LoadRepositoryKnowledge(listed.Id, CancellationToken.None)
+                |> Async.RunSynchronously
+                |> getResult
+
+            let repositoryNodes = RepositoryKnowledgeGraph.currentNodes repositoryKnowledge
+            Assert.Contains(GraphNodeId.create $"commit:{CommitOid.value finalState.Champion}", repositoryNodes.Keys)
+            Assert.Contains(repositoryKnowledge.Edges.Values, fun edge -> edge.Relation = GraphRelationKind.Evaluates)
 
             let annotation =
                 { Id = RunAnnotationId.create ()
@@ -373,7 +425,7 @@ module RuntimeIntegrationTests =
             Assert.Equal(finalState.Id, recoveredReport.RunId)
             let recovered = recoveredRuntime.State |> Option.get
             Assert.Equal(Ready, recovered.Status)
-            Assert.Equal(finalState.Frontier, recovered.Frontier)
+            Assert.Equal(finalState.Champion, recovered.Champion)
             Assert.Equal(1, recovered.Attempted)
             Assert.Equal(1, recovered.AcceptedCount)
             Assert.Equal(120L, TokenUsage.rawTotal recovered.Usage)

@@ -11,7 +11,9 @@ module private Fixtures =
           WorkingDirectory = "."
           Timeout = TimeSpan.FromSeconds 5.0
           RequiredConstraints = [ "build"; "tests" ]
-          MaxInconclusiveRetries = 2 }
+          MaxInconclusiveRetries = 2
+          MaxInfrastructureRetries = 0
+          InfrastructureRetryDelay = TimeSpan.FromMilliseconds 10.0 }
 
     let metric =
         { Name = "primary"
@@ -31,11 +33,13 @@ module private Fixtures =
           Metric = metric
           Model = Defaults.model
           PromptProfile = Defaults.promptProfile
+          GraphSearch = Defaults.graphSearch
           Budgets = Defaults.budgets
           PromotionMode = AutoWhenStrictlyBetter }
 
     let summary =
-        { Hypothesis = "One change"
+        { HypothesisFamily = "fixture"
+          Hypothesis = "One change"
           ChangeSummary = "Changed one file"
           ExpectedEffect = "Metric rises"
           ValidationNotes = [ "Checked" ]
@@ -203,11 +207,14 @@ module PromptTests =
             Prompt.build
                 { Objective = "Improve"
                   EditablePaths = [ "src/**" ]
-                  FrontierScore = 1M
+                  ParentCommit = None
+                  ChampionCommit = None
+                  ChampionScore = 1M
                   Metric = Fixtures.metric
                   Profile = Defaults.promptProfile
                   PreviousEvaluation = None
-                  Memories = memories }
+                  Memories = memories
+                  GraphContext = None }
 
         Assert.True(prompt.Length < 8_500, $"Prompt was unexpectedly large: {prompt.Length}")
         Assert.Contains("Keep tool output bounded", prompt)
@@ -240,11 +247,14 @@ module PromptTests =
             Prompt.build
                 { Objective = "Improve"
                   EditablePaths = [ "src/**" ]
-                  FrontierScore = 1M
+                  ParentCommit = None
+                  ChampionCommit = None
+                  ChampionScore = 1M
                   Metric = Fixtures.metric
                   Profile = profile
                   PreviousEvaluation = Some evaluation
-                  Memories = memories }
+                  Memories = memories
+                  GraphContext = None }
 
         Assert.Contains("memory-1", prompt)
         Assert.Contains("memory-2", prompt)
@@ -291,17 +301,17 @@ module StateMachineTests =
         let pending, effects =
             RunState.transition started (EvaluationCompleted(experimentId, evaluation)) afterCapture
 
-        Assert.Equal(parent, pending.Frontier)
+        Assert.Equal(parent, pending.Champion)
         Assert.Contains(effects, fun effect -> effect = PersistAccepted(experimentId, candidate, parent))
 
         let promoting, _ =
             RunState.transition started (PromotionStarted experimentId) pending
 
         let accepted, _ =
-            RunState.transition started (FrontierAdvanced experimentId) promoting
+            RunState.transition started (ChampionAdvanced experimentId) promoting
 
-        Assert.Equal(candidate, accepted.Frontier)
-        Assert.Equal(11M, accepted.FrontierScore)
+        Assert.Equal(candidate, accepted.Champion)
+        Assert.Equal(11M, accepted.ChampionScore)
 
     [<Fact>]
     let ``missing terminal usage pauses after the candidate is decided`` () =
@@ -415,10 +425,10 @@ module StateMachineTests =
             RunState.transition started (PromotionStarted experimentId) stopping
 
         let unchanged, frontierEffects =
-            RunState.transition started (FrontierAdvanced experimentId) notPromoting
+            RunState.transition started (ChampionAdvanced experimentId) notPromoting
 
         Assert.Equal(Stopping, unchanged.Status)
-        Assert.Equal(parent, unchanged.Frontier)
+        Assert.Equal(parent, unchanged.Champion)
         Assert.Empty promotionEffects
         Assert.Empty frontierEffects
 
@@ -466,10 +476,10 @@ module StateMachineTests =
             RunState.transition started (PromotionStarted experimentId) pending
 
         let completed, effects =
-            RunState.transition started (FrontierAdvanced experimentId) promoting
+            RunState.transition started (ChampionAdvanced experimentId) promoting
 
         Assert.Equal(Completed "Metric target reached.", completed.Status)
-        Assert.Equal(candidate, completed.Frontier)
+        Assert.Equal(candidate, completed.Champion)
         Assert.DoesNotContain(ScheduleNext, effects)
 
     [<Fact>]
@@ -493,6 +503,38 @@ module StateMachineTests =
         Assert.True(completed.Current.IsNone)
         Assert.Equal(1, completed.Attempted)
         Assert.DoesNotContain(ScheduleNext, effects)
+
+    [<Fact>]
+    let ``stagnation allows one synthesis boundary but stops after synthesis`` () =
+        let now = DateTimeOffset.UtcNow
+
+        let initial =
+            RunState.create (RunId.create ()) Fixtures.config Fixtures.config.BaseCommit 10M now
+
+        let expansionBoundary =
+            { initial with
+                ConsecutiveNonImprovements = initial.Config.Budgets.MaxConsecutiveNonImprovements
+                LastExperimentKind = Some ExperimentKind.Expansion }
+
+        let scheduled, effects =
+            RunState.transition now (StartRequested(ExperimentId.create (), now)) expansionBoundary
+
+        Assert.Equal(Running, scheduled.Status)
+
+        Assert.Contains(
+            PrepareCandidate(scheduled.Current.Value.Id, scheduled.Current.Value.Parents, initial.Champion),
+            effects
+        )
+
+        let synthesisBoundary =
+            { expansionBoundary with
+                LastExperimentKind = Some ExperimentKind.Synthesis }
+
+        let completed, completedEffects =
+            RunState.transition now (StartRequested(ExperimentId.create (), now)) synthesisBoundary
+
+        Assert.Equal(Completed "Non-improvement limit reached.", completed.Status)
+        Assert.DoesNotContain(ScheduleNext, completedEffects)
 
     [<Fact>]
     let ``work graph exposes branch children leaves and root lineage`` () =
@@ -534,6 +576,9 @@ module StateMachineTests =
                   AcceptedCount = 0 }
               Nodes = [ node 1 baseline first; node 2 baseline sibling; node 3 first grandchild ]
               Frontier = Some baseline
+              Edges = []
+              Champion = Some baseline
+              ActiveHeads = Set.singleton baseline
               Warnings = [] }
 
         let graph =
@@ -719,6 +764,274 @@ module StateMachineTests =
                 graph
 
         Assert.True(Result.isError unsupported)
+
+module GraphSearchTests =
+    let private oid character =
+        CommitOid.create (String(character, 40))
+
+    let private getResult =
+        function
+        | Ok value -> value
+        | Error error -> failwith $"Unexpected error: {error}"
+
+    let private parent role commit = { Commit = commit; Role = role }
+
+    let private node commit parents metric family sequence validity status depth =
+        { Commit = commit
+          Parents = parents
+          Metric = metric
+          HypothesisFamily = family
+          Validity = validity
+          ChampionDecision = ChampionDecision.NotPromoted
+          SearchStatus = status
+          Sequence = sequence
+          SynthesisDepth = depth }
+
+    let private graph () =
+        let baseline = oid 'a'
+        let first = oid 'b'
+        let second = oid 'c'
+        let child = oid 'd'
+        let invalid = oid 'e'
+
+        let baselineNode =
+            { node baseline [] (Some 10M) "baseline" 0 EvaluationValidity.Valid SearchStatus.Retained 0 with
+                ChampionDecision = ChampionDecision.Promoted }
+
+        { Baseline = baseline
+          Champion = first
+          Direction = Maximize
+          Nodes =
+            [ baseline, baselineNode
+              first,
+              node
+                  first
+                  [ parent ExperimentParentRole.Primary baseline ]
+                  (Some 12M)
+                  "allocation"
+                  1
+                  EvaluationValidity.Valid
+                  SearchStatus.ActiveHead
+                  0
+              second,
+              node
+                  second
+                  [ parent ExperimentParentRole.Primary baseline ]
+                  (Some 11M)
+                  "kernel"
+                  2
+                  EvaluationValidity.Valid
+                  SearchStatus.Retained
+                  0
+              child,
+              node
+                  child
+                  [ parent ExperimentParentRole.Primary first ]
+                  (Some 11.5M)
+                  "allocation"
+                  3
+                  EvaluationValidity.Valid
+                  SearchStatus.Retained
+                  0
+              invalid,
+              node
+                  invalid
+                  [ parent ExperimentParentRole.Primary baseline ]
+                  (Some 99M)
+                  "invalid"
+                  4
+                  (EvaluationValidity.ConstraintFailed [ "tests" ])
+                  SearchStatus.Archived
+                  0 ]
+            |> Map.ofList }
+
+    [<Fact>]
+    let ``multi-parent traversal is acyclic and preserves primary lineage`` () =
+        let source = graph ()
+        let first = oid 'b'
+        let second = oid 'c'
+        let synthesis = oid 'f'
+
+        let merged =
+            node
+                synthesis
+                [ parent ExperimentParentRole.Primary first
+                  parent ExperimentParentRole.Contributor second ]
+                (Some 13M)
+                "synthesis"
+                5
+                EvaluationValidity.Valid
+                SearchStatus.Retained
+                1
+
+        let updated = GraphSearch.addNode merged source |> getResult
+        Assert.True(GraphSearch.ancestors synthesis updated |> Set.contains first)
+        Assert.True(GraphSearch.ancestors synthesis updated |> Set.contains second)
+        Assert.True(GraphSearch.descendants second updated |> Set.contains synthesis)
+
+        let lineage = GraphSearch.primaryLineage synthesis updated |> getResult
+        Assert.Equal<CommitOid list>([ oid 'a'; first; synthesis ], lineage |> List.map _.Commit)
+
+    [<Fact>]
+    let ``head selection is bounded deterministic and retains valid non-winners`` () =
+        let source = graph ()
+        let selected = GraphSearch.selectActiveHeads 3 source
+
+        Assert.Equal(3, selected.Length)
+        Assert.Equal(oid 'b', selected.Head)
+        Assert.Contains(oid 'c', selected)
+        Assert.DoesNotContain(oid 'e', selected)
+        Assert.Equal<CommitOid list>(selected, GraphSearch.selectActiveHeads 3 source)
+
+    [<Fact>]
+    let ``synthesis pairs exclude ancestors and prior attempts`` () =
+        let source = graph ()
+        let first = oid 'b'
+        let second = oid 'c'
+        let child = oid 'd'
+        let eligible = GraphSearch.synthesisPairs 2 Set.empty [ first; second ] source
+
+        Assert.Single eligible |> ignore
+        Assert.Equal(first, eligible.Head.Primary)
+        Assert.Equal(second, eligible.Head.Contributor)
+        Assert.Empty(GraphSearch.synthesisPairs 2 Set.empty [ first; child ] source)
+
+        let attempted = Set.singleton (first, second)
+        Assert.Empty(GraphSearch.synthesisPairs 2 attempted [ first; second ] source)
+        Assert.Empty(GraphSearch.synthesisPairs 2 attempted [ second; first ] source)
+
+    [<Fact>]
+    let ``synthesis cadence and reservation remain bounded`` () =
+        Assert.False(GraphSearch.shouldSynthesize Defaults.graphSearch 2 2)
+        Assert.True(GraphSearch.shouldSynthesize Defaults.graphSearch 3 0)
+        Assert.True(GraphSearch.shouldSynthesize Defaults.graphSearch 0 3)
+        Assert.Equal(2, GraphSearch.reservedSynthesisSlots Defaults.graphSearch 10)
+
+module RepositoryKnowledgeGraphTests =
+    let private getResult =
+        function
+        | Ok value -> value
+        | Error error -> failwith $"Unexpected error: {error}"
+
+    let private node run kind id name attributes =
+        { Id = GraphNodeId.create id
+          Kind = kind
+          CanonicalName = name
+          Attributes = attributes
+          Version = 1
+          OriginRunId = run
+          CreatedAt = DateTimeOffset.UtcNow }
+
+    [<Fact>]
+    let ``repository updates are idempotent and bounded queries keep stable citations`` () =
+        let runId = RunId.create ()
+        let sourceId = KnowledgeSourceId.create ()
+        let commit = node runId GraphNodeKind.Commit "commit:a" "a" Map.empty
+        let claim = node runId GraphNodeKind.Claim "claim:one" "faster kernel" Map.empty
+
+        let evaluation =
+            node runId GraphNodeKind.Evaluation "evaluation:one" "evaluation" (Map [ "rubric", "build+metric" ])
+
+        let edge
+            (id: string)
+            (fromNode: RepositoryGraphNode)
+            relation
+            (toNode: RepositoryGraphNode)
+            : RepositoryGraphEdge =
+            { Id = GraphEdgeId.create id
+              From = fromNode.Id
+              Relation = relation
+              To = toNode.Id
+              Confidence = 1M
+              Provenance = GraphProvenance.Sourced(Set.singleton sourceId)
+              OriginRunId = runId
+              ValidFrom = DateTimeOffset.UtcNow
+              ValidTo = None }
+
+        let update =
+            { ProjectId = "repo"
+              RunId = runId
+              AgentId = "test"
+              IdempotencyKey = "update:one"
+              Nodes = [ commit; claim; evaluation ]
+              Edges =
+                [ edge "edge:claim" claim GraphRelationKind.Supports commit
+                  edge "edge:evaluation" evaluation GraphRelationKind.Evaluates commit ] }
+
+        let once =
+            RepositoryKnowledgeGraph.empty "repo"
+            |> RepositoryKnowledgeGraph.apply update
+            |> getResult
+
+        let twice = once |> RepositoryKnowledgeGraph.apply update |> getResult
+        Assert.Equal(2, twice.Edges.Count)
+
+        let context =
+            RepositoryKnowledgeGraph.query
+                { Seeds = Set.singleton claim.Id
+                  MaxHops = 2
+                  MaxEdges = 10
+                  MaxCharacters = 6_000
+                  AllowedRelations = Set [ GraphRelationKind.Supports; GraphRelationKind.Evaluates ]
+                  AsOf = None
+                  IncludeConflicts = true }
+                twice
+
+        Assert.Contains("[edge:claim]", context.Serialized)
+        Assert.Contains("[edge:evaluation]", context.Serialized)
+        Assert.False context.Truncated
+
+    [<Fact>]
+    let ``artifact provenance invariants and exact aliases are enforced`` () =
+        let runId = RunId.create ()
+
+        let invalidArtifact =
+            node runId GraphNodeKind.Artifact "artifact:bad" "bad" Map.empty
+
+        let invalidUpdate =
+            { ProjectId = "repo"
+              RunId = runId
+              AgentId = "test"
+              IdempotencyKey = "bad"
+              Nodes = [ invalidArtifact ]
+              Edges = [] }
+
+        Assert.True(
+            RepositoryKnowledgeGraph.empty "repo"
+            |> RepositoryKnowledgeGraph.apply invalidUpdate
+            |> Result.isError
+        )
+
+        let orphanClaim =
+            node runId GraphNodeKind.Claim "claim:orphan" "unsupported" Map.empty
+
+        Assert.True(
+            RepositoryKnowledgeGraph.empty "repo"
+            |> RepositoryKnowledgeGraph.apply
+                { invalidUpdate with
+                    IdempotencyKey = "orphan"
+                    Nodes = [ orphanClaim ] }
+            |> Result.isError
+        )
+
+        let entity =
+            node
+                runId
+                GraphNodeKind.Entity
+                "entity:planner"
+                "Graph Scheduler"
+                (Map [ "aliases", "scheduler|beam planner" ])
+
+        let graph =
+            RepositoryKnowledgeGraph.empty "repo"
+            |> RepositoryKnowledgeGraph.apply
+                { invalidUpdate with
+                    IdempotencyKey = "entity"
+                    Nodes = [ entity ] }
+            |> getResult
+
+        Assert.Single(RepositoryKnowledgeGraph.resolveExact GraphNodeKind.Entity "Beam Planner" graph)
+        |> ignore
 
 module BenchmarkTests =
     let private episodes rawSol rawRatchet =

@@ -55,6 +55,43 @@ type PromotionMode =
     | AutoWhenStrictlyBetter
     | ReviewStrictWinners
 
+[<RequireQualifiedAccess>]
+type ExperimentKind =
+    | Expansion
+    | Synthesis
+
+[<RequireQualifiedAccess>]
+type ExperimentParentRole =
+    | Primary
+    | Contributor
+
+type ExperimentParent =
+    { Commit: CommitOid
+      Role: ExperimentParentRole }
+
+[<RequireQualifiedAccess>]
+type EvaluationValidity =
+    | Pending
+    | Valid
+    | ConstraintFailed of string list
+    | Inconclusive of string
+    | InfrastructureFailed of string
+
+[<RequireQualifiedAccess>]
+type ChampionDecision =
+    | Pending
+    | Promoted
+    | NotPromoted
+    | RejectedByUser
+
+[<RequireQualifiedAccess>]
+type SearchStatus =
+    | ActiveHead
+    | Retained
+    | Exhausted
+    | ConflictBlocked
+    | Archived
+
 type TokenUsage =
     { InputTokens: int64
       CachedInputTokens: int64
@@ -90,7 +127,8 @@ module TokenUsage =
         max 0L (usage.OutputTokens - usage.ReasoningOutputTokens)
 
 type ExperimentSummary =
-    { Hypothesis: string
+    { HypothesisFamily: string
+      Hypothesis: string
       ChangeSummary: string
       ExpectedEffect: string
       ValidationNotes: string list
@@ -152,10 +190,20 @@ type EvolutionNode =
       UpdatedAt: DateTimeOffset
       Label: string }
 
+type EvolutionEdge =
+    { Id: string
+      Parent: CommitOid
+      Child: CommitOid
+      Kind: ExperimentKind
+      Role: ExperimentParentRole }
+
 type EvolutionSnapshot =
     { Run: EvolutionRunSummary
       Nodes: EvolutionNode list
       Frontier: CommitOid option
+      Edges: EvolutionEdge list
+      Champion: CommitOid option
+      ActiveHeads: Set<CommitOid>
       Warnings: string list }
 
 type HarnessErrorCategory =

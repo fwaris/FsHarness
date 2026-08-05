@@ -3,6 +3,7 @@
     <OutputType>WinExe</OutputType>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="HeadlessCampaign.fs" />
     <Compile Include="AppState.fs" />
     <Compile Include="EvolutionLayout.fs" />
     <Compile Include="Views.fs" />
@@ -19,5 +20,6 @@
     <ProjectReference Include="../FsHarness.Core/FsHarness.Core.fsproj" />
     <ProjectReference Include="../FsHarness.Codex/FsHarness.Codex.fsproj" />
     <ProjectReference Include="../FsHarness.Infrastructure/FsHarness.Infrastructure.fsproj" />
+    <ProjectReference Include="../FsHarness.Cli/FsHarness.Cli.fsproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>

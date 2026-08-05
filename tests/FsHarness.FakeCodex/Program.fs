@@ -57,6 +57,7 @@ module Program =
             let summary =
                 JsonSerializer.Serialize
                     {| hypothesis = "Increment the deterministic fixture score."
+                       hypothesisFamily = "fixture-score"
                        changeSummary = "Updated src/score.txt."
                        expectedEffect = "Increase the primary metric by one."
                        validationNotes = [| "Fake worker completed." |]

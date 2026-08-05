@@ -31,6 +31,8 @@ module Program =
           DataRoot: string option
           CodexPath: string option
           SummaryPath: string option
+          ControlPath: string option
+          ActivityLogPath: string option
           Commit: CommitOid option
           FromCommit: CommitOid option
           ToCommit: CommitOid option
@@ -42,8 +44,13 @@ module Program =
 
     let private usage () =
         eprintfn "Usage:"
-        eprintfn "  fsharness run --config <file> [--data-root <dir>] [--codex <exe>] [--summary <file>]"
-        eprintfn "  fsharness resume --run-id <guid> [--data-root <dir>] [--codex <exe>] [--summary <file>]"
+
+        eprintfn
+            "  fsharness run --config <file> [--data-root <dir>] [--codex <exe>] [--summary <file>] [--control-file <file>] [--activity-log <file>]"
+
+        eprintfn
+            "  fsharness resume --run-id <guid> [--data-root <dir>] [--codex <exe>] [--summary <file>] [--control-file <file>] [--activity-log <file>]"
+
         eprintfn "  fsharness status [--run-id <guid>] [--data-root <dir>]"
         eprintfn "  fsharness children --run-id <guid> --commit <oid> [--data-root <dir>]"
         eprintfn "  fsharness leaves --run-id <guid> [--data-root <dir>]"
@@ -97,6 +104,16 @@ module Program =
                     { options with
                         SummaryPath = Some value }
                     rest
+            | "--control-file" :: value :: rest ->
+                loop
+                    { options with
+                        ControlPath = Some value }
+                    rest
+            | "--activity-log" :: value :: rest ->
+                loop
+                    { options with
+                        ActivityLogPath = Some value }
+                    rest
             | "--commit" :: value :: rest ->
                 loop
                     { options with
@@ -137,6 +154,8 @@ module Program =
                   DataRoot = None
                   CodexPath = None
                   SummaryPath = None
+                  ControlPath = None
+                  ActivityLogPath = None
                   Commit = None
                   FromCommit = None
                   ToCommit = None
@@ -217,19 +236,19 @@ module Program =
         destination
 
     let private executePrepared options (runtime: HarnessRuntime) (report: PreparedRunReport) (config: HarnessConfig) =
-        use cancellation =
-            new CancellationTokenSource(config.Budgets.MaxDuration + TimeSpan.FromMinutes 5.0)
-
         match runtime.Start() with
         | Error error ->
             eprintfn "%s" (describeError error)
             4
         | Ok _ ->
-            let completed =
-                SpinWait.SpinUntil(
-                    (fun () -> runtime.State |> Option.exists isTerminal),
-                    config.Budgets.MaxDuration + TimeSpan.FromMinutes 2.0
-                )
+            let deadline =
+                DateTimeOffset.UtcNow + config.Budgets.MaxDuration + TimeSpan.FromMinutes 2.0
+
+            while runtime.State |> Option.exists isTerminal |> not
+                  && DateTimeOffset.UtcNow < deadline do
+                Thread.Sleep 250
+
+            let completed = runtime.State |> Option.exists isTerminal
 
             if not completed then
                 runtime.StopNow()
@@ -252,8 +271,50 @@ module Program =
                     | Some(Paused _) -> 7
                     | _ -> 0
 
-    let private subscribeActivity (runtime: HarnessRuntime) =
-        runtime.Activity.Subscribe(fun item -> eprintfn "[%s] %s" (item.Timestamp.ToString("o")) item.Message)
+    let private subscribeActivity options (runtime: HarnessRuntime) =
+        let writer =
+            options.ActivityLogPath
+            |> Option.map (fun path ->
+                let destination = Path.GetFullPath path
+                Directory.CreateDirectory(Path.GetDirectoryName destination) |> ignore
+                new StreamWriter(destination, true) :> TextWriter)
+
+        let subscription =
+            runtime.Activity.Subscribe(fun item ->
+                let message = $"[{item.Timestamp:o}] {item.Message}"
+                eprintfn "%s" message
+
+                writer
+                |> Option.iter (fun output ->
+                    output.WriteLine message
+                    output.Flush()))
+
+        { new IDisposable with
+            member _.Dispose() =
+                subscription.Dispose()
+                writer |> Option.iter _.Dispose() }
+
+    let private monitorControlFile options (runtime: HarnessRuntime) (cancellation: CancellationTokenSource) =
+        let mutable stopObserved = 0
+
+        new Timer(
+            TimerCallback(fun _ ->
+                let shouldStop =
+                    options.ControlPath |> Option.exists (Path.GetFullPath >> File.Exists)
+
+                if shouldStop && Interlocked.CompareExchange(&stopObserved, 1, 0) = 0 then
+                    eprintfn "A stop was requested through the headless control file."
+
+                    try
+                        cancellation.Cancel()
+                    with :? ObjectDisposedException ->
+                        ()
+
+                    runtime.StopNow()),
+            null,
+            TimeSpan.Zero,
+            TimeSpan.FromMilliseconds 250.0
+        )
 
     let private runNew options =
         match options.ConfigPath |> Option.map ConfigFile.read with
@@ -263,11 +324,26 @@ module Program =
             2
         | Some(Ok config) ->
             let codexResolution = CliDiscovery.resolve options.CodexPath
-            let dataRoot = options.DataRoot |> Option.defaultValue (DataPaths.root ())
-            use runtime = new HarnessRuntime(dataRoot, codexResolution.Executable)
-            use _activity = subscribeActivity runtime
 
-            match runtime.Prepare(config, CancellationToken.None) |> Async.RunSynchronously with
+            let configuredDataRoot =
+                options.ConfigPath
+                |> Option.bind (fun path ->
+                    match ConfigFile.readDataRoot path with
+                    | Ok value -> value
+                    | Error _ -> None)
+
+            let dataRoot =
+                options.DataRoot
+                |> Option.orElseWith DataPaths.environmentRoot
+                |> Option.orElse configuredDataRoot
+                |> Option.defaultValue (DataPaths.root ())
+
+            use runtime = new HarnessRuntime(dataRoot, codexResolution.Executable)
+            use _activity = subscribeActivity options runtime
+            use operationCancellation = new CancellationTokenSource()
+            use _control = monitorControlFile options runtime operationCancellation
+
+            match runtime.Prepare(config, operationCancellation.Token) |> Async.RunSynchronously with
             | Error error ->
                 eprintfn "%s" (describeError error)
                 3
@@ -284,10 +360,12 @@ module Program =
         let codexResolution = CliDiscovery.resolve options.CodexPath
         let dataRoot = options.DataRoot |> Option.defaultValue (DataPaths.root ())
         use runtime = new HarnessRuntime(dataRoot, codexResolution.Executable)
-        use _activity = subscribeActivity runtime
+        use _activity = subscribeActivity options runtime
+        use operationCancellation = new CancellationTokenSource()
+        use _control = monitorControlFile options runtime operationCancellation
 
         match
-            runtime.Recover(options.RunId.Value, CancellationToken.None)
+            runtime.Recover(options.RunId.Value, operationCancellation.Token)
             |> Async.RunSynchronously
         with
         | Error error ->

@@ -126,14 +126,10 @@ module ProcessRunner =
                         with _ ->
                             ()
 
-                        return
-                            Error(
-                                error
-                                    "process.timeout_or_cancelled"
-                                    "Process timed out or was cancelled."
-                                    spec.Executable
-                                    false
-                            )
+                        if cancellationToken.IsCancellationRequested then
+                            return Error(error "process.cancelled" "Process was cancelled." spec.Executable false)
+                        else
+                            return Error(error "process.timeout" "Process timed out." spec.Executable true)
             with exceptionValue ->
                 try
                     if not childProcess.HasExited then

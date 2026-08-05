@@ -5,6 +5,7 @@ open System.IO
 open System.Threading
 open FsHarness.Core
 open FsHarness.Infrastructure
+open Microsoft.Data.Sqlite
 open Xunit
 
 module StorageTests =
@@ -35,7 +36,9 @@ module StorageTests =
               WorkingDirectory = "."
               Timeout = TimeSpan.FromSeconds 5.0
               RequiredConstraints = []
-              MaxInconclusiveRetries = 0 }
+              MaxInconclusiveRetries = 0
+              MaxInfrastructureRetries = 0
+              InfrastructureRetryDelay = TimeSpan.FromMilliseconds 10.0 }
           Metric =
             { Name = "primary"
               Direction = Maximize
@@ -44,6 +47,7 @@ module StorageTests =
               Comparison = RetainedScore }
           Model = Defaults.model
           PromptProfile = Defaults.promptProfile
+          GraphSearch = Defaults.graphSearch
           Budgets = Defaults.budgets
           PromotionMode = AutoWhenStrictlyBetter }
 
@@ -65,12 +69,24 @@ module StorageTests =
             |> getResult
             |> ignore
 
+            let usage =
+                { InputTokens = 1_000L
+                  CachedInputTokens = 700L
+                  OutputTokens = 200L
+                  ReasoningOutputTokens = 50L }
+
+            journal.SaveUsage runId experimentId (Some usage) CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
             let memory =
                 { ExperimentId = experimentId
                   Outcome = "Accepted"
                   Metric = Some 12.5M
                   Summary =
-                    { Hypothesis = "h"
+                    { HypothesisFamily = "fixture"
+                      Hypothesis = "h"
                       ChangeSummary = "c"
                       ExpectedEffect = "e"
                       ValidationNotes = [ "v" ]
@@ -91,7 +107,8 @@ module StorageTests =
 
             let events = SqliteStore.loadEvents store 20 |> getResult
             Assert.Single events |> ignore
-            Assert.Equal("Accepted", events.Head.Kind))
+            Assert.Equal("Accepted", events.Head.Kind)
+            Assert.Equal(Some usage, events.Head.Usage))
 
     [<Fact>]
     let ``project lock excludes a second writer`` () =
@@ -357,3 +374,158 @@ module StorageTests =
             let hit = KnowledgeGraph.search "planner scheduler" 5 graph |> Assert.Single
             Assert.Equal(claim.Id, hit.Claim.Id)
             Assert.Equal(source.Id, hit.Sources.Head.Id))
+
+    [<Fact>]
+    let ``repository graph updates are atomic idempotent and project isolated`` () =
+        withTempDirectory (fun directory ->
+            let store = SqliteStore.create (Path.Combine(directory, "harness.db"))
+
+            SqliteStore.initialize store CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            let firstRun = RunId.create ()
+            let secondRun = RunId.create ()
+
+            let firstConfig =
+                { config with
+                    SourcePath = Path.Combine(directory, "repo-a") }
+
+            let secondConfig =
+                { config with
+                    SourcePath = Path.Combine(directory, "repo-b") }
+
+            SqliteStore.saveRun store firstRun firstConfig "Ready" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            SqliteStore.saveRun store secondRun secondConfig "Ready" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            let update runId projectId name =
+                { ProjectId = projectId
+                  RunId = runId
+                  AgentId = "test"
+                  IdempotencyKey = $"update:{RunId.text runId}"
+                  Nodes =
+                    [ { Id = GraphNodeId.create "shared-id"
+                        Kind = GraphNodeKind.Entity
+                        CanonicalName = name
+                        Attributes = Map.empty
+                        Version = 1
+                        OriginRunId = runId
+                        CreatedAt = DateTimeOffset.UtcNow } ]
+                  Edges = [] }
+
+            let firstProject = SqliteStore.projectIdForRun store firstRun |> getResult
+            let secondProject = SqliteStore.projectIdForRun store secondRun |> getResult
+            let firstUpdate = update firstRun firstProject "repository A"
+
+            let inserted =
+                SqliteStore.saveRepositoryGraphUpdate store firstUpdate CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let duplicate =
+                SqliteStore.saveRepositoryGraphUpdate store firstUpdate CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            SqliteStore.saveRepositoryGraphUpdate
+                store
+                (update secondRun secondProject "repository B")
+                CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            Assert.True inserted
+            Assert.False duplicate
+
+            let firstGraph =
+                SqliteStore.loadRepositoryKnowledgeGraph store firstProject |> getResult
+
+            let secondGraph =
+                SqliteStore.loadRepositoryKnowledgeGraph store secondProject |> getResult
+
+            let firstNodes = RepositoryKnowledgeGraph.currentNodes firstGraph
+            let secondNodes = RepositoryKnowledgeGraph.currentNodes secondGraph
+            Assert.Equal("repository A", firstNodes[GraphNodeId.create "shared-id"].CanonicalName)
+            Assert.Equal("repository B", secondNodes[GraphNodeId.create "shared-id"].CanonicalName))
+
+    [<Fact>]
+    let ``v6 migration backs up and reconstructs edges champion and active heads`` () =
+        withTempDirectory (fun directory ->
+            let databasePath = Path.Combine(directory, "legacy.db")
+            let runId = RunId.create ()
+            let projectId = "legacy-project"
+            let baseline = String('a', 40)
+            let champion = String('b', 40)
+            let retained = String('c', 40)
+            let configPath = Path.Combine(directory, "config.json")
+
+            ConfigFile.write
+                configPath
+                { config with
+                    BaseCommit = CommitOid.create baseline }
+            |> getResult
+            |> ignore
+
+            let configJson = File.ReadAllText configPath
+            use database = new SqliteConnection($"Data Source={databasePath}")
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                """
+                PRAGMA user_version = 5;
+                CREATE TABLE projects(id TEXT PRIMARY KEY, source_path TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE runs(id TEXT PRIMARY KEY, project_id TEXT, config_json TEXT, status TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE experiments(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, sequence INTEGER, parent_oid TEXT, candidate_oid TEXT, outcome TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE evaluations(id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, experiment_id TEXT, result_json TEXT NOT NULL, created_at TEXT NOT NULL);
+                INSERT INTO projects VALUES ($project, '/legacy', $now);
+                INSERT INTO runs VALUES ($run, $project, $config, 'Interrupted', $now, $now);
+                INSERT INTO experiments VALUES ($accepted, $run, 1, $baseline, $champion, 'Accepted', $now, $now);
+                INSERT INTO experiments VALUES ($retainedId, $run, 2, $baseline, $retained, 'Rejected: Not strictly better', $now, $now);
+                """
+
+            let parameter name (value: obj) =
+                command.Parameters.AddWithValue(name, value) |> ignore
+
+            parameter "$project" projectId
+            parameter "$run" (RunId.text runId)
+            parameter "$config" configJson
+            parameter "$now" (DateTimeOffset.UtcNow.ToString("o"))
+            parameter "$accepted" (ExperimentId.text (ExperimentId.create ()))
+            parameter "$retainedId" (ExperimentId.text (ExperimentId.create ()))
+            parameter "$baseline" baseline
+            parameter "$champion" champion
+            parameter "$retained" retained
+            command.ExecuteNonQuery() |> ignore
+            database.Close()
+
+            let store = SqliteStore.create databasePath
+
+            SqliteStore.initialize store CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            Assert.True(File.Exists(databasePath + ".pre-v6.bak"))
+            let edges = SqliteStore.loadExperimentEdges store runId |> getResult
+            Assert.Equal(2, edges.Length)
+
+            let heads =
+                SqliteStore.loadActiveHeads store runId
+                |> getResult
+                |> List.map _.Commit
+                |> Set.ofList
+
+            Assert.Contains(CommitOid.create champion, heads)
+            Assert.Contains(CommitOid.create retained, heads)
+
+            use migrated = new SqliteConnection($"Data Source={databasePath}")
+            migrated.Open()
+            use version = migrated.CreateCommand()
+            version.CommandText <- "PRAGMA user_version;"
+            Assert.Equal(6L, version.ExecuteScalar() |> Convert.ToInt64))

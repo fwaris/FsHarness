@@ -9,7 +9,9 @@ type EvaluatorSpec =
       WorkingDirectory: string
       Timeout: TimeSpan
       RequiredConstraints: string list
-      MaxInconclusiveRetries: int }
+      MaxInconclusiveRetries: int
+      MaxInfrastructureRetries: int
+      InfrastructureRetryDelay: TimeSpan }
 
 type MetricComparison =
     | RetainedScore
@@ -38,6 +40,18 @@ type RunBudgets =
       MaxConsecutiveNonImprovements: int
       MaxConsecutiveFailures: int }
 
+type GraphSearchSpec =
+    { InitialFanOut: int
+      BeamWidth: int
+      ExpansionsPerHeadPerRound: int
+      OrdinaryCandidatesPerSynthesis: int
+      StagnationTrigger: int
+      MaxSynthesisBudgetFraction: decimal
+      MaxSynthesisDepth: int
+      ConflictResolutionAttempts: int
+      MaxConflictFiles: int
+      MaxConflictCharacters: int }
+
 type HarnessConfig =
     { SchemaVersion: int
       SourcePath: string
@@ -49,16 +63,32 @@ type HarnessConfig =
       Metric: MetricSpec
       Model: ModelSpec
       PromptProfile: PromptProfile
+      GraphSearch: GraphSearchSpec
       Budgets: RunBudgets
       PromotionMode: PromotionMode }
 
 [<RequireQualifiedAccess>]
 module Defaults =
+    let evaluatorMaxInfrastructureRetries = 120
+    let evaluatorInfrastructureRetryDelay = TimeSpan.FromSeconds 15.0
+
     let promptProfile =
         { MaxMemoryCount = 5
           MaxMemoryCharacters = 6_000
           MaxEvaluationFindings = Int32.MaxValue
           MaxEvaluationCharacters = 2_000 }
+
+    let graphSearch =
+        { InitialFanOut = 2
+          BeamWidth = 4
+          ExpansionsPerHeadPerRound = 1
+          OrdinaryCandidatesPerSynthesis = 3
+          StagnationTrigger = 3
+          MaxSynthesisBudgetFraction = 0.25M
+          MaxSynthesisDepth = 2
+          ConflictResolutionAttempts = 1
+          MaxConflictFiles = 8
+          MaxConflictCharacters = 50_000 }
 
     let budgets =
         { MaxExperiments = 10
@@ -74,7 +104,7 @@ module Defaults =
 
 [<RequireQualifiedAccess>]
 module HarnessConfig =
-    let currentSchemaVersion = 2
+    let currentSchemaVersion = 4
 
     let private validateEditablePath (path: string) =
         let normalized = path.Replace('\\', '/')
@@ -148,6 +178,12 @@ module HarnessConfig =
         if config.Evaluator.MaxInconclusiveRetries < 0 then
             errors.Add "Evaluator inconclusive retries cannot be negative."
 
+        if config.Evaluator.MaxInfrastructureRetries < 0 then
+            errors.Add "Evaluator infrastructure retries cannot be negative."
+
+        if config.Evaluator.InfrastructureRetryDelay <= TimeSpan.Zero then
+            errors.Add "Evaluator infrastructure retry delay must be positive."
+
         if String.IsNullOrWhiteSpace config.Metric.Name then
             errors.Add "A primary metric name is required."
 
@@ -169,6 +205,37 @@ module HarnessConfig =
             || config.PromptProfile.MaxEvaluationCharacters <= 0
         then
             errors.Add "Prompt-profile limits must be positive."
+
+        if config.GraphSearch.InitialFanOut <= 0 then
+            errors.Add "Graph-search initial fan-out must be positive."
+
+        if config.GraphSearch.BeamWidth <= 0 then
+            errors.Add "Graph-search beam width must be positive."
+
+        if config.GraphSearch.ExpansionsPerHeadPerRound <= 0 then
+            errors.Add "Graph-search expansions per head must be positive."
+
+        if config.GraphSearch.OrdinaryCandidatesPerSynthesis <= 0 then
+            errors.Add "Graph-search synthesis cadence must be positive."
+
+        if config.GraphSearch.StagnationTrigger <= 0 then
+            errors.Add "Graph-search stagnation trigger must be positive."
+
+        if
+            config.GraphSearch.MaxSynthesisBudgetFraction < 0M
+            || config.GraphSearch.MaxSynthesisBudgetFraction > 1M
+        then
+            errors.Add "Graph-search synthesis budget fraction must be between zero and one."
+
+        if config.GraphSearch.MaxSynthesisDepth < 0 then
+            errors.Add "Graph-search synthesis depth cannot be negative."
+
+        if
+            config.GraphSearch.ConflictResolutionAttempts < 0
+            || config.GraphSearch.MaxConflictFiles < 0
+            || config.GraphSearch.MaxConflictCharacters < 0
+        then
+            errors.Add "Graph-search conflict limits cannot be negative."
 
         if config.Budgets.MaxExperiments <= 0 then
             errors.Add "The experiment budget must be positive."

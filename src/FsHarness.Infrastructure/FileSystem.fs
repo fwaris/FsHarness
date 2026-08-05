@@ -9,6 +9,11 @@ open FsHarness.Core
 
 [<RequireQualifiedAccess>]
 module DataPaths =
+    let environmentRoot () =
+        match Environment.GetEnvironmentVariable "FSHARNESS_DATA_DIR" with
+        | value when not (String.IsNullOrWhiteSpace value) -> Some(Path.GetFullPath value)
+        | _ -> None
+
     let private compactIdentifier (value: string) =
         if value.Length <= 12 then value else value.Substring(0, 12)
 
@@ -18,9 +23,10 @@ module DataPaths =
         ExperimentId.text experimentId |> compactIdentifier
 
     let root () =
-        match Environment.GetEnvironmentVariable "FSHARNESS_DATA_DIR" with
-        | value when not (String.IsNullOrWhiteSpace value) -> Path.GetFullPath value
-        | _ -> Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FsHarness")
+        environmentRoot ()
+        |> Option.defaultValue (
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FsHarness")
+        )
 
     let runRoot root runId =
         let compact = Path.Combine(root, "runs", runKey runId)

@@ -1,15 +1,41 @@
 namespace FsHarness.App
 
 open System
+open System.IO
+open System.Threading.Tasks
 open Avalonia
 open Avalonia.Controls.ApplicationLifetimes
 open Avalonia.FuncUI.Elmish
 open Avalonia.FuncUI.Hosts
 open Avalonia.Platform.Storage
 open Avalonia.Themes.Fluent
+open Avalonia.Threading
 open Elmish
 open FsHarness.Codex
 open FsHarness.Infrastructure
+
+[<RequireQualifiedAccess>]
+module WindowTitle =
+    let private compactPath maxLength (path: string) =
+        if path.Length <= maxLength then
+            path
+        else
+            let visibleLength = maxLength - 1
+            let leftLength = visibleLength / 2
+            let rightLength = visibleLength - leftLength
+            $"{path.Substring(0, leftLength)}…{path.Substring(path.Length - rightLength)}"
+
+    let forExperiment (experimentFile: string option) =
+        match experimentFile with
+        | None -> "FsHarness · Token-Efficient Experiment Ratchet"
+        | Some path ->
+            let fileName = Path.GetFileName path
+            let directory = Path.GetDirectoryName path |> Option.ofObj |> Option.defaultValue ""
+
+            if String.IsNullOrEmpty directory then
+                $"FsHarness · {fileName}"
+            else
+                $"FsHarness · {fileName} — {compactPath 54 directory}"
 
 type MainWindow() as this =
     inherit HostWindow()
@@ -23,13 +49,31 @@ type MainWindow() as this =
 
     let runtime = new HarnessRuntime(codexExecutable)
 
+    let runPickerOnUiThread (picker: unit -> Task<'result>) : Async<'result> =
+        let completion = TaskCompletionSource<'result>()
+
+        Dispatcher.UIThread.Post(
+            Action(fun () ->
+                Async.StartImmediate(
+                    async {
+                        try
+                            let! result = picker () |> Async.AwaitTask
+                            completion.TrySetResult result |> ignore
+                        with error ->
+                            completion.TrySetException error |> ignore
+                    }
+                ))
+        )
+
+        completion.Task |> Async.AwaitTask
+
     let pickRepositoryFolder () =
         async {
             try
                 let options =
                     FolderPickerOpenOptions(Title = "Select a source repository", AllowMultiple = false)
 
-                let! folders = this.StorageProvider.OpenFolderPickerAsync options |> Async.AwaitTask
+                let! folders = runPickerOnUiThread (fun () -> this.StorageProvider.OpenFolderPickerAsync options)
 
                 return folders |> Seq.tryHead |> Option.map (fun folder -> folder.Path.LocalPath) |> Ok
             with error ->
@@ -42,7 +86,7 @@ type MainWindow() as this =
                 let options =
                     FolderPickerOpenOptions(Title = "Select the FsHarness data root", AllowMultiple = false)
 
-                let! folders = this.StorageProvider.OpenFolderPickerAsync options |> Async.AwaitTask
+                let! folders = runPickerOnUiThread (fun () -> this.StorageProvider.OpenFolderPickerAsync options)
 
                 return folders |> Seq.tryHead |> Option.map (fun folder -> folder.Path.LocalPath) |> Ok
             with error ->
@@ -61,7 +105,7 @@ type MainWindow() as this =
                     FilePickerOpenOptions(Title = "Load an FsHarness experiment", AllowMultiple = false)
 
                 options.FileTypeFilter <- [ experimentFileType () ]
-                let! files = this.StorageProvider.OpenFilePickerAsync options |> Async.AwaitTask
+                let! files = runPickerOnUiThread (fun () -> this.StorageProvider.OpenFilePickerAsync options)
 
                 match files |> Seq.tryHead with
                 | None -> return Ok None
@@ -70,7 +114,12 @@ type MainWindow() as this =
 
                     return
                         match ConfigFile.read path with
-                        | Ok config -> Ok(Some(path, config))
+                        | Ok config ->
+                            match ConfigFile.readDataRoot path with
+                            | Ok dataRoot -> Ok(Some(path, config, dataRoot))
+                            | Error errors ->
+                                let detail = String.concat " " errors
+                                Error $"Unable to load experiment data root: {detail}"
                         | Error errors ->
                             let detail = String.concat " " errors
                             Error $"Unable to load experiment: {detail}"
@@ -78,20 +127,20 @@ type MainWindow() as this =
                 return Error $"Unable to load experiment: {error.Message}"
         }
 
-    let saveExperiment config =
+    let saveExperiment dataRoot config =
         async {
             try
                 let options = FilePickerSaveOptions(Title = "Save the FsHarness experiment")
                 options.DefaultExtension <- "json"
                 options.SuggestedFileName <- "experiment.json"
                 options.FileTypeChoices <- [ experimentFileType () ]
-                let! file = this.StorageProvider.SaveFilePickerAsync options |> Async.AwaitTask
+                let! file = runPickerOnUiThread (fun () -> this.StorageProvider.SaveFilePickerAsync options)
 
                 match file |> Option.ofObj with
                 | None -> return Ok None
                 | Some selected ->
                     return
-                        match ConfigFile.write selected.Path.LocalPath config with
+                        match ConfigFile.writeWithDataRoot (Some dataRoot) selected.Path.LocalPath config with
                         | Ok path -> Ok(Some path)
                         | Error errors ->
                             let detail = String.concat " " errors
@@ -101,7 +150,7 @@ type MainWindow() as this =
         }
 
     do
-        base.Title <- "FsHarness · Token-Efficient Experiment Ratchet"
+        base.Title <- WindowTitle.forExperiment None
         base.Width <- 1280.0
         base.Height <- 820.0
         base.MinWidth <- 1024.0
@@ -109,10 +158,21 @@ type MainWindow() as this =
 
         this.Closed.Add(fun _ -> (runtime :> IDisposable).Dispose())
 
+        let view model dispatch =
+            this.Title <- WindowTitle.forExperiment model.ExperimentFile
+            this.FontSize <- 13.0 * model.FontScale
+            Views.view model dispatch
+
         Program.mkProgram
             (fun () -> AppState.init runtime)
-            (AppState.update runtime pickRepositoryFolder pickDataRootFolder loadExperiment saveExperiment)
-            Views.view
+            (AppState.update
+                runtime
+                pickRepositoryFolder
+                pickDataRootFolder
+                loadExperiment
+                saveExperiment
+                codexExecutable)
+            view
         |> Program.withHost this
         |> Program.runWithAvaloniaSyncDispatch ()
 

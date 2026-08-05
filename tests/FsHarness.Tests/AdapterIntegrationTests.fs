@@ -215,14 +215,17 @@ module AdapterIntegrationTests =
                   WorkingDirectory = "."
                   Timeout = TimeSpan.FromSeconds 10.0
                   RequiredConstraints = [ "build"; "tests" ]
-                  MaxInconclusiveRetries = 2 }
+                  MaxInconclusiveRetries = 2
+                  MaxInfrastructureRetries = 0
+                  InfrastructureRetryDelay = TimeSpan.FromMilliseconds 10.0 }
 
             let result =
                 Evaluator.run
-                    spec
-                    workspace
-                    workspace
-                    (Path.Combine(root, "artifacts", "evaluation.json"))
+                    { Spec = spec
+                      DerivationParentPath = workspace
+                      ChampionPath = workspace
+                      CandidatePath = workspace
+                      ResultPath = Path.Combine(root, "artifacts", "evaluation.json") }
                     CancellationToken.None
                 |> Async.RunSynchronously
 
@@ -232,5 +235,41 @@ module AdapterIntegrationTests =
                 Assert.Equal(12.34M, evaluation.Metrics["primary"])
                 Assert.True evaluation.Constraints["build"]
                 Assert.True evaluation.Constraints["tests"]
+        finally
+            Directory.Delete(root, true)
+
+    [<Fact>]
+    let ``evaluator classifies remote process failure as retryable infrastructure`` () =
+        let root = AdapterFixture.temporaryDirectory ()
+
+        try
+            let workspace = Path.Combine(root, "worktree")
+            Directory.CreateDirectory workspace |> ignore
+
+            let spec =
+                { Executable = AdapterFixture.executable "FsHarness.FakeEvaluator" "FsHarness.FakeEvaluator"
+                  Arguments = [ "--fail" ]
+                  WorkingDirectory = "."
+                  Timeout = TimeSpan.FromSeconds 10.0
+                  RequiredConstraints = []
+                  MaxInconclusiveRetries = 0
+                  MaxInfrastructureRetries = 2
+                  InfrastructureRetryDelay = TimeSpan.FromMilliseconds 10.0 }
+
+            let result =
+                Evaluator.run
+                    { Spec = spec
+                      DerivationParentPath = workspace
+                      ChampionPath = workspace
+                      CandidatePath = workspace
+                      ResultPath = Path.Combine(root, "evaluation.json") }
+                    CancellationToken.None
+                |> Async.RunSynchronously
+
+            match result with
+            | Ok _ -> Assert.Fail("The deliberately unavailable evaluator should fail.")
+            | Error error ->
+                Assert.Equal("evaluator.nonzero_exit", error.Code)
+                Assert.True error.Retryable
         finally
             Directory.Delete(root, true)

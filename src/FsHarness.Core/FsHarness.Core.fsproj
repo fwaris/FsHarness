@@ -6,6 +6,7 @@
     <Compile Include="Evaluation.fs" />
     <Compile Include="Prompt.fs" />
     <Compile Include="Evolution.fs" />
+    <Compile Include="GraphSearch.fs" />
     <Compile Include="WorkGraph.fs" />
     <Compile Include="Planning.fs" />
     <Compile Include="Agents.fs" />

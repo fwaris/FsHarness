@@ -103,6 +103,11 @@ module Protocol =
                     |> Ok
                 | _ -> Error "Missing required string array 'validationNotes'."
 
+            let hypothesisFamily =
+                tryString "hypothesisFamily" root
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.defaultValue "general"
+
             match
                 requiredString "hypothesis" root,
                 requiredString "changeSummary" root,
@@ -112,7 +117,8 @@ module Protocol =
             with
             | Ok hypothesis, Ok change, Ok effect, Ok validationNotes, Ok lesson ->
                 Ok
-                    { Hypothesis = hypothesis
+                    { HypothesisFamily = hypothesisFamily
+                      Hypothesis = hypothesis
                       ChangeSummary = change
                       ExpectedEffect = effect
                       ValidationNotes = validationNotes

@@ -1,6 +1,7 @@
 namespace FsHarness.Tests
 
 open System
+open System.IO
 open System.Threading
 open Avalonia
 open Avalonia.Controls
@@ -24,6 +25,103 @@ type HeadlessAppBuilder =
         AppBuilder.Configure<App>().UseSkia().UseHeadless(options)
 
 module UiTests =
+    let private update runtime message model =
+        AppState.update
+            runtime
+            (fun () -> async { return Ok None })
+            (fun () -> async { return Ok None })
+            (fun () -> async { return Ok None })
+            (fun _ _ -> async { return Ok None })
+            "codex"
+            message
+            model
+
+    [<Fact>]
+    let ``font controls clamp the UI scale`` () =
+        use runtime = new HarnessRuntime("codex")
+        let model, _ = AppState.init runtime
+
+        let enlarged, _ = update runtime IncreaseFont model
+        Assert.Equal(1.1, enlarged.FontScale, 5)
+
+        let minimum = { model with FontScale = 0.8 }
+        let unchanged, _ = update runtime DecreaseFont minimum
+        Assert.Equal(0.8, unchanged.FontScale, 5)
+
+    [<Fact>]
+    let ``window title keeps the loaded filename and compacts its directory`` () =
+        let fileName = "important-campaign-settings.json"
+        let directory = $"/a/{String('b', 80)}/campaigns"
+        let title = WindowTitle.forExperiment (Some(Path.Combine(directory, fileName)))
+
+        Assert.Contains(fileName, title)
+        Assert.Contains("…", title)
+        Assert.DoesNotContain(String('b', 80), title)
+
+    [<Fact>]
+    let ``unchanged text notifications preserve the loaded campaign`` () =
+        use runtime = new HarnessRuntime("codex")
+        let model, _ = AppState.init runtime
+
+        let loaded =
+            { model with
+                ExperimentFile = Some "/tmp/campaign.json" }
+
+        let updated, _ =
+            update runtime (DraftChanged(DraftField.Objective, loaded.Draft.Objective)) loaded
+
+        Assert.Equal(loaded, updated)
+
+    [<Fact>]
+    let ``headless campaign launch persists liveness and stop control`` () =
+        if not (OperatingSystem.IsWindows()) then
+            lock typeof<HeadlessCampaignStatus> (fun () ->
+                let directory =
+                    Path.Combine(Path.GetTempPath(), $"fsharness-headless-{Guid.NewGuid():N}")
+
+                Directory.CreateDirectory directory |> ignore
+                let executable = Path.Combine(directory, "fake-fsharness")
+                let configPath = Path.Combine(directory, "campaign.json")
+                let dataRoot = Path.Combine(directory, "data")
+                File.WriteAllText(executable, "#!/bin/sh\nsleep 1\n")
+
+                File.SetUnixFileMode(
+                    executable,
+                    UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
+                )
+
+                File.WriteAllText(configPath, "{}")
+                let previous = Environment.GetEnvironmentVariable "FSHARNESS_CLI_PATH"
+
+                try
+                    Environment.SetEnvironmentVariable("FSHARNESS_CLI_PATH", executable)
+
+                    let launched =
+                        match HeadlessCampaign.launch configPath dataRoot "codex" with
+                        | Ok status -> status
+                        | Error error -> failwith error
+
+                    Assert.True(launched.IsRunning, $"Unexpected launch status: {launched}")
+                    Assert.True(launched.ProcessId.IsSome)
+                    Assert.Equal(Ok(), HeadlessCampaign.requestStop configPath dataRoot)
+                finally
+                    Environment.SetEnvironmentVariable("FSHARNESS_CLI_PATH", previous)
+                    Directory.Delete(directory, true))
+
+    [<Fact>]
+    let ``evolution monitor polling leaves the manual graph model unchanged`` () =
+        use runtime = new HarnessRuntime("codex")
+        let model, _ = AppState.init runtime
+
+        let evolutionModel =
+            { model with
+                Page = Evolution
+                EvolutionRequestId = 42
+                EvolutionBusy = false }
+
+        let updated, _ = update runtime PollMonitor evolutionModel
+        Assert.Equal(evolutionModel, updated)
+
     [<Fact>]
     let ``evolution page constructs a selectable graph and score view`` () =
         use runtime = new HarnessRuntime("codex")
@@ -51,6 +149,9 @@ module UiTests =
         let snapshot =
             { Run = run
               Frontier = Some candidate
+              Edges = []
+              Champion = Some candidate
+              ActiveHeads = Set.singleton candidate
               Warnings = []
               Nodes =
                 [ { Id = ExperimentNode experimentId
@@ -76,6 +177,89 @@ module UiTests =
                 Evolution = Some snapshot }
 
         Assert.NotNull(Views.view evolutionModel ignore)
+
+    [<Fact>]
+    let ``evolution layout renders siblings and real synthesis as a diamond`` () =
+        let now = DateTimeOffset.UtcNow
+        let runId = RunId.create ()
+        let baseline = CommitOid.create (String('a', 40))
+        let first = CommitOid.create (String('b', 40))
+        let second = CommitOid.create (String('c', 40))
+        let synthesis = CommitOid.create (String('d', 40))
+
+        let node sequence commit parent metric =
+            { Id = ExperimentNode(ExperimentId.create ())
+              Kind = EvolutionNodeKind.Candidate
+              Sequence = sequence
+              Parent = Some parent
+              Commit = Some commit
+              Outcome = EvolutionOutcome.Rejected "valid retained"
+              Metric = Some metric
+              RetainedScore = Some metric
+              Summary = None
+              EvaluationSummary = Some "ok"
+              Usage = None
+              StartedAt = now
+              UpdatedAt = now
+              Label = $"Attempt {sequence}" }
+
+        let firstNode = node 1 first baseline 2M
+        let secondNode = node 2 second baseline 1.5M
+
+        let synthesisNode =
+            { node 3 synthesis first 3M with
+                Outcome = EvolutionOutcome.Accepted }
+
+        let edge parent child kind role =
+            { Id = $"{CommitOid.value parent}:{CommitOid.value child}:{role}"
+              Parent = parent
+              Child = child
+              Kind = kind
+              Role = role }
+
+        let snapshot =
+            { Run =
+                { Id = runId
+                  SourcePath = "/source"
+                  Status = "Completed"
+                  CreatedAt = now
+                  UpdatedAt = now
+                  MetricName = "primary"
+                  Direction = Maximize
+                  BaselineCommit = Some baseline
+                  BaselineScore = Some 1M
+                  FrontierScore = Some 3M
+                  AttemptCount = 3
+                  AcceptedCount = 1 }
+              Frontier = Some synthesis
+              Champion = Some synthesis
+              ActiveHeads = Set [ first; second; synthesis ]
+              Edges =
+                [ edge baseline first ExperimentKind.Expansion ExperimentParentRole.Primary
+                  edge baseline second ExperimentKind.Expansion ExperimentParentRole.Primary
+                  edge first synthesis ExperimentKind.Synthesis ExperimentParentRole.Primary
+                  edge second synthesis ExperimentKind.Synthesis ExperimentParentRole.Contributor ]
+              Warnings = []
+              Nodes = [ firstNode; secondNode; synthesisNode ] }
+
+        let layout = EvolutionLayout.build snapshot
+
+        let firstPosition =
+            layout.Nodes |> List.find (fun item -> item.Node.Commit = Some first)
+
+        let secondPosition =
+            layout.Nodes |> List.find (fun item -> item.Node.Commit = Some second)
+
+        let synthesisPosition =
+            layout.Nodes |> List.find (fun item -> item.Node.Commit = Some synthesis)
+
+        Assert.Equal(4, layout.Edges.Length)
+        Assert.Equal(firstPosition.X, secondPosition.X)
+        Assert.NotEqual(firstPosition.Y, secondPosition.Y)
+        Assert.True(synthesisPosition.X > firstPosition.X)
+        Assert.True synthesisPosition.IsSynthesis
+        Assert.True synthesisPosition.IsChampion
+        Assert.Equal(3, layout.Scores.Length)
 
     [<Fact>]
     let ``shell renders at both supported viewport sizes and accepts keyboard focus`` () =
@@ -162,7 +346,8 @@ module UiTests =
                 (fun () -> async { return Ok None })
                 (fun () -> async { return Ok None })
                 (fun () -> async { return Ok None })
-                (fun _ -> async { return Ok None })
+                (fun _ _ -> async { return Ok None })
+                "codex"
                 (RepositoryFolderSelected(Ok(Some selectedPath)))
                 { model with
                     Repository = Some inspected }
@@ -184,7 +369,9 @@ module UiTests =
                   WorkingDirectory = "."
                   Timeout = TimeSpan.FromHours 3.0
                   RequiredConstraints = [ "tests" ]
-                  MaxInconclusiveRetries = 2 }
+                  MaxInconclusiveRetries = 2
+                  MaxInfrastructureRetries = 120
+                  InfrastructureRetryDelay = TimeSpan.FromSeconds 15.0 }
               Metric =
                 { Name = "paired_speed_index_lcb"
                   Direction = Maximize
@@ -199,6 +386,7 @@ module UiTests =
                   MaxMemoryCharacters = 2_000
                   MaxEvaluationFindings = 3
                   MaxEvaluationCharacters = 1_000 }
+              GraphSearch = Defaults.graphSearch
               Budgets =
                 { Defaults.budgets with
                     MaxExperiments = 3
@@ -211,8 +399,9 @@ module UiTests =
                 (fun () -> async { return Ok None })
                 (fun () -> async { return Ok None })
                 (fun () -> async { return Ok None })
-                (fun _ -> async { return Ok None })
-                (ExperimentLoaded(Ok(Some("C:\\experiment.json", loadedConfig))))
+                (fun _ _ -> async { return Ok None })
+                "codex"
+                (ExperimentLoaded(Ok(Some("C:\\experiment.json", loadedConfig, None))))
                 selected
 
         Assert.Equal("Loaded objective", loaded.Draft.Objective)

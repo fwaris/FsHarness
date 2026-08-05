@@ -6,18 +6,43 @@ open System.Text.Json
 
 module Program =
     [<EntryPoint>]
-    let main _ =
+    let main args =
         let resultPath = Environment.GetEnvironmentVariable "FSHARNESS_RESULT_PATH"
         let candidatePath = Environment.GetEnvironmentVariable "FSHARNESS_CANDIDATE_PATH"
         let frontierPath = Environment.GetEnvironmentVariable "FSHARNESS_FRONTIER_PATH"
+        let parentPath = Environment.GetEnvironmentVariable "FSHARNESS_PARENT_PATH"
+        let championPath = Environment.GetEnvironmentVariable "FSHARNESS_CHAMPION_PATH"
 
-        match resultPath, candidatePath, frontierPath with
-        | resultPath, candidatePath, frontierPath when
+        let failCountFile =
+            args
+            |> Array.tryFindIndex ((=) "--fail-count-file")
+            |> Option.bind (fun index -> args |> Array.tryItem (index + 1))
+
+        let requestedFailure =
+            if args |> Array.contains "--fail" then
+                true
+            else
+                match failCountFile with
+                | Some path when File.Exists path ->
+                    match Int32.TryParse(File.ReadAllText path) with
+                    | true, remaining when remaining > 0 ->
+                        File.WriteAllText(path, string (remaining - 1))
+                        true
+                    | _ -> false
+                | _ -> false
+
+        match resultPath, candidatePath, frontierPath, parentPath, championPath with
+        | resultPath, candidatePath, frontierPath, parentPath, championPath when
             not (String.IsNullOrWhiteSpace resultPath)
             && not (String.IsNullOrWhiteSpace candidatePath)
             && not (String.IsNullOrWhiteSpace frontierPath)
+            && not (String.IsNullOrWhiteSpace parentPath)
+            && not (String.IsNullOrWhiteSpace championPath)
             ->
-            if Environment.GetEnvironmentVariable "FSHARNESS_FAKE_EVALUATOR_FAIL" = "1" then
+            if
+                requestedFailure
+                || Environment.GetEnvironmentVariable "FSHARNESS_FAKE_EVALUATOR_FAIL" = "1"
+            then
                 Console.Error.WriteLine "requested evaluator infrastructure failure"
                 23
             else

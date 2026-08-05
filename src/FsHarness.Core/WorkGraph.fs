@@ -12,6 +12,9 @@ type WorkGraphNode =
 type WorkGraph =
     { Baseline: CommitOid
       Frontier: CommitOid
+      Champion: CommitOid
+      ActiveHeads: Set<CommitOid>
+      Edges: EvolutionEdge list
       Nodes: Map<CommitOid, WorkGraphNode> }
 
 [<RequireQualifiedAccess>]
@@ -50,32 +53,59 @@ module WorkGraph =
                 |> Map.ofList
                 |> Map.add baseline baselineNode
 
-            if not (Map.containsKey frontier nodes) then
+            let champion = snapshot.Champion |> Option.defaultValue frontier
+
+            let edges =
+                if List.isEmpty snapshot.Edges then
+                    nodes
+                    |> Map.values
+                    |> Seq.choose (fun node ->
+                        node.Parent
+                        |> Option.map (fun parent ->
+                            { Id = $"legacy:{CommitOid.value parent}:{CommitOid.value node.Commit}"
+                              Parent = parent
+                              Child = node.Commit
+                              Kind = ExperimentKind.Expansion
+                              Role = ExperimentParentRole.Primary }))
+                    |> List.ofSeq
+                else
+                    snapshot.Edges
+
+            if not (Map.containsKey champion nodes) then
                 Error(
-                    graphError
-                        "work_graph.frontier_missing"
-                        "The retained frontier is not present in the persisted work graph."
+                    graphError "work_graph.champion_missing" "The champion is not present in the persisted work graph."
                 )
             else
                 let missingParents =
-                    nodes
-                    |> Map.values
-                    |> Seq.choose _.Parent
+                    edges
+                    |> Seq.map _.Parent
                     |> Seq.filter (fun parent -> not (Map.containsKey parent nodes))
                     |> Seq.distinct
                     |> Seq.toList
 
-                if List.isEmpty missingParents then
+                let missingChildren =
+                    edges
+                    |> Seq.map _.Child
+                    |> Seq.filter (fun child -> not (Map.containsKey child nodes))
+                    |> Seq.distinct
+                    |> Seq.toList
+
+                if List.isEmpty missingParents && List.isEmpty missingChildren then
                     Ok
                         { Baseline = baseline
                           Frontier = frontier
+                          Champion = champion
+                          ActiveHeads = snapshot.ActiveHeads
+                          Edges = edges
                           Nodes = nodes }
                 else
                     Error(
-                        graphError
-                            "work_graph.parent_missing"
-                            "One or more work-graph nodes refer to a missing parent commit."
-                        |> HarnessError.withDetail (missingParents |> List.map CommitOid.value |> String.concat ", ")
+                        graphError "work_graph.parent_missing" "One or more work-graph edges refer to a missing commit."
+                        |> HarnessError.withDetail (
+                            (missingParents @ missingChildren)
+                            |> List.map CommitOid.value
+                            |> String.concat ", "
+                        )
                     )
         | _ ->
             Error(graphError "work_graph.root_missing" "The persisted work graph has no verified baseline or frontier.")
@@ -83,14 +113,28 @@ module WorkGraph =
     let tryFind commit graph = Map.tryFind commit graph.Nodes
 
     let children parent graph =
-        graph.Nodes
-        |> Map.values
-        |> Seq.filter (fun node -> node.Parent = Some parent)
+        graph.Edges
+        |> Seq.filter (fun edge -> edge.Parent = parent)
+        |> Seq.choose (fun edge -> Map.tryFind edge.Child graph.Nodes)
+        |> Seq.distinctBy _.Commit
         |> Seq.sortBy _.Sequence
         |> List.ofSeq
 
+    let parents child graph =
+        graph.Edges
+        |> List.filter (fun edge -> edge.Child = child)
+        |> List.sortBy (fun edge ->
+            match edge.Role with
+            | ExperimentParentRole.Primary -> 0
+            | ExperimentParentRole.Contributor -> 1)
+
+    let activeHeads graph =
+        graph.ActiveHeads
+        |> Set.toList
+        |> List.choose (fun commit -> Map.tryFind commit graph.Nodes)
+
     let leaves graph =
-        let parents = graph.Nodes |> Map.values |> Seq.choose _.Parent |> Set.ofSeq
+        let parents = graph.Edges |> Seq.map _.Parent |> Set.ofSeq
 
         graph.Nodes
         |> Map.values
@@ -109,10 +153,37 @@ module WorkGraph =
                         graphError "work_graph.commit_missing" "The requested commit is not present in the work graph."
                     )
                 | Some node ->
-                    match node.Parent with
+                    match
+                        parents current graph
+                        |> List.tryFind (fun edge -> edge.Role = ExperimentParentRole.Primary)
+                    with
                     | None -> Ok(node :: collected)
-                    | Some parent -> walk (Set.add current visited) parent (node :: collected)
+                    | Some edge -> walk (Set.add current visited) edge.Parent (node :: collected)
 
         walk Set.empty commit []
+
+    let ancestors commit graph =
+        let rec walk pending visited =
+            match pending with
+            | [] -> visited
+            | current :: remaining when Set.contains current visited -> walk remaining visited
+            | current :: remaining ->
+                let next = parents current graph |> List.map _.Parent
+                walk (next @ remaining) (Set.add current visited)
+
+        parents commit graph |> List.map _.Parent |> (fun roots -> walk roots Set.empty)
+
+    let descendants commit graph =
+        let rec walk pending visited =
+            match pending with
+            | [] -> visited
+            | current :: remaining when Set.contains current visited -> walk remaining visited
+            | current :: remaining ->
+                let next = children current graph |> List.map _.Commit
+                walk (next @ remaining) (Set.add current visited)
+
+        children commit graph
+        |> List.map _.Commit
+        |> fun roots -> walk roots Set.empty
 
     let contains commit graph = Map.containsKey commit graph.Nodes

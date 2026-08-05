@@ -6,11 +6,14 @@ open System.Text
 type PromptContext =
     { Objective: string
       EditablePaths: string list
-      FrontierScore: decimal
+      ParentCommit: CommitOid option
+      ChampionCommit: CommitOid option
+      ChampionScore: decimal
       Metric: MetricSpec
       Profile: PromptProfile
       PreviousEvaluation: EvaluationResult option
-      Memories: MemorySummary list }
+      Memories: MemorySummary list
+      GraphContext: string option }
 
 [<RequireQualifiedAccess>]
 module Prompt =
@@ -102,9 +105,15 @@ module Prompt =
         builder.AppendLine() |> ignore
 
         builder.AppendLine(
-            $"Primary metric: {context.Metric.Name}; direction: {direction}; retained score: {context.FrontierScore}; required minimum delta: {context.Metric.MinDelta}."
+            $"Primary metric: {context.Metric.Name}; direction: {direction}; champion score: {context.ChampionScore}; required minimum delta: {context.Metric.MinDelta}."
         )
         |> ignore
+
+        context.ParentCommit
+        |> Option.iter (fun parent -> builder.AppendLine($"Derivation parent: {CommitOid.value parent}") |> ignore)
+
+        context.ChampionCommit
+        |> Option.iter (fun champion -> builder.AppendLine($"Current champion: {CommitOid.value champion}") |> ignore)
 
         let editablePaths = String.concat ", " context.EditablePaths
         builder.AppendLine($"Editable paths: {editablePaths}") |> ignore
@@ -131,6 +140,17 @@ module Prompt =
 
             memories
             |> List.iteri (fun index memory -> builder.AppendLine($"[{index + 1}] {memory}") |> ignore)
+
+        context.GraphContext
+        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        |> Option.iter (fun graphContext ->
+            builder.AppendLine() |> ignore
+
+            builder.AppendLine("Bounded repository knowledge graph context (cite stable edge IDs):")
+            |> ignore
+
+            builder.AppendLine(truncate context.Profile.MaxMemoryCharacters graphContext)
+            |> ignore)
 
         builder.AppendLine() |> ignore
 

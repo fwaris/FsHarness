@@ -50,6 +50,7 @@ module GitStoreTests =
         Directory.CreateDirectory(Path.Combine(source, "src")) |> ignore
         runGit source [ "init"; "--quiet" ] |> ignore
         File.WriteAllText(Path.Combine(source, "src", "score.txt"), "1")
+        File.WriteAllText(Path.Combine(source, "src", "other.txt"), "baseline")
         File.WriteAllText(Path.Combine(source, "protected.txt"), "original")
         runGit source [ "add"; "." ] |> ignore
 
@@ -103,7 +104,13 @@ module GitStoreTests =
             let experimentId = ExperimentId.create ()
 
             let workspace =
-                port.PrepareCandidate runId experimentId inspection.Head CancellationToken.None
+                port.PrepareCandidate
+                    runId
+                    experimentId
+                    [ { Commit = inspection.Head
+                        Role = ExperimentParentRole.Primary } ]
+                    inspection.Head
+                    CancellationToken.None
                 |> Async.RunSynchronously
                 |> getResult
 
@@ -163,7 +170,13 @@ module GitStoreTests =
             let experimentId = ExperimentId.create ()
 
             let workspace =
-                port.PrepareCandidate runId experimentId inspection.Head CancellationToken.None
+                port.PrepareCandidate
+                    runId
+                    experimentId
+                    [ { Commit = inspection.Head
+                        Role = ExperimentParentRole.Primary } ]
+                    inspection.Head
+                    CancellationToken.None
                 |> Async.RunSynchronously
                 |> getResult
 
@@ -226,7 +239,13 @@ module GitStoreTests =
             |> getResult
 
             let workspace =
-                port.PrepareCandidate runId (ExperimentId.create ()) inspection.Head CancellationToken.None
+                port.PrepareCandidate
+                    runId
+                    (ExperimentId.create ())
+                    [ { Commit = inspection.Head
+                        Role = ExperimentParentRole.Primary } ]
+                    inspection.Head
+                    CancellationToken.None
                 |> Async.RunSynchronously
                 |> getResult
 
@@ -236,3 +255,94 @@ module GitStoreTests =
 
             Assert.Equal("2", File.ReadAllText(Path.Combine(workspace.GenerationPath, "src", "score.txt")))
             Assert.Equal("1", File.ReadAllText(Path.Combine(source, "src", "score.txt"))))
+
+    [<Fact>]
+    let ``clean synthesis creates a real two-parent commit`` () =
+        withTempDirectory (fun directory ->
+            let source = createRepository directory
+            let dataRoot = Path.Combine(directory, "data")
+            let store = GitStore.create dataRoot
+            let port = GitStore.port store
+
+            let inspection =
+                port.InspectSource source CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let runId = RunId.create ()
+
+            port.CreateRun runId inspection CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            let capture (path: string) (value: string) =
+                let experimentId = ExperimentId.create ()
+
+                let workspace =
+                    port.PrepareCandidate
+                        runId
+                        experimentId
+                        [ { Commit = inspection.Head
+                            Role = ExperimentParentRole.Primary } ]
+                        inspection.Head
+                        CancellationToken.None
+                    |> Async.RunSynchronously
+                    |> getResult
+
+                File.WriteAllText(Path.Combine(workspace.GenerationPath, path), value)
+
+                port.CaptureCandidate runId workspace [ "src/**" ] CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let first = capture (Path.Combine("src", "score.txt")) "2"
+            let second = capture (Path.Combine("src", "other.txt")) "donor"
+            let synthesisId = ExperimentId.create ()
+
+            let analysis =
+                port.AnalyzeSynthesis runId first.Commit second.Commit CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.True analysis.CleanMerge
+            Assert.Equal(0, analysis.ChangedPathOverlap)
+
+            let synthesisWorkspace =
+                match
+                    port.PrepareSynthesis
+                        runId
+                        synthesisId
+                        first.Commit
+                        second.Commit
+                        first.Commit
+                        CancellationToken.None
+                    |> Async.RunSynchronously
+                    |> getResult
+                with
+                | SynthesisPreparation.Clean workspace -> workspace
+                | SynthesisPreparation.Conflicted _ -> failwith "Independent edits should merge cleanly."
+
+            let merged =
+                port.CaptureCandidate runId synthesisWorkspace [ "src/**" ] CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let privateRepo = DataPaths.repository dataRoot runId
+
+            let parents =
+                runGit
+                    directory
+                    [ "--git-dir"
+                      privateRepo
+                      "rev-list"
+                      "--parents"
+                      "-n"
+                      "1"
+                      CommitOid.value merged.Commit ]
+                |> fun line -> line.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+
+            Assert.Equal(3, parents.Length)
+            Assert.Equal(CommitOid.value first.Commit, parents[1])
+            Assert.Equal(CommitOid.value second.Commit, parents[2])
+            Assert.Equal("2", File.ReadAllText(Path.Combine(merged.EvaluationPath, "src", "score.txt")))
+            Assert.Equal("donor", File.ReadAllText(Path.Combine(merged.EvaluationPath, "src", "other.txt"))))

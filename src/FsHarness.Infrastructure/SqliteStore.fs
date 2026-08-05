@@ -17,6 +17,7 @@ type HistoryEvent =
       ExperimentId: ExperimentId option
       Kind: string
       Payload: string
+      Usage: TokenUsage option
       CreatedAt: DateTimeOffset }
 
 type StoredRun =
@@ -35,6 +36,54 @@ type StoredExperiment =
       Candidate: CommitOid option
       Outcome: string
       CreatedAt: DateTimeOffset
+      UpdatedAt: DateTimeOffset }
+
+type StoredExperimentEdge =
+    { Id: string
+      RunId: RunId
+      ExperimentId: ExperimentId
+      Parent: CommitOid
+      Child: CommitOid option
+      Kind: ExperimentKind
+      Role: ExperimentParentRole
+      CreatedAt: DateTimeOffset }
+
+type StoredExperimentGraphState =
+    { RunId: RunId
+      ExperimentId: ExperimentId
+      Kind: ExperimentKind
+      Validity: EvaluationValidity
+      ChampionDecision: ChampionDecision
+      SearchStatus: SearchStatus
+      ChampionAtStart: CommitOid
+      HypothesisFamily: string
+      SynthesisDepth: int
+      UpdatedAt: DateTimeOffset }
+
+type StoredSearchHead =
+    { RunId: RunId
+      Commit: CommitOid
+      Round: int
+      Status: SearchStatus
+      UpdatedAt: DateTimeOffset }
+
+type StoredSearchRound =
+    { RunId: RunId
+      Round: int
+      Heads: CommitOid list
+      CompletedHeads: Set<CommitOid>
+      OrdinarySinceSynthesis: int
+      Status: string
+      UpdatedAt: DateTimeOffset }
+
+type StoredSynthesisAttempt =
+    { RunId: RunId
+      Primary: CommitOid
+      Contributor: CommitOid
+      PolicyVersion: int
+      Status: string
+      ExperimentId: ExperimentId option
+      FailureDetail: string option
       UpdatedAt: DateTimeOffset }
 
 type StoredEvaluation =
@@ -99,6 +148,21 @@ module SqliteStore =
                 Directory.CreateDirectory(Path.GetDirectoryName store.DatabasePath) |> ignore
                 use database = connection store
                 database.Open()
+
+                use versionCommand = database.CreateCommand()
+                versionCommand.CommandText <- "PRAGMA user_version;"
+                let previousVersion = versionCommand.ExecuteScalar() |> Convert.ToInt32
+
+                if previousVersion > 0 && previousVersion < 6 then
+                    let backupPath = store.DatabasePath + ".pre-v6.bak"
+
+                    if not (File.Exists backupPath) then
+                        let backupBuilder = SqliteConnectionStringBuilder()
+                        backupBuilder.DataSource <- backupPath
+                        backupBuilder.Mode <- SqliteOpenMode.ReadWriteCreate
+                        use backup = new SqliteConnection(backupBuilder.ToString())
+                        backup.Open()
+                        database.BackupDatabase backup
 
                 use command = database.CreateCommand()
 
@@ -270,6 +334,292 @@ module SqliteStore =
                     );
                     CREATE INDEX IF NOT EXISTS knowledge_claim_lookup
                         ON knowledge_claims(run_id, subject_id, predicate);
+                    CREATE TABLE IF NOT EXISTS experiment_edges (
+                        id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        experiment_id TEXT NOT NULL,
+                        parent_oid TEXT NOT NULL,
+                        child_oid TEXT,
+                        edge_kind TEXT NOT NULL,
+                        parent_role TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(run_id, experiment_id, parent_oid, parent_role),
+                        FOREIGN KEY(run_id) REFERENCES runs(id),
+                        FOREIGN KEY(experiment_id) REFERENCES experiments(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS experiment_edges_parent
+                        ON experiment_edges(run_id, parent_oid, created_at);
+                    CREATE INDEX IF NOT EXISTS experiment_edges_child
+                        ON experiment_edges(run_id, child_oid, created_at);
+                    CREATE TABLE IF NOT EXISTS experiment_graph_state (
+                        run_id TEXT NOT NULL,
+                        experiment_id TEXT PRIMARY KEY,
+                        experiment_kind TEXT NOT NULL,
+                        evaluation_validity TEXT NOT NULL,
+                        validity_detail TEXT,
+                        champion_decision TEXT NOT NULL,
+                        search_status TEXT NOT NULL,
+                        champion_at_start TEXT NOT NULL,
+                        hypothesis_family TEXT NOT NULL,
+                        synthesis_depth INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(run_id) REFERENCES runs(id),
+                        FOREIGN KEY(experiment_id) REFERENCES experiments(id)
+                    );
+                    CREATE TABLE IF NOT EXISTS champion_history (
+                        run_id TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        commit_oid TEXT NOT NULL,
+                        score TEXT,
+                        experiment_id TEXT,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(run_id, sequence),
+                        FOREIGN KEY(run_id) REFERENCES runs(id)
+                    );
+                    CREATE TABLE IF NOT EXISTS active_heads (
+                        run_id TEXT NOT NULL,
+                        commit_oid TEXT NOT NULL,
+                        round INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(run_id, commit_oid),
+                        FOREIGN KEY(run_id) REFERENCES runs(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS active_heads_round
+                        ON active_heads(run_id, round, status);
+                    CREATE TABLE IF NOT EXISTS search_rounds (
+                        run_id TEXT NOT NULL,
+                        round INTEGER NOT NULL,
+                        heads_json TEXT NOT NULL,
+                        completed_heads_json TEXT NOT NULL,
+                        ordinary_since_synthesis INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(run_id, round),
+                        FOREIGN KEY(run_id) REFERENCES runs(id)
+                    );
+                    CREATE TABLE IF NOT EXISTS synthesis_attempts (
+                        run_id TEXT NOT NULL,
+                        primary_oid TEXT NOT NULL,
+                        contributor_oid TEXT NOT NULL,
+                        policy_version INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        experiment_id TEXT,
+                        detail TEXT,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(run_id, primary_oid, contributor_oid, policy_version),
+                        FOREIGN KEY(run_id) REFERENCES runs(id)
+                    );
+                    CREATE TABLE IF NOT EXISTS knowledge_graph_nodes (
+                        project_id TEXT NOT NULL,
+                        id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        canonical_name TEXT NOT NULL,
+                        attributes_json TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        origin_run_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(project_id, id, version),
+                        FOREIGN KEY(project_id) REFERENCES projects(id),
+                        FOREIGN KEY(origin_run_id) REFERENCES runs(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS knowledge_graph_nodes_current
+                        ON knowledge_graph_nodes(project_id, id, version DESC);
+                    CREATE TABLE IF NOT EXISTS knowledge_graph_edges (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        from_id TEXT NOT NULL,
+                        relation TEXT NOT NULL,
+                        to_id TEXT NOT NULL,
+                        confidence TEXT NOT NULL,
+                        is_inference INTEGER NOT NULL,
+                        rationale TEXT,
+                        source_ids_json TEXT NOT NULL,
+                        origin_run_id TEXT NOT NULL,
+                        valid_from TEXT NOT NULL,
+                        valid_to TEXT,
+                        FOREIGN KEY(project_id) REFERENCES projects(id),
+                        FOREIGN KEY(origin_run_id) REFERENCES runs(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS knowledge_graph_edges_from
+                        ON knowledge_graph_edges(project_id, from_id, relation, valid_to);
+                    CREATE INDEX IF NOT EXISTS knowledge_graph_edges_to
+                        ON knowledge_graph_edges(project_id, to_id, relation, valid_to);
+                    CREATE TABLE IF NOT EXISTS graph_updates (
+                        idempotency_key TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        agent_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(project_id) REFERENCES projects(id),
+                        FOREIGN KEY(run_id) REFERENCES runs(id)
+                    );
+                    INSERT OR IGNORE INTO experiment_edges(
+                        id, run_id, experiment_id, parent_oid, child_oid,
+                        edge_kind, parent_role, created_at)
+                    SELECT run_id || ':' || id || ':primary', run_id, id, parent_oid,
+                           candidate_oid, 'expanded-from', 'primary', created_at
+                    FROM experiments
+                    WHERE parent_oid IS NOT NULL;
+                    INSERT OR IGNORE INTO champion_history(
+                        run_id, sequence, commit_oid, score, experiment_id, created_at)
+                    SELECT runs.id, 0,
+                           COALESCE(
+                               (SELECT candidate_oid FROM experiments accepted
+                                WHERE accepted.run_id = runs.id
+                                  AND accepted.outcome = 'Accepted'
+                                  AND accepted.candidate_oid IS NOT NULL
+                                ORDER BY accepted.sequence DESC LIMIT 1),
+                               json_extract(runs.config_json, '$.baseCommit')),
+                           NULL, NULL, runs.created_at
+                    FROM runs
+                    WHERE COALESCE(
+                              (SELECT candidate_oid FROM experiments accepted
+                               WHERE accepted.run_id = runs.id
+                                 AND accepted.outcome = 'Accepted'
+                                 AND accepted.candidate_oid IS NOT NULL
+                               ORDER BY accepted.sequence DESC LIMIT 1),
+                              json_extract(runs.config_json, '$.baseCommit')) IS NOT NULL;
+                    INSERT OR IGNORE INTO champion_history(
+                        run_id, sequence, commit_oid, score, experiment_id, created_at)
+                    SELECT experiments.run_id, experiments.sequence, experiments.candidate_oid,
+                           json_extract(evaluations.result_json,
+                               '$.metrics.' || json_extract(runs.config_json, '$.metric.name')),
+                           experiments.id, experiments.updated_at
+                    FROM experiments
+                    JOIN runs ON runs.id = experiments.run_id
+                    LEFT JOIN evaluations ON evaluations.experiment_id = experiments.id
+                    WHERE experiments.outcome = 'Accepted'
+                      AND experiments.candidate_oid IS NOT NULL
+                      AND experiments.sequence > 0;
+                    INSERT OR IGNORE INTO active_heads(run_id, commit_oid, round, status, updated_at)
+                    SELECT run_id, commit_oid, 0, 'active', created_at
+                    FROM champion_history champion
+                    WHERE sequence = (
+                        SELECT MAX(sequence) FROM champion_history latest
+                        WHERE latest.run_id = champion.run_id);
+                    INSERT OR IGNORE INTO active_heads(run_id, commit_oid, round, status, updated_at)
+                    SELECT run_id, candidate_oid, 0, 'active', updated_at
+                    FROM (
+                        SELECT experiments.*,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY run_id ORDER BY sequence DESC, candidate_oid) AS retained_rank
+                        FROM experiments
+                        WHERE candidate_oid IS NOT NULL
+                          AND outcome LIKE 'Rejected%'
+                          AND outcome NOT LIKE '%Constraint%'
+                          AND outcome NOT LIKE '%Protected%'
+                          AND outcome NOT LIKE '%Metric missing%'
+                          AND outcome NOT LIKE '%Inconclusive%') retained
+                    WHERE retained_rank <= 3;
+                    INSERT OR IGNORE INTO experiment_graph_state(
+                        run_id, experiment_id, experiment_kind, evaluation_validity,
+                        validity_detail, champion_decision, search_status,
+                        champion_at_start, hypothesis_family, synthesis_depth, updated_at)
+                    SELECT experiments.run_id,
+                           experiments.id,
+                           CASE WHEN (
+                               SELECT COUNT(*) FROM experiment_edges edges
+                               WHERE edges.experiment_id = experiments.id) > 1
+                               THEN 'synthesis' ELSE 'expansion' END,
+                           CASE
+                               WHEN experiments.outcome = 'Accepted' THEN 'valid'
+                               WHEN experiments.outcome LIKE 'Rejected%'
+                                    AND experiments.candidate_oid IS NOT NULL
+                                    AND experiments.outcome NOT LIKE '%Constraint%'
+                                    AND experiments.outcome NOT LIKE '%Protected%'
+                                    AND experiments.outcome NOT LIKE '%Metric missing%'
+                                   THEN 'valid'
+                               WHEN experiments.outcome LIKE 'Inconclusive%' THEN 'inconclusive'
+                               WHEN experiments.outcome = 'Active' THEN 'pending'
+                               ELSE 'infrastructure-failed'
+                           END,
+                           experiments.outcome,
+                           CASE WHEN experiments.outcome = 'Accepted'
+                                THEN 'promoted' ELSE 'not-promoted' END,
+                           CASE WHEN EXISTS(
+                               SELECT 1 FROM active_heads heads
+                               WHERE heads.run_id = experiments.run_id
+                                 AND heads.commit_oid = experiments.candidate_oid)
+                                THEN 'active-head'
+                                WHEN experiments.outcome = 'Accepted'
+                                  OR experiments.outcome LIKE 'Rejected%'
+                                THEN 'retained'
+                                ELSE 'archived' END,
+                           COALESCE(experiments.parent_oid,
+                                    json_extract(runs.config_json, '$.baseCommit')),
+                           'legacy',
+                           CASE WHEN (
+                               SELECT COUNT(*) FROM experiment_edges edges
+                               WHERE edges.experiment_id = experiments.id) > 1
+                               THEN 1 ELSE 0 END,
+                           experiments.updated_at
+                    FROM experiments
+                    JOIN runs ON runs.id = experiments.run_id
+                    WHERE COALESCE(experiments.parent_oid,
+                                   json_extract(runs.config_json, '$.baseCommit')) IS NOT NULL;
+                    CREATE TABLE IF NOT EXISTS knowledge_claim_sources (
+                        claim_id TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        PRIMARY KEY(claim_id, source_id),
+                        FOREIGN KEY(claim_id) REFERENCES knowledge_claims(id),
+                        FOREIGN KEY(source_id) REFERENCES knowledge_sources(id)
+                    );
+                    INSERT OR IGNORE INTO knowledge_graph_nodes(
+                        project_id, id, kind, canonical_name, attributes_json,
+                        version, origin_run_id, created_at)
+                    SELECT runs.project_id, 'legacy-entity:' || entities.id, 'entity',
+                           entities.canonical_name, entities.attributes_json,
+                           1, entities.run_id, runs.created_at
+                    FROM knowledge_entities entities
+                    JOIN runs ON runs.id = entities.run_id
+                    WHERE runs.project_id IS NOT NULL;
+                    INSERT OR IGNORE INTO knowledge_graph_nodes(
+                        project_id, id, kind, canonical_name, attributes_json,
+                        version, origin_run_id, created_at)
+                    SELECT runs.project_id, 'legacy-claim:' || claims.id, 'claim',
+                           claims.predicate || ': ' || claims.object_value,
+                           json_object('predicate', claims.predicate,
+                                       'objectKind', claims.object_kind,
+                                       'objectValue', claims.object_value),
+                           1, claims.run_id, claims.created_at
+                    FROM knowledge_claims claims
+                    JOIN runs ON runs.id = claims.run_id
+                    WHERE runs.project_id IS NOT NULL;
+                    INSERT OR IGNORE INTO knowledge_graph_nodes(
+                        project_id, id, kind, canonical_name, attributes_json,
+                        version, origin_run_id, created_at)
+                    SELECT runs.project_id, 'legacy-source:' || sources.id, 'source',
+                           sources.location,
+                           json_object('location', sources.location, 'kind', sources.kind),
+                           1, sources.run_id, sources.captured_at
+                    FROM knowledge_sources sources
+                    JOIN runs ON runs.id = sources.run_id
+                    WHERE runs.project_id IS NOT NULL;
+                    INSERT OR IGNORE INTO knowledge_graph_edges(
+                        id, project_id, from_id, relation, to_id, confidence,
+                        is_inference, rationale, source_ids_json, origin_run_id,
+                        valid_from, valid_to)
+                    SELECT 'legacy-support:' || claims.id,
+                           runs.project_id,
+                           'legacy-claim:' || claims.id,
+                           'supports',
+                           'legacy-entity:' || claims.subject_id,
+                           claims.confidence,
+                           0, NULL,
+                           json_group_array(sources.source_id),
+                           claims.run_id, claims.created_at, NULL
+                    FROM knowledge_claims claims
+                    JOIN runs ON runs.id = claims.run_id
+                    JOIN knowledge_claim_sources sources ON sources.claim_id = claims.id
+                    WHERE runs.project_id IS NOT NULL
+                    GROUP BY claims.id;
+                    INSERT OR IGNORE INTO graph_updates(
+                        idempotency_key, project_id, run_id, agent_id, created_at)
+                    SELECT 'legacy-import:' || runs.id, runs.project_id, runs.id,
+                           'migration-v6', CURRENT_TIMESTAMP
+                    FROM runs
+                    WHERE runs.project_id IS NOT NULL;
                     CREATE TABLE IF NOT EXISTS knowledge_claim_sources (
                         claim_id TEXT NOT NULL,
                         source_id TEXT NOT NULL,
@@ -297,8 +647,10 @@ module SqliteStore =
                     VALUES (4, CURRENT_TIMESTAMP);
                     INSERT OR IGNORE INTO schema_migrations(version, applied_at)
                     VALUES (5, CURRENT_TIMESTAMP);
-                    UPDATE schema_info SET version = 5;
-                    PRAGMA user_version = 5;
+                    INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                    VALUES (6, CURRENT_TIMESTAMP);
+                    UPDATE schema_info SET version = 6;
+                    PRAGMA user_version = 6;
                     COMMIT;
                     """
 
@@ -349,7 +701,9 @@ module SqliteStore =
                    workingDirectory = config.Evaluator.WorkingDirectory
                    timeoutSeconds = config.Evaluator.Timeout.TotalSeconds
                    requiredConstraints = List.toArray config.Evaluator.RequiredConstraints
-                   maxInconclusiveRetries = config.Evaluator.MaxInconclusiveRetries |}
+                   maxInconclusiveRetries = config.Evaluator.MaxInconclusiveRetries
+                   maxInfrastructureRetries = config.Evaluator.MaxInfrastructureRetries
+                   infrastructureRetryDelaySeconds = config.Evaluator.InfrastructureRetryDelay.TotalSeconds |}
                metric =
                 {| name = config.Metric.Name
                    direction = direction
@@ -364,6 +718,17 @@ module SqliteStore =
                    maxMemoryCharacters = config.PromptProfile.MaxMemoryCharacters
                    maxEvaluationFindings = config.PromptProfile.MaxEvaluationFindings
                    maxEvaluationCharacters = config.PromptProfile.MaxEvaluationCharacters |}
+               graphSearch =
+                {| initialFanOut = config.GraphSearch.InitialFanOut
+                   beamWidth = config.GraphSearch.BeamWidth
+                   expansionsPerHeadPerRound = config.GraphSearch.ExpansionsPerHeadPerRound
+                   ordinaryCandidatesPerSynthesis = config.GraphSearch.OrdinaryCandidatesPerSynthesis
+                   stagnationTrigger = config.GraphSearch.StagnationTrigger
+                   maxSynthesisBudgetFraction = config.GraphSearch.MaxSynthesisBudgetFraction
+                   maxSynthesisDepth = config.GraphSearch.MaxSynthesisDepth
+                   conflictResolutionAttempts = config.GraphSearch.ConflictResolutionAttempts
+                   maxConflictFiles = config.GraphSearch.MaxConflictFiles
+                   maxConflictCharacters = config.GraphSearch.MaxConflictCharacters |}
                budgets =
                 {| maxExperiments = config.Budgets.MaxExperiments
                    maxRawTokens = config.Budgets.MaxRawTokens
@@ -465,6 +830,219 @@ module SqliteStore =
                     )
         }
 
+    let private experimentKindText kind =
+        match kind with
+        | ExperimentKind.Expansion -> "expansion"
+        | ExperimentKind.Synthesis -> "synthesis"
+
+    let private parentRoleText role =
+        match role with
+        | ExperimentParentRole.Primary -> "primary"
+        | ExperimentParentRole.Contributor -> "contributor"
+
+    let private evaluationValidityText validity =
+        match validity with
+        | EvaluationValidity.Pending -> "pending", None
+        | EvaluationValidity.Valid -> "valid", None
+        | EvaluationValidity.ConstraintFailed constraints -> "constraint-failed", Some(String.concat "," constraints)
+        | EvaluationValidity.Inconclusive reason -> "inconclusive", Some reason
+        | EvaluationValidity.InfrastructureFailed reason -> "infrastructure-failed", Some reason
+
+    let private championDecisionText decision =
+        match decision with
+        | ChampionDecision.Pending -> "pending"
+        | ChampionDecision.Promoted -> "promoted"
+        | ChampionDecision.NotPromoted -> "not-promoted"
+        | ChampionDecision.RejectedByUser -> "rejected-by-user"
+
+    let private searchStatusText status =
+        match status with
+        | SearchStatus.ActiveHead -> "active-head"
+        | SearchStatus.Retained -> "retained"
+        | SearchStatus.Exhausted -> "exhausted"
+        | SearchStatus.ConflictBlocked -> "conflict-blocked"
+        | SearchStatus.Archived -> "archived"
+
+    let beginGraphExperiment
+        store
+        runId
+        experimentId
+        sequence
+        kind
+        (parents: ExperimentParent list)
+        championAtStart
+        outcome
+        (_: CancellationToken)
+        =
+        async {
+            try
+                let primary =
+                    parents
+                    |> List.tryFind (fun parent -> parent.Role = ExperimentParentRole.Primary)
+
+                match primary with
+                | None ->
+                    return
+                        Error(
+                            HarnessError.create
+                                "sqlite.graph_experiment_primary_missing"
+                                HarnessErrorCategory.Persistence
+                                "A graph experiment requires one primary parent."
+                        )
+                | Some primaryParent ->
+                    use database = connection store
+                    database.Open()
+                    use transaction = database.BeginTransaction()
+                    let timestamp = DateTimeOffset.UtcNow.ToString("o")
+                    use experimentCommand = database.CreateCommand()
+                    experimentCommand.Transaction <- transaction
+
+                    experimentCommand.CommandText <-
+                        """
+                        INSERT INTO experiments(id, run_id, sequence, parent_oid, candidate_oid, outcome, created_at, updated_at)
+                        VALUES ($id, $run, $sequence, $parent, NULL, $outcome, $created, $updated)
+                        ON CONFLICT(id) DO UPDATE SET
+                            sequence = excluded.sequence,
+                            parent_oid = excluded.parent_oid,
+                            outcome = excluded.outcome,
+                            updated_at = excluded.updated_at;
+                        """
+
+                    addParameter experimentCommand "$id" (ExperimentId.text experimentId)
+                    addParameter experimentCommand "$run" (RunId.text runId)
+                    addParameter experimentCommand "$sequence" sequence
+                    addParameter experimentCommand "$parent" (CommitOid.value primaryParent.Commit)
+                    addParameter experimentCommand "$outcome" outcome
+                    addParameter experimentCommand "$created" timestamp
+                    addParameter experimentCommand "$updated" timestamp
+                    experimentCommand.ExecuteNonQuery() |> ignore
+
+                    use stateCommand = database.CreateCommand()
+                    stateCommand.Transaction <- transaction
+
+                    stateCommand.CommandText <-
+                        """
+                        INSERT INTO experiment_graph_state(
+                            run_id, experiment_id, experiment_kind, evaluation_validity,
+                            validity_detail, champion_decision, search_status,
+                            champion_at_start, hypothesis_family, synthesis_depth, updated_at)
+                        VALUES ($run, $experiment, $kind, 'pending', NULL, 'pending', 'archived',
+                                $champion, 'pending', 0, $updated)
+                        ON CONFLICT(experiment_id) DO UPDATE SET
+                            experiment_kind = excluded.experiment_kind,
+                            champion_at_start = excluded.champion_at_start,
+                            updated_at = excluded.updated_at;
+                        """
+
+                    addParameter stateCommand "$run" (RunId.text runId)
+                    addParameter stateCommand "$experiment" (ExperimentId.text experimentId)
+                    addParameter stateCommand "$kind" (experimentKindText kind)
+                    addParameter stateCommand "$champion" (CommitOid.value championAtStart)
+                    addParameter stateCommand "$updated" timestamp
+                    stateCommand.ExecuteNonQuery() |> ignore
+
+                    for parent in parents do
+                        use edgeCommand = database.CreateCommand()
+                        edgeCommand.Transaction <- transaction
+
+                        edgeCommand.CommandText <-
+                            """
+                            INSERT INTO experiment_edges(
+                                id, run_id, experiment_id, parent_oid, child_oid,
+                                edge_kind, parent_role, created_at)
+                            VALUES ($edge, $run, $experiment, $parent, NULL, $kind, $role, $created)
+                            ON CONFLICT(run_id, experiment_id, parent_oid, parent_role) DO NOTHING;
+                            """
+
+                        let edgeId =
+                            $"{RunId.text runId}:{ExperimentId.text experimentId}:{parentRoleText parent.Role}:{CommitOid.value parent.Commit}"
+
+                        addParameter edgeCommand "$edge" edgeId
+                        addParameter edgeCommand "$run" (RunId.text runId)
+                        addParameter edgeCommand "$experiment" (ExperimentId.text experimentId)
+                        addParameter edgeCommand "$parent" (CommitOid.value parent.Commit)
+                        addParameter edgeCommand "$kind" (experimentKindText kind)
+                        addParameter edgeCommand "$role" (parentRoleText parent.Role)
+                        addParameter edgeCommand "$created" timestamp
+                        edgeCommand.ExecuteNonQuery() |> ignore
+
+                    transaction.Commit()
+                    return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError
+                            "sqlite.graph_experiment_begin_failed"
+                            "Could not persist the planned graph experiment."
+                            exceptionValue
+                    )
+        }
+
+    let saveExperimentGraphState
+        store
+        runId
+        experimentId
+        kind
+        validity
+        decision
+        searchStatus
+        championAtStart
+        hypothesisFamily
+        synthesisDepth
+        (_: CancellationToken)
+        =
+        async {
+            try
+                let validityText, validityDetail = evaluationValidityText validity
+                use database = connection store
+                database.Open()
+                use command = database.CreateCommand()
+
+                command.CommandText <-
+                    """
+                    INSERT INTO experiment_graph_state(
+                        run_id, experiment_id, experiment_kind, evaluation_validity,
+                        validity_detail, champion_decision, search_status,
+                        champion_at_start, hypothesis_family, synthesis_depth, updated_at)
+                    VALUES ($run, $experiment, $kind, $validity, $detail, $decision, $status,
+                            $champion, $family, $depth, $updated)
+                    ON CONFLICT(experiment_id) DO UPDATE SET
+                        experiment_kind = excluded.experiment_kind,
+                        evaluation_validity = excluded.evaluation_validity,
+                        validity_detail = excluded.validity_detail,
+                        champion_decision = excluded.champion_decision,
+                        search_status = excluded.search_status,
+                        champion_at_start = excluded.champion_at_start,
+                        hypothesis_family = excluded.hypothesis_family,
+                        synthesis_depth = excluded.synthesis_depth,
+                        updated_at = excluded.updated_at;
+                    """
+
+                addParameter command "$run" (RunId.text runId)
+                addParameter command "$experiment" (ExperimentId.text experimentId)
+                addParameter command "$kind" (experimentKindText kind)
+                addParameter command "$validity" validityText
+
+                addParameter command "$detail" (validityDetail |> Option.map box |> Option.defaultValue DBNull.Value)
+
+                addParameter command "$decision" (championDecisionText decision)
+                addParameter command "$status" (searchStatusText searchStatus)
+                addParameter command "$champion" (CommitOid.value championAtStart)
+                addParameter command "$family" hypothesisFamily
+                addParameter command "$depth" synthesisDepth
+                addParameter command "$updated" (DateTimeOffset.UtcNow.ToString("o"))
+                command.ExecuteNonQuery() |> ignore
+                return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError
+                            "sqlite.experiment_graph_state_failed"
+                            "Could not persist the experiment's independent graph outcome dimensions."
+                            exceptionValue
+                    )
+        }
+
     let updateExperimentCandidate store experimentId candidate (_: CancellationToken) =
         async {
             try
@@ -473,7 +1051,12 @@ module SqliteStore =
                 use command = database.CreateCommand()
 
                 command.CommandText <-
-                    "UPDATE experiments SET candidate_oid = $candidate, updated_at = $updated WHERE id = $id;"
+                    """
+                    BEGIN IMMEDIATE;
+                    UPDATE experiments SET candidate_oid = $candidate, updated_at = $updated WHERE id = $id;
+                    UPDATE experiment_edges SET child_oid = $candidate WHERE experiment_id = $id;
+                    COMMIT;
+                    """
 
                 addParameter command "$id" (ExperimentId.text experimentId)
                 addParameter command "$candidate" (CommitOid.value candidate)
@@ -862,6 +1445,294 @@ module SqliteStore =
         | "hypothesis" -> KnowledgeEntityKind.Hypothesis
         | "constraint" -> KnowledgeEntityKind.Constraint
         | _ -> KnowledgeEntityKind.Concept
+
+    let private graphNodeKindText kind =
+        match kind with
+        | GraphNodeKind.Entity -> "entity"
+        | GraphNodeKind.Claim -> "claim"
+        | GraphNodeKind.Source -> "source"
+        | GraphNodeKind.Artifact -> "artifact"
+        | GraphNodeKind.AgentRun -> "agent-run"
+        | GraphNodeKind.Evaluation -> "evaluation"
+        | GraphNodeKind.Task -> "task"
+        | GraphNodeKind.Commit -> "commit"
+        | GraphNodeKind.Metric -> "metric"
+
+    let private parseGraphNodeKind value =
+        match value with
+        | "claim" -> GraphNodeKind.Claim
+        | "source" -> GraphNodeKind.Source
+        | "artifact" -> GraphNodeKind.Artifact
+        | "agent-run" -> GraphNodeKind.AgentRun
+        | "evaluation" -> GraphNodeKind.Evaluation
+        | "task" -> GraphNodeKind.Task
+        | "commit" -> GraphNodeKind.Commit
+        | "metric" -> GraphNodeKind.Metric
+        | _ -> GraphNodeKind.Entity
+
+    let private graphRelationText relation =
+        match relation with
+        | GraphRelationKind.Mentions -> "mentions"
+        | GraphRelationKind.Supports -> "supports"
+        | GraphRelationKind.Contradicts -> "contradicts"
+        | GraphRelationKind.DerivedFrom -> "derived-from"
+        | GraphRelationKind.Produced -> "produced"
+        | GraphRelationKind.Evaluates -> "evaluates"
+        | GraphRelationKind.Revises -> "revises"
+        | GraphRelationKind.Supersedes -> "supersedes"
+        | GraphRelationKind.DependsOn -> "depends-on"
+        | GraphRelationKind.ParentOf -> "parent-of"
+        | GraphRelationKind.ResolvedTo -> "resolved-to"
+
+    let private parseGraphRelation value =
+        match value with
+        | "supports" -> GraphRelationKind.Supports
+        | "contradicts" -> GraphRelationKind.Contradicts
+        | "derived-from" -> GraphRelationKind.DerivedFrom
+        | "produced" -> GraphRelationKind.Produced
+        | "evaluates" -> GraphRelationKind.Evaluates
+        | "revises" -> GraphRelationKind.Revises
+        | "supersedes" -> GraphRelationKind.Supersedes
+        | "depends-on" -> GraphRelationKind.DependsOn
+        | "parent-of" -> GraphRelationKind.ParentOf
+        | "resolved-to" -> GraphRelationKind.ResolvedTo
+        | _ -> GraphRelationKind.Mentions
+
+    let projectIdForRun store runId : Result<string, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+            command.CommandText <- "SELECT project_id FROM runs WHERE id = $run;"
+            addParameter command "$run" (RunId.text runId)
+
+            match command.ExecuteScalar() with
+            | :? string as projectId when not (String.IsNullOrWhiteSpace projectId) -> Ok projectId
+            | _ ->
+                Error(
+                    HarnessError.create
+                        "sqlite.project_missing"
+                        HarnessErrorCategory.Persistence
+                        "The run is not linked to a repository project."
+                )
+        with exceptionValue ->
+            Error(persistenceError "sqlite.project_load_failed" "Could not resolve repository identity." exceptionValue)
+
+    let saveRepositoryGraphUpdate store (update: GraphUpdate) (_: CancellationToken) =
+        async {
+            try
+                use database = connection store
+                database.Open()
+                use transaction = database.BeginTransaction()
+                use updateCommand = database.CreateCommand()
+                updateCommand.Transaction <- transaction
+
+                updateCommand.CommandText <-
+                    """
+                    INSERT OR IGNORE INTO graph_updates(idempotency_key, project_id, run_id, agent_id, created_at)
+                    VALUES ($key, $project, $run, $agent, $created);
+                    SELECT changes();
+                    """
+
+                addParameter updateCommand "$key" update.IdempotencyKey
+                addParameter updateCommand "$project" update.ProjectId
+                addParameter updateCommand "$run" (RunId.text update.RunId)
+                addParameter updateCommand "$agent" update.AgentId
+                addParameter updateCommand "$created" (DateTimeOffset.UtcNow.ToString("o"))
+                let inserted = updateCommand.ExecuteScalar() |> Convert.ToInt32
+
+                if inserted > 0 then
+                    for node in update.Nodes do
+                        use nodeCommand = database.CreateCommand()
+                        nodeCommand.Transaction <- transaction
+
+                        nodeCommand.CommandText <-
+                            """
+                            INSERT OR IGNORE INTO knowledge_graph_nodes(
+                                project_id, id, kind, canonical_name, attributes_json,
+                                version, origin_run_id, created_at)
+                            VALUES ($project, $id, $kind, $name, $attributes, $version, $run, $created);
+                            """
+
+                        addParameter nodeCommand "$project" update.ProjectId
+                        addParameter nodeCommand "$id" (GraphNodeId.value node.Id)
+                        addParameter nodeCommand "$kind" (graphNodeKindText node.Kind)
+                        addParameter nodeCommand "$name" node.CanonicalName
+
+                        addParameter
+                            nodeCommand
+                            "$attributes"
+                            (JsonSerializer.Serialize(node.Attributes |> Map.toArray |> dict))
+
+                        addParameter nodeCommand "$version" node.Version
+                        addParameter nodeCommand "$run" (RunId.text node.OriginRunId)
+                        addParameter nodeCommand "$created" (node.CreatedAt.ToString("o"))
+                        nodeCommand.ExecuteNonQuery() |> ignore
+
+                    for edge in update.Edges do
+                        let isInference, rationale, sourceIds =
+                            match edge.Provenance with
+                            | GraphProvenance.Sourced sources ->
+                                0, DBNull.Value :> obj, sources |> Set.toList |> List.map KnowledgeSourceId.text
+                            | GraphProvenance.Inference reason -> 1, box reason, []
+
+                        use edgeCommand = database.CreateCommand()
+                        edgeCommand.Transaction <- transaction
+
+                        edgeCommand.CommandText <-
+                            """
+                            INSERT INTO knowledge_graph_edges(
+                                id, project_id, from_id, relation, to_id, confidence,
+                                is_inference, rationale, source_ids_json, origin_run_id,
+                                valid_from, valid_to)
+                            VALUES ($id, $project, $from, $relation, $to, $confidence,
+                                    $inference, $rationale, $sources, $run, $fromTime, $toTime);
+                            """
+
+                        addParameter edgeCommand "$id" (GraphEdgeId.value edge.Id)
+                        addParameter edgeCommand "$project" update.ProjectId
+                        addParameter edgeCommand "$from" (GraphNodeId.value edge.From)
+                        addParameter edgeCommand "$relation" (graphRelationText edge.Relation)
+                        addParameter edgeCommand "$to" (GraphNodeId.value edge.To)
+                        addParameter edgeCommand "$confidence" (edge.Confidence.ToString(CultureInfo.InvariantCulture))
+                        addParameter edgeCommand "$inference" isInference
+                        addParameter edgeCommand "$rationale" rationale
+                        addParameter edgeCommand "$sources" (JsonSerializer.Serialize sourceIds)
+                        addParameter edgeCommand "$run" (RunId.text edge.OriginRunId)
+                        addParameter edgeCommand "$fromTime" (edge.ValidFrom.ToString("o"))
+
+                        addParameter
+                            edgeCommand
+                            "$toTime"
+                            (edge.ValidTo
+                             |> Option.map (fun value -> box (value.ToString("o")))
+                             |> Option.defaultValue DBNull.Value)
+
+                        edgeCommand.ExecuteNonQuery() |> ignore
+
+                transaction.Commit()
+                return Ok(inserted > 0)
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError
+                            "sqlite.repository_graph_update_failed"
+                            "Could not atomically save the repository knowledge update."
+                            exceptionValue
+                    )
+        }
+
+    let loadRepositoryKnowledgeGraph store projectId : Result<RepositoryKnowledgeGraph, HarnessError> =
+        try
+            let parseAttributes (json: string) =
+                use document = JsonDocument.Parse json
+
+                document.RootElement.EnumerateObject()
+                |> Seq.map (fun (property: JsonProperty) -> property.Name, property.Value.GetString())
+                |> Map.ofSeq
+
+            use database = connection store
+            database.Open()
+            use nodeCommand = database.CreateCommand()
+
+            nodeCommand.CommandText <-
+                """
+                SELECT id, kind, canonical_name, attributes_json, version, origin_run_id, created_at
+                FROM knowledge_graph_nodes WHERE project_id = $project ORDER BY id, version;
+                """
+
+            addParameter nodeCommand "$project" projectId
+            use nodeReader = nodeCommand.ExecuteReader()
+            let mutable nodes = Map.empty
+
+            while nodeReader.Read() do
+                let attributes = parseAttributes (nodeReader.GetString 3)
+
+                let node =
+                    { Id = GraphNodeId.create (nodeReader.GetString 0)
+                      Kind = parseGraphNodeKind (nodeReader.GetString 1)
+                      CanonicalName = nodeReader.GetString 2
+                      Attributes = attributes
+                      Version = nodeReader.GetInt32 4
+                      OriginRunId = RunId.ofGuid (Guid.Parse(nodeReader.GetString 5))
+                      CreatedAt = DateTimeOffset.Parse(nodeReader.GetString 6) }
+
+                nodes <-
+                    nodes
+                    |> Map.change node.Id (fun versions -> node :: Option.defaultValue [] versions |> Some)
+
+            nodeReader.Close()
+            use edgeCommand = database.CreateCommand()
+
+            edgeCommand.CommandText <-
+                """
+                SELECT id, from_id, relation, to_id, confidence, is_inference,
+                       rationale, source_ids_json, origin_run_id, valid_from, valid_to
+                FROM knowledge_graph_edges WHERE project_id = $project;
+                """
+
+            addParameter edgeCommand "$project" projectId
+            use edgeReader = edgeCommand.ExecuteReader()
+            let mutable edges = Map.empty
+
+            while edgeReader.Read() do
+                let provenance =
+                    if edgeReader.GetInt32 5 = 1 then
+                        GraphProvenance.Inference(
+                            if edgeReader.IsDBNull 6 then
+                                "legacy inference"
+                            else
+                                edgeReader.GetString 6
+                        )
+                    else
+                        edgeReader.GetString 7
+                        |> JsonSerializer.Deserialize<string list>
+                        |> List.map (Guid.Parse >> KnowledgeSourceId.ofGuid)
+                        |> Set.ofList
+                        |> GraphProvenance.Sourced
+
+                let edge =
+                    { Id = GraphEdgeId.create (edgeReader.GetString 0)
+                      From = GraphNodeId.create (edgeReader.GetString 1)
+                      Relation = parseGraphRelation (edgeReader.GetString 2)
+                      To = GraphNodeId.create (edgeReader.GetString 3)
+                      Confidence = Decimal.Parse(edgeReader.GetString 4, CultureInfo.InvariantCulture)
+                      Provenance = provenance
+                      OriginRunId = RunId.ofGuid (Guid.Parse(edgeReader.GetString 8))
+                      ValidFrom = DateTimeOffset.Parse(edgeReader.GetString 9)
+                      ValidTo =
+                        if edgeReader.IsDBNull 10 then
+                            None
+                        else
+                            Some(DateTimeOffset.Parse(edgeReader.GetString 10)) }
+
+                edges <- Map.add edge.Id edge edges
+
+            edgeReader.Close()
+            use updateCommand = database.CreateCommand()
+            updateCommand.CommandText <- "SELECT idempotency_key FROM graph_updates WHERE project_id = $project;"
+            addParameter updateCommand "$project" projectId
+            use updateReader = updateCommand.ExecuteReader()
+            let mutable updates = Set.empty
+
+            while updateReader.Read() do
+                updates <- Set.add (updateReader.GetString 0) updates
+
+            Ok
+                { ProjectId = projectId
+                  Nodes = nodes
+                  Edges = edges
+                  AppliedUpdates = updates }
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 ->
+            Ok(RepositoryKnowledgeGraph.empty projectId)
+        | exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.repository_graph_load_failed"
+                    "Could not load repository-scoped knowledge."
+                    exceptionValue
+            )
 
     let private knowledgeSourceKindText kind =
         match kind with
@@ -1445,7 +2316,8 @@ module SqliteStore =
 
                 while reader.Read() && results.Count < maxCount && characterCount < maxCharacters do
                     let summary =
-                        { Hypothesis = reader.GetString 3
+                        { HypothesisFamily = "legacy"
+                          Hypothesis = reader.GetString 3
                           ChangeSummary = reader.GetString 4
                           ExpectedEffect = reader.GetString 5
                           ValidationNotes = JsonSerializer.Deserialize<string list>(reader.GetString 6)
@@ -1489,7 +2361,24 @@ module SqliteStore =
             use command = database.CreateCommand()
 
             command.CommandText <-
-                "SELECT sequence, run_id, experiment_id, kind, payload, created_at FROM events ORDER BY sequence DESC LIMIT $limit;"
+                """
+                SELECT e.sequence,
+                       e.run_id,
+                       e.experiment_id,
+                       e.kind,
+                       e.payload,
+                       e.created_at,
+                       u.input_tokens,
+                       u.cached_input_tokens,
+                       u.output_tokens,
+                       u.reasoning_output_tokens
+                FROM events e
+                LEFT JOIN usage u
+                  ON u.run_id = e.run_id
+                 AND u.experiment_id = e.experiment_id
+                ORDER BY e.sequence DESC
+                LIMIT $limit;
+                """
 
             addParameter command "$limit" limit
             use reader = command.ExecuteReader()
@@ -1506,6 +2395,15 @@ module SqliteStore =
                             Some(ExperimentId.ofGuid (Guid.Parse(reader.GetString 2)))
                       Kind = reader.GetString 3
                       Payload = reader.GetString 4
+                      Usage =
+                        if reader.IsDBNull 6 then
+                            None
+                        else
+                            Some
+                                { InputTokens = reader.GetInt64 6
+                                  CachedInputTokens = reader.GetInt64 7
+                                  OutputTokens = reader.GetInt64 8
+                                  ReasoningOutputTokens = reader.GetInt64 9 }
                       CreatedAt = DateTimeOffset.Parse(reader.GetString 5) }
 
             Ok(List.ofSeq events)
@@ -1519,7 +2417,24 @@ module SqliteStore =
             use command = database.CreateCommand()
 
             command.CommandText <-
-                "SELECT sequence, run_id, experiment_id, kind, payload, created_at FROM events WHERE run_id = $run ORDER BY sequence;"
+                """
+                SELECT e.sequence,
+                       e.run_id,
+                       e.experiment_id,
+                       e.kind,
+                       e.payload,
+                       e.created_at,
+                       u.input_tokens,
+                       u.cached_input_tokens,
+                       u.output_tokens,
+                       u.reasoning_output_tokens
+                FROM events e
+                LEFT JOIN usage u
+                  ON u.run_id = e.run_id
+                 AND u.experiment_id = e.experiment_id
+                WHERE e.run_id = $run
+                ORDER BY e.sequence;
+                """
 
             addParameter command "$run" (RunId.text runId)
             use reader = command.ExecuteReader()
@@ -1536,6 +2451,15 @@ module SqliteStore =
                             Some(ExperimentId.ofGuid (Guid.Parse(reader.GetString 2)))
                       Kind = reader.GetString 3
                       Payload = reader.GetString 4
+                      Usage =
+                        if reader.IsDBNull 6 then
+                            None
+                        else
+                            Some
+                                { InputTokens = reader.GetInt64 6
+                                  CachedInputTokens = reader.GetInt64 7
+                                  OutputTokens = reader.GetInt64 8
+                                  ReasoningOutputTokens = reader.GetInt64 9 }
                       CreatedAt = DateTimeOffset.Parse(reader.GetString 5) }
 
             Ok(List.ofSeq events)
@@ -1700,6 +2624,420 @@ module SqliteStore =
                     exceptionValue
             )
 
+    let private parseExperimentKind value =
+        match value with
+        | "synthesis" -> ExperimentKind.Synthesis
+        | _ -> ExperimentKind.Expansion
+
+    let private parseParentRole value =
+        match value with
+        | "contributor" -> ExperimentParentRole.Contributor
+        | _ -> ExperimentParentRole.Primary
+
+    let loadExperimentEdges store runId : Result<StoredExperimentEdge list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                """
+                SELECT id, run_id, experiment_id, parent_oid, child_oid,
+                       edge_kind, parent_role, created_at
+                FROM experiment_edges
+                WHERE run_id = $run
+                ORDER BY created_at, id;
+                """
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredExperimentEdge>()
+
+            while reader.Read() do
+                results.Add
+                    { Id = reader.GetString 0
+                      RunId = RunId.ofGuid (Guid.Parse(reader.GetString 1))
+                      ExperimentId = ExperimentId.ofGuid (Guid.Parse(reader.GetString 2))
+                      Parent = CommitOid.create (reader.GetString 3)
+                      Child = nullableString reader 4 |> Option.map CommitOid.create
+                      Kind = parseExperimentKind (reader.GetString 5)
+                      Role = parseParentRole (reader.GetString 6)
+                      CreatedAt = DateTimeOffset.Parse(reader.GetString 7) }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.experiment_edges_load_failed"
+                    "Could not load experiment graph edges."
+                    exceptionValue
+            )
+
+    let loadExperimentGraphStates store runId : Result<StoredExperimentGraphState list, HarnessError> =
+        try
+            let validity (value: string) (detail: string option) =
+                match value with
+                | "valid" -> EvaluationValidity.Valid
+                | "constraint-failed" ->
+                    detail
+                    |> Option.map (fun text -> text.Split(',', StringSplitOptions.RemoveEmptyEntries) |> List.ofArray)
+                    |> Option.defaultValue []
+                    |> EvaluationValidity.ConstraintFailed
+                | "inconclusive" -> EvaluationValidity.Inconclusive(Option.defaultValue "Inconclusive" detail)
+                | "infrastructure-failed" ->
+                    EvaluationValidity.InfrastructureFailed(Option.defaultValue "Infrastructure failure" detail)
+                | _ -> EvaluationValidity.Pending
+
+            let decision value =
+                match value with
+                | "promoted" -> ChampionDecision.Promoted
+                | "not-promoted" -> ChampionDecision.NotPromoted
+                | "rejected-by-user" -> ChampionDecision.RejectedByUser
+                | _ -> ChampionDecision.Pending
+
+            let status value =
+                match value with
+                | "active-head" -> SearchStatus.ActiveHead
+                | "retained" -> SearchStatus.Retained
+                | "exhausted" -> SearchStatus.Exhausted
+                | "conflict-blocked" -> SearchStatus.ConflictBlocked
+                | _ -> SearchStatus.Archived
+
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                """
+                SELECT run_id, experiment_id, experiment_kind, evaluation_validity,
+                       validity_detail, champion_decision, search_status,
+                       champion_at_start, hypothesis_family, synthesis_depth, updated_at
+                FROM experiment_graph_state
+                WHERE run_id = $run
+                ORDER BY updated_at, experiment_id;
+                """
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredExperimentGraphState>()
+
+            while reader.Read() do
+                let detail = nullableString reader 4
+
+                results.Add
+                    { RunId = RunId.ofGuid (Guid.Parse(reader.GetString 0))
+                      ExperimentId = ExperimentId.ofGuid (Guid.Parse(reader.GetString 1))
+                      Kind = parseExperimentKind (reader.GetString 2)
+                      Validity = validity (reader.GetString 3) detail
+                      ChampionDecision = decision (reader.GetString 5)
+                      SearchStatus = status (reader.GetString 6)
+                      ChampionAtStart = CommitOid.create (reader.GetString 7)
+                      HypothesisFamily = reader.GetString 8
+                      SynthesisDepth = reader.GetInt32 9
+                      UpdatedAt = DateTimeOffset.Parse(reader.GetString 10) }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.experiment_graph_states_load_failed"
+                    "Could not load independent experiment outcome dimensions."
+                    exceptionValue
+            )
+
+    let saveChampion store runId sequence commit score experimentId (_: CancellationToken) =
+        async {
+            try
+                use database = connection store
+                database.Open()
+                use command = database.CreateCommand()
+
+                command.CommandText <-
+                    """
+                    INSERT INTO champion_history(run_id, sequence, commit_oid, score, experiment_id, created_at)
+                    VALUES ($run, $sequence, $commit, $score, $experiment, $created)
+                    ON CONFLICT(run_id, sequence) DO NOTHING;
+                    """
+
+                addParameter command "$run" (RunId.text runId)
+                addParameter command "$sequence" sequence
+                addParameter command "$commit" (CommitOid.value commit)
+
+                addParameter
+                    command
+                    "$score"
+                    (score |> Option.map string |> Option.map box |> Option.defaultValue DBNull.Value)
+
+                addParameter
+                    command
+                    "$experiment"
+                    (experimentId
+                     |> Option.map ExperimentId.text
+                     |> Option.map box
+                     |> Option.defaultValue DBNull.Value)
+
+                addParameter command "$created" (DateTimeOffset.UtcNow.ToString("o"))
+                command.ExecuteNonQuery() |> ignore
+                return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError "sqlite.champion_save_failed" "Could not save champion history." exceptionValue
+                    )
+        }
+
+    let replaceActiveHeads store runId round heads (_: CancellationToken) =
+        async {
+            try
+                use database = connection store
+                database.Open()
+                use transaction = database.BeginTransaction()
+                use deleteCommand = database.CreateCommand()
+                deleteCommand.Transaction <- transaction
+                deleteCommand.CommandText <- "DELETE FROM active_heads WHERE run_id = $run;"
+                addParameter deleteCommand "$run" (RunId.text runId)
+                deleteCommand.ExecuteNonQuery() |> ignore
+
+                for commit in heads do
+                    use insertCommand = database.CreateCommand()
+                    insertCommand.Transaction <- transaction
+
+                    insertCommand.CommandText <-
+                        """
+                        INSERT INTO active_heads(run_id, commit_oid, round, status, updated_at)
+                        VALUES ($run, $commit, $round, 'active', $updated);
+                        """
+
+                    addParameter insertCommand "$run" (RunId.text runId)
+                    addParameter insertCommand "$commit" (CommitOid.value commit)
+                    addParameter insertCommand "$round" round
+                    addParameter insertCommand "$updated" (DateTimeOffset.UtcNow.ToString("o"))
+                    insertCommand.ExecuteNonQuery() |> ignore
+
+                transaction.Commit()
+                return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError "sqlite.heads_save_failed" "Could not save active graph heads." exceptionValue
+                    )
+        }
+
+    let loadActiveHeads store runId : Result<StoredSearchHead list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                "SELECT run_id, commit_oid, round, status, updated_at FROM active_heads WHERE run_id = $run ORDER BY commit_oid;"
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredSearchHead>()
+
+            while reader.Read() do
+                results.Add
+                    { RunId = RunId.ofGuid (Guid.Parse(reader.GetString 0))
+                      Commit = CommitOid.create (reader.GetString 1)
+                      Round = reader.GetInt32 2
+                      Status = SearchStatus.ActiveHead
+                      UpdatedAt = DateTimeOffset.Parse(reader.GetString 4) }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(persistenceError "sqlite.heads_load_failed" "Could not load active graph heads." exceptionValue)
+
+    let saveSearchRound store (round: StoredSearchRound) (_: CancellationToken) =
+        async {
+            try
+                use database = connection store
+                database.Open()
+                use command = database.CreateCommand()
+
+                command.CommandText <-
+                    """
+                    INSERT INTO search_rounds(
+                        run_id, round, heads_json, completed_heads_json,
+                        ordinary_since_synthesis, status, updated_at)
+                    VALUES ($run, $round, $heads, $completed, $ordinary, $status, $updated)
+                    ON CONFLICT(run_id, round) DO UPDATE SET
+                        heads_json = excluded.heads_json,
+                        completed_heads_json = excluded.completed_heads_json,
+                        ordinary_since_synthesis = excluded.ordinary_since_synthesis,
+                        status = excluded.status,
+                        updated_at = excluded.updated_at;
+                    """
+
+                addParameter command "$run" (RunId.text round.RunId)
+                addParameter command "$round" round.Round
+                addParameter command "$heads" (round.Heads |> List.map CommitOid.value |> JsonSerializer.Serialize)
+
+                addParameter
+                    command
+                    "$completed"
+                    (round.CompletedHeads
+                     |> Set.toList
+                     |> List.map CommitOid.value
+                     |> JsonSerializer.Serialize)
+
+                addParameter command "$ordinary" round.OrdinarySinceSynthesis
+                addParameter command "$status" round.Status
+                addParameter command "$updated" (round.UpdatedAt.ToString("o"))
+                command.ExecuteNonQuery() |> ignore
+                return Ok()
+            with exceptionValue ->
+                return Error(persistenceError "sqlite.round_save_failed" "Could not save search round." exceptionValue)
+        }
+
+    let loadLatestSearchRound store runId : Result<StoredSearchRound option, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                """
+                SELECT run_id, round, heads_json, completed_heads_json,
+                       ordinary_since_synthesis, status, updated_at
+                FROM search_rounds
+                WHERE run_id = $run
+                ORDER BY round DESC LIMIT 1;
+                """
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+
+            if reader.Read() then
+                let commits (json: string) =
+                    JsonSerializer.Deserialize<string list>(json) |> List.map CommitOid.create
+
+                Ok(
+                    Some
+                        { RunId = RunId.ofGuid (Guid.Parse(reader.GetString 0))
+                          Round = reader.GetInt32 1
+                          Heads = commits (reader.GetString 2)
+                          CompletedHeads = commits (reader.GetString 3) |> Set.ofList
+                          OrdinarySinceSynthesis = reader.GetInt32 4
+                          Status = reader.GetString 5
+                          UpdatedAt = DateTimeOffset.Parse(reader.GetString 6) }
+                )
+            else
+                Ok None
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok None
+        | exceptionValue ->
+            Error(persistenceError "sqlite.round_load_failed" "Could not load the current search round." exceptionValue)
+
+    let saveSynthesisAttempt store (attempt: StoredSynthesisAttempt) (_: CancellationToken) =
+        async {
+            try
+                let first, second =
+                    if
+                        StringComparer.Ordinal.Compare(
+                            CommitOid.value attempt.Primary,
+                            CommitOid.value attempt.Contributor
+                        )
+                        <= 0
+                    then
+                        attempt.Primary, attempt.Contributor
+                    else
+                        attempt.Contributor, attempt.Primary
+
+                use database = connection store
+                database.Open()
+                use command = database.CreateCommand()
+
+                command.CommandText <-
+                    """
+                    INSERT INTO synthesis_attempts(
+                        run_id, primary_oid, contributor_oid, policy_version,
+                        status, experiment_id, detail, updated_at)
+                    VALUES ($run, $primary, $contributor, $policy, $status, $experiment, $detail, $updated)
+                    ON CONFLICT(run_id, primary_oid, contributor_oid, policy_version) DO UPDATE SET
+                        status = excluded.status,
+                        experiment_id = excluded.experiment_id,
+                        detail = excluded.detail,
+                        updated_at = excluded.updated_at;
+                    """
+
+                addParameter command "$run" (RunId.text attempt.RunId)
+                addParameter command "$primary" (CommitOid.value first)
+                addParameter command "$contributor" (CommitOid.value second)
+                addParameter command "$policy" attempt.PolicyVersion
+                addParameter command "$status" attempt.Status
+
+                addParameter
+                    command
+                    "$experiment"
+                    (attempt.ExperimentId
+                     |> Option.map ExperimentId.text
+                     |> Option.map box
+                     |> Option.defaultValue DBNull.Value)
+
+                addParameter
+                    command
+                    "$detail"
+                    (attempt.FailureDetail |> Option.map box |> Option.defaultValue DBNull.Value)
+
+                addParameter command "$updated" (attempt.UpdatedAt.ToString("o"))
+                command.ExecuteNonQuery() |> ignore
+                return Ok()
+            with exceptionValue ->
+                return
+                    Error(
+                        persistenceError
+                            "sqlite.synthesis_attempt_save_failed"
+                            "Could not save synthesis attempt."
+                            exceptionValue
+                    )
+        }
+
+    let loadSynthesisAttempts store runId : Result<StoredSynthesisAttempt list, HarnessError> =
+        try
+            use database = connection store
+            database.Open()
+            use command = database.CreateCommand()
+
+            command.CommandText <-
+                """
+                SELECT run_id, primary_oid, contributor_oid, policy_version,
+                       status, experiment_id, detail, updated_at
+                FROM synthesis_attempts WHERE run_id = $run;
+                """
+
+            addParameter command "$run" (RunId.text runId)
+            use reader = command.ExecuteReader()
+            let results = ResizeArray<StoredSynthesisAttempt>()
+
+            while reader.Read() do
+                results.Add
+                    { RunId = RunId.ofGuid (Guid.Parse(reader.GetString 0))
+                      Primary = CommitOid.create (reader.GetString 1)
+                      Contributor = CommitOid.create (reader.GetString 2)
+                      PolicyVersion = reader.GetInt32 3
+                      Status = reader.GetString 4
+                      ExperimentId = nullableString reader 5 |> Option.map (Guid.Parse >> ExperimentId.ofGuid)
+                      FailureDetail = nullableString reader 6
+                      UpdatedAt = DateTimeOffset.Parse(reader.GetString 7) }
+
+            Ok(List.ofSeq results)
+        with
+        | :? SqliteException as exceptionValue when exceptionValue.SqliteErrorCode = 1 -> Ok []
+        | exceptionValue ->
+            Error(
+                persistenceError
+                    "sqlite.synthesis_attempts_load_failed"
+                    "Could not load synthesis attempts."
+                    exceptionValue
+            )
+
     let loadEvaluationsForRun store runId : Result<StoredEvaluation list, HarnessError> =
         try
             use database = connection store
@@ -1804,7 +3142,8 @@ module SqliteStore =
                       Outcome = reader.GetString 1
                       Metric = metric
                       Summary =
-                        { Hypothesis = reader.GetString 3
+                        { HypothesisFamily = "legacy"
+                          Hypothesis = reader.GetString 3
                           ChangeSummary = reader.GetString 4
                           ExpectedEffect = reader.GetString 5
                           ValidationNotes = JsonSerializer.Deserialize<string list>(reader.GetString 6)

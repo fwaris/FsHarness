@@ -128,6 +128,36 @@ module ConfigFile =
               MaxEvaluationCharacters = requiredInt "maxEvaluationCharacters" profile }
         | _ -> raise (InvalidDataException "promptProfile must be an object.")
 
+    let private parseGraphSearch (root: JsonElement) =
+        match tryProperty "graphSearch" root with
+        | None -> Defaults.graphSearch
+        | Some graph when graph.ValueKind = JsonValueKind.Object ->
+            let intValue name fallback =
+                tryProperty name graph
+                |> Option.map _.GetInt32()
+                |> Option.defaultValue fallback
+
+            let decimalValue name fallback =
+                tryProperty name graph
+                |> Option.map _.GetDecimal()
+                |> Option.defaultValue fallback
+
+            { InitialFanOut = intValue "initialFanOut" Defaults.graphSearch.InitialFanOut
+              BeamWidth = intValue "beamWidth" Defaults.graphSearch.BeamWidth
+              ExpansionsPerHeadPerRound =
+                intValue "expansionsPerHeadPerRound" Defaults.graphSearch.ExpansionsPerHeadPerRound
+              OrdinaryCandidatesPerSynthesis =
+                intValue "ordinaryCandidatesPerSynthesis" Defaults.graphSearch.OrdinaryCandidatesPerSynthesis
+              StagnationTrigger = intValue "stagnationTrigger" Defaults.graphSearch.StagnationTrigger
+              MaxSynthesisBudgetFraction =
+                decimalValue "maxSynthesisBudgetFraction" Defaults.graphSearch.MaxSynthesisBudgetFraction
+              MaxSynthesisDepth = intValue "maxSynthesisDepth" Defaults.graphSearch.MaxSynthesisDepth
+              ConflictResolutionAttempts =
+                intValue "conflictResolutionAttempts" Defaults.graphSearch.ConflictResolutionAttempts
+              MaxConflictFiles = intValue "maxConflictFiles" Defaults.graphSearch.MaxConflictFiles
+              MaxConflictCharacters = intValue "maxConflictCharacters" Defaults.graphSearch.MaxConflictCharacters }
+        | _ -> raise (InvalidDataException "graphSearch must be an object.")
+
     let parse (contents: string) =
         try
             use document = JsonDocument.Parse contents
@@ -159,7 +189,15 @@ module ConfigFile =
                       MaxInconclusiveRetries =
                         tryProperty "maxInconclusiveRetries" evaluator
                         |> Option.map _.GetInt32()
-                        |> Option.defaultValue 0 }
+                        |> Option.defaultValue 0
+                      MaxInfrastructureRetries =
+                        tryProperty "maxInfrastructureRetries" evaluator
+                        |> Option.map _.GetInt32()
+                        |> Option.defaultValue Defaults.evaluatorMaxInfrastructureRetries
+                      InfrastructureRetryDelay =
+                        tryProperty "infrastructureRetryDelaySeconds" evaluator
+                        |> Option.map (fun value -> TimeSpan.FromSeconds(value.GetDouble()))
+                        |> Option.defaultValue Defaults.evaluatorInfrastructureRetryDelay }
                   Metric =
                     { Name = requiredString "name" metric
                       Direction = requiredString "direction" metric |> parseDirection
@@ -170,6 +208,7 @@ module ConfigFile =
                     { Id = requiredString "id" model
                       Effort = requiredString "reasoningEffort" model |> parseEffort }
                   PromptProfile = parsePromptProfile root
+                  GraphSearch = parseGraphSearch root
                   Budgets =
                     { MaxExperiments = requiredInt "maxExperiments" budgets
                       MaxRawTokens = requiredInt64 "maxRawTokens" budgets
@@ -192,7 +231,23 @@ module ConfigFile =
         with error ->
             Error [ error.Message ]
 
-    let write (path: string) (config: HarnessConfig) =
+    let readDataRoot (path: string) =
+        try
+            use document = JsonDocument.Parse(File.ReadAllText path)
+
+            let value = optionalString "dataRoot" document.RootElement
+
+            value
+            |> Option.map (fun configured ->
+                if Path.IsPathRooted configured then
+                    Path.GetFullPath configured
+                else
+                    Path.GetFullPath(configured, Path.GetDirectoryName(Path.GetFullPath path)))
+            |> Ok
+        with error ->
+            Error [ error.Message ]
+
+    let writeWithDataRoot (dataRoot: string option) (path: string) (config: HarnessConfig) =
         match HarnessConfig.validate config with
         | Error errors -> Error errors
         | Ok validated ->
@@ -204,6 +259,7 @@ module ConfigFile =
 
                 let document =
                     {| schemaVersion = HarnessConfig.currentSchemaVersion
+                       dataRoot = dataRoot |> Option.map Path.GetFullPath |> Option.toObj
                        sourcePath = validated.SourcePath
                        baseCommit = CommitOid.value validated.BaseCommit
                        objective = validated.Objective
@@ -215,7 +271,9 @@ module ConfigFile =
                            workingDirectory = validated.Evaluator.WorkingDirectory
                            timeoutSeconds = int validated.Evaluator.Timeout.TotalSeconds
                            requiredConstraints = List.toArray validated.Evaluator.RequiredConstraints
-                           maxInconclusiveRetries = validated.Evaluator.MaxInconclusiveRetries |}
+                           maxInconclusiveRetries = validated.Evaluator.MaxInconclusiveRetries
+                           maxInfrastructureRetries = validated.Evaluator.MaxInfrastructureRetries
+                           infrastructureRetryDelaySeconds = validated.Evaluator.InfrastructureRetryDelay.TotalSeconds |}
                        metric =
                         {| name = validated.Metric.Name
                            direction = directionText validated.Metric.Direction
@@ -230,6 +288,17 @@ module ConfigFile =
                            maxMemoryCharacters = validated.PromptProfile.MaxMemoryCharacters
                            maxEvaluationFindings = validated.PromptProfile.MaxEvaluationFindings
                            maxEvaluationCharacters = validated.PromptProfile.MaxEvaluationCharacters |}
+                       graphSearch =
+                        {| initialFanOut = validated.GraphSearch.InitialFanOut
+                           beamWidth = validated.GraphSearch.BeamWidth
+                           expansionsPerHeadPerRound = validated.GraphSearch.ExpansionsPerHeadPerRound
+                           ordinaryCandidatesPerSynthesis = validated.GraphSearch.OrdinaryCandidatesPerSynthesis
+                           stagnationTrigger = validated.GraphSearch.StagnationTrigger
+                           maxSynthesisBudgetFraction = validated.GraphSearch.MaxSynthesisBudgetFraction
+                           maxSynthesisDepth = validated.GraphSearch.MaxSynthesisDepth
+                           conflictResolutionAttempts = validated.GraphSearch.ConflictResolutionAttempts
+                           maxConflictFiles = validated.GraphSearch.MaxConflictFiles
+                           maxConflictCharacters = validated.GraphSearch.MaxConflictCharacters |}
                        budgets =
                         {| maxExperiments = validated.Budgets.MaxExperiments
                            maxRawTokens = validated.Budgets.MaxRawTokens
@@ -245,3 +314,5 @@ module ConfigFile =
                 Ok destination
             with error ->
                 Error [ error.Message ]
+
+    let write (path: string) (config: HarnessConfig) = writeWithDataRoot None path config

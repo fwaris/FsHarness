@@ -14,6 +14,12 @@ open FsHarness.Core
 open FsHarness.Infrastructure
 
 module private Theme =
+    let mutable private scale = 1.0
+
+    let setScale value = scale <- value
+
+    let fontSize value = value * scale
+
     let brush (value: string) =
         SolidColorBrush(Color.Parse value) :> IBrush
 
@@ -33,24 +39,31 @@ module private Theme =
 
 [<RequireQualifiedAccess>]
 module Views =
+    let private isActiveRunStatus (status: string) =
+        status = "Running"
+        || status = "PreparingBaseline"
+        || status = "Ready"
+        || status = "PauseAfterCurrent"
+        || status = "Stopping"
+
     let private text (value: string) (size: float) (foreground: IBrush) : IView =
         TextBlock.create
             [ TextBlock.text value
-              TextBlock.fontSize size
+              TextBlock.fontSize (Theme.fontSize size)
               TextBlock.foreground foreground
               TextBlock.textWrapping TextWrapping.Wrap ]
 
     let private heading (value: string) : IView =
         TextBlock.create
             [ TextBlock.text value
-              TextBlock.fontSize 24.0
+              TextBlock.fontSize (Theme.fontSize 24.0)
               TextBlock.fontWeight FontWeight.SemiBold
               TextBlock.foreground Theme.text ]
 
     let private overline (value: string) : IView =
         TextBlock.create
             [ TextBlock.text value
-              TextBlock.fontSize 11.0
+              TextBlock.fontSize (Theme.fontSize 11.0)
               TextBlock.fontWeight FontWeight.Bold
               TextBlock.foreground Theme.accent ]
 
@@ -236,8 +249,19 @@ module Views =
                 Theme.text
 
     let private setupView (model: Model) (dispatch: Msg -> unit) : IView =
-        let canLoadExperiment = not model.Busy && model.Prepared.IsNone && model.Run.IsNone
+        let campaignRunning = model.Campaign |> Option.exists _.IsRunning
+        let canLoadExperiment = not model.Busy && not campaignRunning
         let canSaveExperiment = not model.Busy && model.Repository.IsSome
+
+        let launchBlocker =
+            if model.Busy then
+                Some "Launch is unavailable while another UI operation is in progress."
+            elif model.ExperimentFile.IsNone then
+                Some "Save or load the campaign JSON to enable launch."
+            elif campaignRunning then
+                Some "The loaded campaign is already running."
+            else
+                None
 
         let directionLabel =
             match model.Draft.MetricDirection with
@@ -292,7 +316,7 @@ module Views =
                                     muted
                                         "Private Git repositories, SQLite state, artifacts, and run worktrees are stored below this directory."
                                     muted
-                                        "The selected root is used when you prepare the next private run. Active or prepared runs must be stopped first." ]
+                                        "The selected root is passed to the headless CLI when the loaded campaign is launched." ]
                               card
                                   [ overline "3 - EXPERIMENT CONTRACT"
                                     multilineField "Objective" model.Draft.Objective DraftField.Objective 84.0 dispatch
@@ -317,6 +341,26 @@ module Views =
                                         model.Draft.EvaluatorWorkingDirectory
                                         DraftField.EvaluatorWorkingDirectory
                                         dispatch
+                                    Grid.create
+                                        [ Grid.columnDefinitions "*,*"
+                                          Grid.columnSpacing 12.0
+                                          Grid.children
+                                              [ field
+                                                    "Remote/infrastructure retries"
+                                                    model.Draft.MaxInfrastructureRetries
+                                                    DraftField.MaxInfrastructureRetries
+                                                    dispatch
+                                                Border.create
+                                                    [ Grid.column 1
+                                                      Border.child (
+                                                          field
+                                                              "Retry delay (seconds)"
+                                                              model.Draft.InfrastructureRetryDelaySeconds
+                                                              DraftField.InfrastructureRetryDelaySeconds
+                                                              dispatch
+                                                      ) ] ] ]
+                                    muted
+                                        "Retryable evaluator failures—including remote disconnects, reboots, and timeouts—rerun the same preserved candidate after this delay."
                                     field
                                         "Required constraints (semicolon-separated)"
                                         model.Draft.RequiredConstraints
@@ -356,7 +400,7 @@ module Views =
                                         CheckCodex
                                         dispatch ]
                               card
-                                  [ overline "5 - BUDGETS AND BASELINE"
+                                  [ overline "5 - BUDGETS AND HEADLESS EXECUTION"
                                     Grid.create
                                         [ Grid.columnDefinitions "*,*"
                                           Grid.columnSpacing 12.0
@@ -377,50 +421,37 @@ module Views =
                                                       ) ] ] ]
                                     muted
                                         "Token usage is reported at turn completion; the active turn can overshoot the remaining budget."
-                                    primaryButton
-                                        (if model.Busy then
-                                             "Validating…"
-                                         else
-                                             "Prepare private run and evaluate baseline")
-                                        (not model.Busy && model.Repository.IsSome)
-                                        PrepareRun
-                                        dispatch
-                                    match model.Prepared with
-                                    | None ->
-                                        muted
-                                            "Start remains unavailable until Git isolation, Codex health, and baseline evaluation pass."
-                                    | Some prepared ->
-                                        StackPanel.create
-                                            [ StackPanel.spacing 8.0
-                                              StackPanel.children
-                                                  [ text
-                                                        $"Ready · baseline score {prepared.BaselineScore}"
-                                                        15.0
-                                                        Theme.accent
-                                                    muted $"Private run: {prepared.DataDirectory}"
-                                                    primaryButton "Start measured loop" true StartRun dispatch ] ] ] ] ]
+                                    match model.Campaign with
+                                    | Some campaign when campaign.IsRunning ->
+                                        let processId =
+                                            campaign.ProcessId |> Option.map string |> Option.defaultValue "unknown"
+
+                                        text $"● Headless campaign running · PID {processId}" 13.0 Theme.accent
+                                    | Some campaign when campaign.ProcessId.IsSome ->
+                                        muted "The last headless process for this campaign is no longer running."
+                                    | _ -> muted "No headless process is associated with the loaded campaign."
+                                    StackPanel.create
+                                        [ StackPanel.orientation Orientation.Horizontal
+                                          StackPanel.spacing 8.0
+                                          StackPanel.children
+                                              [ primaryButton
+                                                    "Launch headless campaign"
+                                                    launchBlocker.IsNone
+                                                    LaunchCampaign
+                                                    dispatch
+                                                Button.create
+                                                    [ Button.content "Stop campaign"
+                                                      Button.isEnabled (not model.Busy && campaignRunning)
+                                                      Button.background Theme.dangerDark
+                                                      Button.foreground Theme.danger
+                                                      Button.borderBrush Theme.danger
+                                                      Button.onClick (fun _ -> dispatch StopCampaign) ] ] ]
+                                    muted (
+                                        launchBlocker
+                                        |> Option.defaultValue
+                                            "Ready to launch. Preparation, baseline evaluation, generation, and evaluation run only in FsHarness.Cli."
+                                    ) ] ] ]
               ) ]
-
-    let private statusText (status: RunStatus) =
-        match status with
-        | Ready -> "Ready"
-        | Running -> "Running"
-        | PauseAfterCurrent -> "Pause requested"
-        | Paused reason -> $"Paused · {reason}"
-        | Stopping -> "Stopping"
-        | Completed reason -> $"Completed · {reason}"
-        | RecoveryRequired error -> $"Recovery required · {error.Summary}"
-
-    let private phaseText (phase: ExperimentPhase) =
-        match phase with
-        | PreparingWorktree -> "Prepare"
-        | Generating -> "Codex"
-        | SnapshotPrepared -> "Snapshot"
-        | Evaluating -> "Verify"
-        | Deciding -> "Decide"
-        | AcceptPending -> "Persist"
-        | Promoting -> "Promote"
-        | AwaitingReview -> "Review"
 
     let private metricCard (label: string) (value: string) (detail: string) : IView =
         Border.create
@@ -435,81 +466,20 @@ module Views =
                         StackPanel.children [ muted label; text value 21.0 Theme.text; muted detail ] ]
               ) ]
 
-    let private runControls (run: RunState) (dispatch: Msg -> unit) : IView =
-        let canPause = run.Status = Running
-
-        let canResume =
-            match run.Status with
-            | Paused _ -> true
-            | _ -> false
-
-        let canStop =
-            match run.Status with
-            | Running
-            | PauseAfterCurrent
-            | Paused _
-            | Ready -> true
-            | _ -> false
-
-        StackPanel.create
-            [ StackPanel.orientation Orientation.Horizontal
-              StackPanel.spacing 8.0
-              StackPanel.children
-                  [ secondaryButton "Pause after current" canPause Msg.PauseAfterCurrent dispatch
-                    primaryButton "Resume" canResume ResumeRun dispatch
-                    Button.create
-                        [ Button.content "Stop now"
-                          Button.isEnabled canStop
-                          Button.background Theme.dangerDark
-                          Button.foreground Theme.danger
-                          Button.borderBrush Theme.danger
-                          Button.onClick (fun _ -> dispatch StopNow) ] ] ]
-
-    let private activityRows (activities: RuntimeActivity list) : IView list =
-        activities
-        |> List.truncate 200
-        |> List.map (fun item ->
-            Grid.create
-                [ Grid.columnDefinitions "Auto,*"
-                  Grid.columnSpacing 10.0
-                  Grid.children
-                      [ TextBlock.create
-                            [ Grid.column 0
-                              TextBlock.text (item.Timestamp.ToLocalTime().ToString("HH:mm:ss"))
-                              TextBlock.foreground Theme.muted
-                              TextBlock.fontSize 11.0 ]
-                        TextBlock.create
-                            [ Grid.column 1
-                              TextBlock.text item.Message
-                              TextBlock.foreground Theme.text
-                              TextBlock.fontSize 12.0
-                              TextBlock.textWrapping TextWrapping.Wrap ] ] ]
-            :> IView)
-
     let private currentRunView (model: Model) (dispatch: Msg -> unit) : IView =
-        match model.Run with
-        | None ->
+        match model.ExperimentFile, model.Campaign with
+        | None, _ ->
             StackPanel.create
                 [ StackPanel.margin (Thickness 24.0)
                   StackPanel.spacing 12.0
                   StackPanel.children
-                      [ heading "No active run"
-                        muted "Prepare a run from Setup before starting the ratchet."
+                      [ heading "No campaign loaded"
+                        muted "Load or save a campaign in Setup to monitor its headless process."
                         primaryButton "Open setup" true (Navigate Setup) dispatch ] ]
-        | Some run ->
-            let rawTokens = TokenUsage.rawTotal run.Usage
-            let budget = run.Config.Budgets.MaxRawTokens
-
-            let percent =
-                if budget <= 0L then
-                    0.0
-                else
-                    min 100.0 (float rawTokens / float budget * 100.0)
-
-            let currentPhase =
-                run.Current
-                |> Option.map (fun value -> phaseText value.Phase)
-                |> Option.defaultValue "Between experiments"
+        | Some configPath, campaign ->
+            let isRunning = campaign |> Option.exists _.IsRunning
+            let processLabel = if isRunning then "● RUNNING" else "○ NOT RUNNING"
+            let processBrush = if isRunning then Theme.accent else Theme.muted
 
             ScrollViewer.create
                 [ ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Auto
@@ -524,81 +494,74 @@ module Views =
                                         Grid.children
                                             [ StackPanel.create
                                                   [ StackPanel.children
-                                                        [ heading "Current run"
-                                                          text (statusText run.Status) 13.0 Theme.accent ] ]
-                                              Border.create [ Grid.column 1; Border.child (runControls run dispatch) ] ] ]
-                                  Grid.create
-                                      [ Grid.columnDefinitions "*,*,*,*"
-                                        Grid.columnSpacing 10.0
-                                        Grid.children
-                                            [ metricCard
-                                                  "Retained score"
-                                                  (string run.FrontierScore)
-                                                  run.Config.Metric.Name
-                                              Border.create
+                                                        [ heading "Current run"; text processLabel 13.0 processBrush ] ]
+                                              Button.create
                                                   [ Grid.column 1
-                                                    Border.child (
-                                                        metricCard
-                                                            "Kept / attempted"
-                                                            $"{run.AcceptedCount} / {run.Attempted}"
-                                                            "strict improvements"
-                                                    ) ]
-                                              Border.create
-                                                  [ Grid.column 2
-                                                    Border.child (
-                                                        metricCard "Raw tokens" (string rawTokens) $"of {budget}"
-                                                    ) ]
-                                              Border.create
-                                                  [ Grid.column 3
-                                                    Border.child (
-                                                        metricCard
-                                                            "Current phase"
-                                                            currentPhase
-                                                            (run.Config.Model.Id
-                                                             + " / "
-                                                             + ReasoningEffort.toConfigValue run.Config.Model.Effort)
-                                                    ) ] ] ]
+                                                    Button.content "Stop campaign"
+                                                    Button.isEnabled (isRunning && not model.Busy)
+                                                    Button.background Theme.dangerDark
+                                                    Button.foreground Theme.danger
+                                                    Button.borderBrush Theme.danger
+                                                    Button.onClick (fun _ -> dispatch StopCampaign) ] ] ]
                                   card
-                                      [ overline "TOKEN BUDGET"
-                                        ProgressBar.create
-                                            [ ProgressBar.minimum 0.0
-                                              ProgressBar.maximum 100.0
-                                              ProgressBar.value percent
-                                              ProgressBar.height 10.0 ]
-                                        muted
-                                            $"Uncached total: {TokenUsage.uncachedTotal run.Usage}; reasoning output: {run.Usage.ReasoningOutputTokens}. Cached and reasoning tokens are displayed as subsets, never added twice." ]
-                                  match run.Current with
-                                  | Some active when active.Phase = AwaitingReview ->
+                                      [ overline "HEADLESS PROCESS"
+                                        muted $"Campaign: {configPath}"
+                                        campaign
+                                        |> Option.bind _.ProcessId
+                                        |> Option.map (fun pid -> muted $"Process ID: {pid}")
+                                        |> Option.defaultValue (muted "No process has been launched for this campaign.")
+                                        campaign
+                                        |> Option.bind _.ActivityLogPath
+                                        |> Option.map (fun path -> muted $"Activity log: {path}")
+                                        |> Option.defaultValue (Border.create []) ]
+                                  match model.AssociatedRun with
+                                  | None ->
                                       card
-                                          [ overline "QUALIFIED WINNER"
-                                            text
-                                                "All automatic constraints passed and the primary metric strictly improved. Review can only accept or reject this already-qualified candidate."
-                                                13.0
-                                                Theme.text
-                                            StackPanel.create
-                                                [ StackPanel.orientation Orientation.Horizontal
-                                                  StackPanel.spacing 8.0
-                                                  StackPanel.children
-                                                      [ primaryButton
-                                                            "Accept winner"
-                                                            (not model.Busy)
-                                                            AcceptWinner
-                                                            dispatch
-                                                        secondaryButton
-                                                            "Reject and continue"
-                                                            (not model.Busy)
-                                                            RejectWinner
-                                                            dispatch ] ] ]
-                                  | _ -> Border.create []
-                                  card
-                                      [ overline "ACTIVITY"
-                                        if List.isEmpty model.Activities then
+                                          [ overline "DURABLE RUN STATE"
                                             muted
-                                                "Activity appears here when the run starts. Full JSONL remains in the run artifacts."
-                                        else
-                                            StackPanel.create
-                                                [ StackPanel.spacing 7.0
-                                                  StackPanel.children (activityRows model.Activities) ] ] ] ]
+                                                "No persisted run has been associated yet. The monitor checks the selected data root every five seconds." ]
+                                  | Some run ->
+                                      Grid.create
+                                          [ Grid.columnDefinitions "*,*,*,*"
+                                            Grid.columnSpacing 10.0
+                                            Grid.children
+                                                [ metricCard "Stored status" run.Status "durable SQLite state"
+                                                  Border.create
+                                                      [ Grid.column 1
+                                                        Border.child (
+                                                            metricCard
+                                                                "Retained score"
+                                                                (run.FrontierScore
+                                                                 |> Option.map string
+                                                                 |> Option.defaultValue "—")
+                                                                run.MetricName
+                                                        ) ]
+                                                  Border.create
+                                                      [ Grid.column 2
+                                                        Border.child (
+                                                            metricCard
+                                                                "Kept / attempted"
+                                                                $"{run.AcceptedCount} / {run.AttemptCount}"
+                                                                "strict improvements"
+                                                        ) ]
+                                                  Border.create
+                                                      [ Grid.column 3
+                                                        Border.child (
+                                                            metricCard
+                                                                "Last update"
+                                                                (run.UpdatedAt.ToLocalTime().ToString("HH:mm:ss"))
+                                                                (run.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd"))
+                                                        ) ] ] ]
+                                  if
+                                      not isRunning
+                                      && (model.AssociatedRun |> Option.exists (fun run -> isActiveRunStatus run.Status))
+                                  then
+                                      card
+                                          [ overline "PROCESS / STATE MISMATCH"
+                                            text
+                                                "The durable run is marked active, but its headless process is not running. Resume or recover it before expecting more progress."
+                                                13.0
+                                                Theme.warning ] ] ]
                   ) ]
 
     let private shortCommit commit =
@@ -623,28 +586,60 @@ module Views =
         Line.create
             [ Line.startPoint (Point(edge.From.X, edge.From.Y))
               Line.endPoint (Point(edge.To.X, edge.To.Y))
-              Line.stroke Theme.border
-              Line.strokeThickness 2.0 ]
+              Line.stroke (
+                  if edge.Kind = ExperimentKind.Synthesis then
+                      Theme.accent
+                  else
+                      Theme.border
+              )
+              Line.strokeThickness (
+                  if edge.Role = ExperimentParentRole.Contributor then
+                      3.0
+                  else
+                      2.0
+              ) ]
 
-    let private evolutionNodeButton (layout: EvolutionNodeLayout) (selected: bool) (dispatch: Msg -> unit) : IView =
+    let private evolutionNodeButton
+        (layout: EvolutionNodeLayout)
+        (selected: bool)
+        (related: bool)
+        (dispatch: Msg -> unit)
+        : IView =
         let node = layout.Node
 
         let marker =
-            match node.Outcome with
-            | EvolutionOutcome.Accepted -> "✓"
-            | EvolutionOutcome.Rejected _ -> "×"
-            | EvolutionOutcome.Failed _ -> "!"
-            | EvolutionOutcome.Inconclusive _ -> "?"
-            | EvolutionOutcome.Cancelled -> "–"
-            | EvolutionOutcome.Active _ -> "…"
-            | EvolutionOutcome.Unknown _ -> "·"
+            if layout.IsSynthesis then
+                "◇"
+            else
+                match node.Outcome with
+                | EvolutionOutcome.Accepted -> "✓"
+                | EvolutionOutcome.Rejected _ -> "×"
+                | EvolutionOutcome.Failed _ -> "!"
+                | EvolutionOutcome.Inconclusive _ -> "?"
+                | EvolutionOutcome.Cancelled -> "–"
+                | EvolutionOutcome.Active _ -> "…"
+                | EvolutionOutcome.Unknown _ -> "·"
+
+        let badges =
+            [ if layout.IsChampion then
+                  "CHAMPION"
+              if layout.IsActiveHead then
+                  "HEAD" ]
+            |> String.concat " · "
+
+        let label =
+            if String.IsNullOrWhiteSpace badges then
+                $"{marker} {node.Label}\n{shortCommit node.Commit}"
+            else
+                $"{marker} {node.Label}\n{badges} · {shortCommit node.Commit}"
 
         Button.create
             [ Canvas.left layout.X
               Canvas.top layout.Y
               Button.width layout.Width
               Button.height layout.Height
-              Button.content $"{marker} {node.Label}\n{shortCommit node.Commit}"
+              Button.content label
+              Button.fontSize (Theme.fontSize 10.0)
               Button.background (
                   if selected then
                       Theme.accentDark
@@ -652,8 +647,12 @@ module Views =
                       outcomeBrush node.Outcome
               )
               Button.foreground Theme.text
-              Button.borderBrush (if selected then Theme.accent else Theme.border)
-              Button.borderThickness (if selected then 2.0 else 1.0)
+              Button.borderBrush (
+                  if selected then Theme.accent
+                  elif related then Theme.warning
+                  else Theme.border
+              )
+              Button.borderThickness (if selected || related then 2.0 else 1.0)
               Button.padding (Thickness(8.0, 5.0))
               Button.onClick (fun _ -> dispatch (SelectEvolutionNode node.Id)) ]
 
@@ -680,7 +679,7 @@ module Views =
                       Button.width 20.0
                       Button.height 20.0
                       Button.content "●"
-                      Button.fontSize 14.0
+                      Button.fontSize (Theme.fontSize 14.0)
                       Button.padding 0.0
                       Button.background (if selected then Theme.accentDark else Theme.surfaceRaised)
                       Button.foreground Theme.accent
@@ -694,12 +693,56 @@ module Views =
         (selected: EvolutionNodeId option)
         (dispatch: Msg -> unit)
         : IView =
-        let layout = EvolutionLayout.build snapshot
+        let layout = EvolutionLayout.buildForSelection snapshot selected
+
+        let selectedCommit =
+            selected
+            |> Option.bind (fun nodeId ->
+                layout.Nodes
+                |> List.tryFind (fun item -> item.Node.Id = nodeId)
+                |> Option.bind (fun item -> item.Node.Commit))
+
+        let rec connected step visited frontier =
+            match frontier with
+            | [] -> visited
+            | commit :: rest when Set.contains commit visited -> connected step visited rest
+            | commit :: rest ->
+                let next = step commit
+                connected step (Set.add commit visited) (next @ rest)
+
+        let relatedCommits =
+            match selectedCommit with
+            | None -> Set.empty
+            | Some commit ->
+                let ancestors =
+                    connected
+                        (fun child ->
+                            snapshot.Edges
+                            |> List.filter (fun edge -> edge.Child = child)
+                            |> List.map _.Parent)
+                        Set.empty
+                        [ commit ]
+
+                let descendants =
+                    connected
+                        (fun parent ->
+                            snapshot.Edges
+                            |> List.filter (fun edge -> edge.Parent = parent)
+                            |> List.map _.Child)
+                        Set.empty
+                        [ commit ]
+
+                Set.union ancestors descendants
 
         let graphChildren =
             (layout.Edges |> List.map evolutionEdge)
             @ (layout.Nodes
-               |> List.map (fun item -> evolutionNodeButton item (selected = Some item.Node.Id) dispatch))
+               |> List.map (fun item ->
+                   let related =
+                       item.Node.Commit
+                       |> Option.exists (fun commit -> Set.contains commit relatedCommits)
+
+                   evolutionNodeButton item (selected = Some item.Node.Id) related dispatch))
 
         let chartLines =
             layout.Scores
@@ -718,7 +761,7 @@ module Views =
                         Canvas.top 6.0
                         TextBlock.text (string value)
                         TextBlock.foreground Theme.muted
-                        TextBlock.fontSize 10.0 ]
+                        TextBlock.fontSize (Theme.fontSize 10.0) ]
                   :> IView
               | None -> TextBlock.create [] :> IView
               match layout.AxisMinimum with
@@ -728,7 +771,7 @@ module Views =
                         Canvas.top 174.0
                         TextBlock.text (string value)
                         TextBlock.foreground Theme.muted
-                        TextBlock.fontSize 10.0 ]
+                        TextBlock.fontSize (Theme.fontSize 10.0) ]
                   :> IView
               | None -> TextBlock.create [] :> IView ]
 
@@ -834,7 +877,8 @@ module Views =
                                 |> List.map (fun run ->
                                     let runIdText = RunId.text run.Id
                                     let runTime = run.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-                                    let label = $"{runTime} · {runIdText.Substring(0, 8)} · {run.Status}"
+                                    let livePrefix = if isActiveRunStatus run.Status then "● LIVE · " else ""
+                                    let label = $"{livePrefix}{runTime} · {runIdText.Substring(0, 8)} · {run.Status}"
 
                                     Button.create
                                         [ Button.horizontalContentAlignment HorizontalAlignment.Left
@@ -855,10 +899,19 @@ module Views =
                   ) ]
 
     let private evolutionView (model: Model) (dispatch: Msg -> unit) : IView =
+        let activeRun =
+            if model.Campaign |> Option.exists _.IsRunning then
+                model.AssociatedRun
+                |> Option.orElseWith (fun () ->
+                    model.EvolutionRuns
+                    |> List.tryFind (fun run -> model.SelectedEvolutionRun = Some run.Id))
+            else
+                None
+
         let body =
             match model.Evolution, model.EvolutionBusy with
             | None, true -> muted "Loading run evolution…"
-            | None, false -> muted "Select a run to inspect its retained frontier and candidate branches."
+            | None, false -> muted "Select a run to inspect its champion, active heads, and experiment DAG."
             | Some snapshot, _ ->
                 StackPanel.create
                     [ StackPanel.spacing 14.0
@@ -884,7 +937,87 @@ module Views =
                                           secondaryButton "Refresh" (not model.EvolutionBusy) RefreshEvolution dispatch
                                           |> fun view -> Border.create [ Grid.column 1; Border.child view ] ] ]
                               muted
-                                  "Accepted candidates extend the central retained trunk; side branches are preserved rejected or failed attempts."
+                                  "Work is laid out by DAG depth. Diamonds are two-parent synthesis commits; champion and active heads are labeled. Select a node to highlight its ancestors and descendants."
+                              match activeRun with
+                              | Some run ->
+                                  card
+                                      [ overline "● LIVE CAMPAIGN"
+                                        text $"{RunId.text run.Id} · {run.Status}" 14.0 Theme.accent
+                                        muted
+                                            "The process monitor updates automatically. This graph changes only when Refresh is selected." ]
+                              | None -> Border.create []
+                              evolutionRunSelector model dispatch
+                              body ] ]
+              ) ]
+
+    let private relationLabel relation =
+        match relation with
+        | GraphRelationKind.Mentions -> "MENTIONS"
+        | GraphRelationKind.Supports -> "SUPPORTS"
+        | GraphRelationKind.Contradicts -> "CONTRADICTS"
+        | GraphRelationKind.DerivedFrom -> "DERIVED_FROM"
+        | GraphRelationKind.Produced -> "PRODUCED"
+        | GraphRelationKind.Evaluates -> "EVALUATES"
+        | GraphRelationKind.Revises -> "REVISES"
+        | GraphRelationKind.Supersedes -> "SUPERSEDES"
+        | GraphRelationKind.DependsOn -> "DEPENDS_ON"
+        | GraphRelationKind.ParentOf -> "PARENT_OF"
+        | GraphRelationKind.ResolvedTo -> "RESOLVED_TO"
+
+    let private knowledgeView (model: Model) (dispatch: Msg -> unit) : IView =
+        let body =
+            match model.Knowledge, model.KnowledgeBusy with
+            | None, true -> muted "Loading repository knowledge…"
+            | None, false -> muted "Select a run to inspect repository-scoped provenance."
+            | Some graph, _ ->
+                let nodes = RepositoryKnowledgeGraph.currentNodes graph
+
+                let name id =
+                    nodes
+                    |> Map.tryFind id
+                    |> Option.map _.CanonicalName
+                    |> Option.defaultValue (GraphNodeId.value id)
+
+                let rows =
+                    graph.Edges
+                    |> Map.values
+                    |> Seq.sortBy (fun edge -> edge.ValidFrom, GraphEdgeId.value edge.Id)
+                    |> Seq.map (fun edge ->
+                        let provenance =
+                            match edge.Provenance with
+                            | GraphProvenance.Sourced sources -> $"{sources.Count} source(s)"
+                            | GraphProvenance.Inference rationale -> $"inference · {rationale}"
+
+                        card
+                            [ overline (relationLabel edge.Relation)
+                              text $"{name edge.From}  →  {name edge.To}" 13.0 Theme.text
+                              muted $"[{GraphEdgeId.value edge.Id}] · {provenance} · confidence {edge.Confidence}" ])
+                    |> List.ofSeq
+
+                StackPanel.create
+                    [ StackPanel.spacing 12.0
+                      StackPanel.children
+                          [ muted $"{nodes.Count} current nodes · {graph.Edges.Count} append-only relations"
+                            if List.isEmpty rows then
+                                muted "No evaluated experiment knowledge has been recorded yet."
+                            else
+                                StackPanel.create [ StackPanel.spacing 8.0; StackPanel.children rows ] ] ]
+
+        ScrollViewer.create
+            [ ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Auto
+              ScrollViewer.content (
+                  StackPanel.create
+                      [ StackPanel.margin (Thickness 24.0)
+                        StackPanel.spacing 14.0
+                        StackPanel.children
+                            [ Grid.create
+                                  [ Grid.columnDefinitions "*,Auto"
+                                    Grid.children
+                                        [ heading "Knowledge graph"
+                                          secondaryButton "Refresh" (not model.KnowledgeBusy) RefreshKnowledge dispatch
+                                          |> fun view -> Border.create [ Grid.column 1; Border.child view ] ] ]
+                              muted
+                                  "Repository-scoped claims, artifacts, evaluations, runs, metrics, and commits. Relations retain stable IDs and provenance; refresh is manual."
                               evolutionRunSelector model dispatch
                               body ] ]
               ) ]
@@ -892,9 +1025,16 @@ module Views =
     let private historyView (model: Model) (dispatch: Msg -> unit) : IView =
         let rows =
             model.History
+            |> List.sortByDescending _.Sequence
             |> List.map (fun item ->
+                let tokenText =
+                    item.Usage
+                    |> Option.map (fun usage ->
+                        $"raw {TokenUsage.rawTotal usage:N0} · in {usage.InputTokens:N0} · out {usage.OutputTokens:N0}")
+                    |> Option.defaultValue "—"
+
                 Grid.create
-                    [ Grid.columnDefinitions "120,145,160,*"
+                    [ Grid.columnDefinitions "120,145,210,160,*"
                       Grid.columnSpacing 12.0
                       Grid.children
                           [ text (item.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")) 11.0 Theme.muted
@@ -902,24 +1042,30 @@ module Views =
                                 [ Grid.column 1
                                   TextBlock.text item.Kind
                                   TextBlock.foreground Theme.accent
-                                  TextBlock.fontSize 12.0 ]
+                                  TextBlock.fontSize (Theme.fontSize 12.0) ]
                             TextBlock.create
                                 [ Grid.column 2
-                                  TextBlock.text (RunId.text item.RunId)
-                                  TextBlock.foreground Theme.muted
-                                  TextBlock.fontSize 10.0 ]
+                                  TextBlock.text tokenText
+                                  TextBlock.foreground Theme.warning
+                                  TextBlock.fontSize (Theme.fontSize 10.0) ]
                             TextBlock.create
                                 [ Grid.column 3
+                                  TextBlock.text (RunId.text item.RunId)
+                                  TextBlock.foreground Theme.muted
+                                  TextBlock.fontSize (Theme.fontSize 10.0) ]
+                            TextBlock.create
+                                [ Grid.column 4
                                   TextBlock.text item.Payload
                                   TextBlock.foreground Theme.text
-                                  TextBlock.fontSize 12.0
+                                  TextBlock.fontSize (Theme.fontSize 12.0)
                                   TextBlock.textWrapping TextWrapping.Wrap ] ] ]
                 :> IView)
 
-        StackPanel.create
-            [ StackPanel.margin (Thickness 24.0)
-              StackPanel.spacing 14.0
-              StackPanel.children
+        Grid.create
+            [ Grid.margin (Thickness 24.0)
+              Grid.rowDefinitions "Auto,Auto,*"
+              Grid.rowSpacing 14.0
+              Grid.children
                   [ Grid.create
                         [ Grid.columnDefinitions "*,Auto"
                           Grid.children
@@ -928,16 +1074,25 @@ module Views =
                                     [ Grid.column 1
                                       Border.child (secondaryButton "Refresh" (not model.Busy) RefreshHistory dispatch) ] ] ]
                     muted
-                        "Append-only state transitions and outcomes. Candidate code lineage remains in each run's private Git refs."
-                    card
-                        [ if List.isEmpty rows then
-                              muted "No journal events yet."
-                          else
-                              ScrollViewer.create
-                                  [ ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Auto
-                                    ScrollViewer.content (
-                                        StackPanel.create [ StackPanel.spacing 8.0; StackPanel.children rows ]
-                                    ) ] ] ] ]
+                        "Newest events are shown first. Token counts are attached to events for their associated experiment."
+                    |> fun view -> Border.create [ Grid.row 1; Border.child view ]
+                    Border.create
+                        [ Grid.row 2
+                          Border.background Theme.surface
+                          Border.borderBrush Theme.border
+                          Border.borderThickness 1.0
+                          Border.cornerRadius Theme.radius
+                          Border.padding 16.0
+                          Border.child (
+                              if List.isEmpty rows then
+                                  muted "No journal events yet."
+                              else
+                                  ScrollViewer.create
+                                      [ ScrollViewer.verticalScrollBarVisibility ScrollBarVisibility.Auto
+                                        ScrollViewer.content (
+                                            StackPanel.create [ StackPanel.spacing 8.0; StackPanel.children rows ]
+                                        ) ]
+                          ) ] ] ]
 
     let private settingsView (model: Model) : IView =
         let writePolicy =
@@ -999,11 +1154,14 @@ module Views =
               Button.onClick (fun _ -> dispatch (Navigate target)) ]
 
     let view (model: Model) (dispatch: Msg -> unit) : IView =
+        Theme.setScale model.FontScale
+
         let page: IView =
             match model.Page with
             | Setup -> setupView model dispatch
             | CurrentRun -> currentRunView model dispatch
             | Evolution -> evolutionView model dispatch
+            | Knowledge -> knowledgeView model dispatch
             | History -> historyView model dispatch
             | Settings -> settingsView model
 
@@ -1024,13 +1182,42 @@ module Views =
                                               [ DockPanel.dock Dock.Top
                                                 StackPanel.margin (Thickness(6.0, 10.0, 6.0, 24.0))
                                                 StackPanel.children
-                                                    [ overline "FSHARNESS"; text "Experiment Ratchet" 17.0 Theme.text ] ]
+                                                    [ overline "FSHARNESS"
+                                                      text "Experiment Graph Search" 17.0 Theme.text ] ]
+                                          StackPanel.create
+                                              [ DockPanel.dock Dock.Bottom
+                                                StackPanel.spacing 6.0
+                                                StackPanel.children
+                                                    [ overline "FONT SIZE"
+                                                      StackPanel.create
+                                                          [ StackPanel.orientation Orientation.Horizontal
+                                                            StackPanel.spacing 8.0
+                                                            StackPanel.children
+                                                                [ secondaryButton
+                                                                      "−"
+                                                                      (model.FontScale > 0.8)
+                                                                      DecreaseFont
+                                                                      dispatch
+                                                                  muted (sprintf "%.0f%%" (model.FontScale * 100.0))
+                                                                  secondaryButton
+                                                                      "+"
+                                                                      (model.FontScale < 1.6)
+                                                                      IncreaseFont
+                                                                      dispatch ] ] ] ]
                                           StackPanel.create
                                               [ StackPanel.spacing 5.0
                                                 StackPanel.children
                                                     [ navigationButton model.Page Setup "Setup" dispatch
-                                                      navigationButton model.Page CurrentRun "Current Run" dispatch
+                                                      navigationButton
+                                                          model.Page
+                                                          CurrentRun
+                                                          (if model.Campaign |> Option.exists _.IsRunning then
+                                                               "Current Run  ●"
+                                                           else
+                                                               "Current Run")
+                                                          dispatch
                                                       navigationButton model.Page Evolution "Evolution" dispatch
+                                                      navigationButton model.Page Knowledge "Knowledge" dispatch
                                                       navigationButton model.Page History "History" dispatch
                                                       navigationButton model.Page Settings "Settings" dispatch ] ] ] ]
                           ) ]
