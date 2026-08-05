@@ -473,7 +473,10 @@ module StorageTests =
             |> ignore
 
             let configJson = File.ReadAllText configPath
-            use database = new SqliteConnection($"Data Source={databasePath}")
+            // This fixture deletes the temporary database immediately after the action.
+            // Disable pooling so disposed migration connections cannot keep a native
+            // handle to legacy.db alive through the process-wide SQLite pool.
+            use database = new SqliteConnection($"Data Source={databasePath};Pooling=False")
             database.Open()
             use command = database.CreateCommand()
 
@@ -524,7 +527,7 @@ module StorageTests =
             Assert.Contains(CommitOid.create champion, heads)
             Assert.Contains(CommitOid.create retained, heads)
 
-            use migrated = new SqliteConnection($"Data Source={databasePath}")
+            use migrated = new SqliteConnection($"Data Source={databasePath};Pooling=False")
             migrated.Open()
             use version = migrated.CreateCommand()
             version.CommandText <- "PRAGMA user_version;"

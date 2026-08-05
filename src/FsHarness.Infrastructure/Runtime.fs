@@ -315,6 +315,10 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                 |> List.find (fun parent -> parent.Role = ExperimentParentRole.Primary)
                 |> _.Commit
 
+            let abortRepositoryUpdate error =
+                enterRecovery error (Some experimentId)
+                raise (RuntimePersistenceAbort error)
+
             let entity =
                 { Id = KnowledgeEntityId.create ()
                   Kind = KnowledgeEntityKind.Experiment
@@ -373,10 +377,10 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         | Error error -> publish $"Knowledge graph warning: {error.Summary}" (Some experimentId)
 
                     match SqliteStore.projectIdForRun sqlite runId with
-                    | Error error -> enterRecovery error (Some experimentId)
+                    | Error error -> abortRepositoryUpdate error
                     | Ok projectId ->
                         match SqliteStore.loadRepositoryKnowledgeGraph sqlite projectId with
-                        | Error error -> enterRecovery error (Some experimentId)
+                        | Error error -> abortRepositoryUpdate error
                         | Ok repositoryGraph ->
                             let now = DateTimeOffset.UtcNow
                             let runText = RunId.text runId
@@ -395,13 +399,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             let candidateNode = nodeId "commit" (CommitOid.value candidate)
 
                             let node kind id name attributes =
-                                { Id = id
-                                  Kind = kind
-                                  CanonicalName = name
-                                  Attributes = attributes
-                                  Version = 1
-                                  OriginRunId = runId
-                                  CreatedAt = now }
+                                RepositoryKnowledgeGraph.versionNode runId now kind id name attributes repositoryGraph
 
                             let sourced relation fromNode toNode =
                                 { Id = edgeId (string relation) (GraphNodeId.value fromNode) (GraphNodeId.value toNode)
@@ -486,16 +484,15 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
                             match RepositoryKnowledgeGraph.apply update repositoryGraph with
                             | Error errors ->
-                                enterRecovery
-                                    (HarnessError.create
-                                        "runtime.repository_graph_invalid"
-                                        HarnessErrorCategory.Persistence
-                                        (String.concat " " errors))
-                                    (Some experimentId)
+                                HarnessError.create
+                                    "runtime.repository_graph_invalid"
+                                    HarnessErrorCategory.Persistence
+                                    (String.concat " " errors)
+                                |> abortRepositoryUpdate
                             | Ok _ ->
                                 match! SqliteStore.saveRepositoryGraphUpdate sqlite update cancellationToken with
                                 | Ok _ -> ()
-                                | Error error -> enterRecovery error (Some experimentId)
+                                | Error error -> abortRepositoryUpdate error
         }
 
     let experimentSchema =
@@ -622,6 +619,18 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         | Some _ -> Ok()
 
     let tryCurrent () = lock stateGate (fun () -> state)
+
+    let isRunLive (storedRun: StoredRun) =
+        if tryCurrent () |> Option.exists (fun current -> current.Id = storedRun.Id) then
+            true
+        elif String.IsNullOrWhiteSpace storedRun.SourcePath then
+            false
+        else
+            match ProjectLock.tryAcquire (DataPaths.projectLock root storedRun.SourcePath) with
+            | Error _ -> true
+            | Ok probe ->
+                probe.Dispose()
+                false
 
     let beginPromotion experimentId =
         match dispatch (PromotionStarted experimentId) with
@@ -1931,7 +1940,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                 |> List.filter (fun node -> node.Kind = EvolutionNodeKind.Candidate)
                 |> List.length
 
-            let live = tryCurrent () |> Option.exists (fun state -> state.Id = storedRun.Id)
+            let live = isRunLive storedRun
 
             let runSummary =
                 { Id = storedRun.Id
@@ -3252,7 +3261,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                               Status =
                                 if
                                     stored.Status = "Running"
-                                    && not (tryCurrent () |> Option.exists (fun value -> value.Id = stored.Id))
+                                    && not (isRunLive stored)
                                 then
                                     "Interrupted"
                                 else

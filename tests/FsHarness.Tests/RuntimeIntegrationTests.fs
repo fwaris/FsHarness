@@ -50,6 +50,83 @@ module RuntimeIntegrationTests =
         finally
             deleteTree temporary
 
+    [<Fact>]
+    let ``evolution recognizes a running headless owner through the project lock`` () =
+        let temporary =
+            Path.Combine(Path.GetTempPath(), $"fsharness-liveness-{Guid.NewGuid():N}")
+
+        let source = Path.Combine(temporary, "source")
+        let dataRoot = Path.Combine(temporary, "data")
+        Directory.CreateDirectory source |> ignore
+
+        let config =
+            { SchemaVersion = HarnessConfig.currentSchemaVersion
+              SourcePath = source
+              BaseCommit = CommitOid.create (String('a', 40))
+              Objective = "Exercise cross-process liveness."
+              EditablePaths = [ "src/**" ]
+              SeedPatches = []
+              Evaluator =
+                { Executable = "evaluator"
+                  Arguments = []
+                  WorkingDirectory = "."
+                  Timeout = TimeSpan.FromMinutes 1.0
+                  RequiredConstraints = [ "tests" ]
+                  MaxInconclusiveRetries = 0
+                  MaxInfrastructureRetries = 0
+                  InfrastructureRetryDelay = TimeSpan.FromSeconds 1.0 }
+              Metric =
+                { Name = "primary"
+                  Direction = Maximize
+                  MinDelta = 0M
+                  Target = None
+                  Comparison = RetainedScore }
+              Model = Defaults.model
+              PromptProfile = Defaults.promptProfile
+              GraphSearch = Defaults.graphSearch
+              Budgets = Defaults.budgets
+              PromotionMode = AutoWhenStrictlyBetter }
+
+        try
+            let store = SqliteStore.create (Path.Combine(dataRoot, "fsharness.db"))
+            let runId = RunId.create ()
+
+            SqliteStore.initialize store CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            SqliteStore.saveRun store runId config "Running" CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            let liveStatus =
+                use projectLock =
+                    match ProjectLock.tryAcquire (DataPaths.projectLock dataRoot source) with
+                    | Ok acquired -> acquired
+                    | Error error -> failwith error
+
+                use observer = new HarnessRuntime(dataRoot, "codex")
+
+                observer.ListEvolutionRuns(CancellationToken.None)
+                |> Async.RunSynchronously
+                |> getResult
+                |> List.find (fun run -> run.Id = runId)
+                |> _.Status
+
+            use observer = new HarnessRuntime(dataRoot, "codex")
+
+            let interruptedStatus =
+                observer.ListEvolutionRuns(CancellationToken.None)
+                |> Async.RunSynchronously
+                |> getResult
+                |> List.find (fun run -> run.Id = runId)
+                |> _.Status
+
+            Assert.Equal("Running", liveStatus)
+            Assert.Equal("Interrupted", interruptedStatus)
+        finally
+            deleteTree temporary
+
     let private runGit workingDirectory arguments =
         let startInfo = ProcessStartInfo()
         startInfo.FileName <- "git"

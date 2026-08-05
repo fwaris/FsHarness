@@ -982,6 +982,52 @@ module RepositoryKnowledgeGraphTests =
         Assert.False context.Truncated
 
     [<Fact>]
+    let ``shared repository nodes retain identical versions and append changed content`` () =
+        let firstRun = RunId.create ()
+        let secondRun = RunId.create ()
+        let nodeId = GraphNodeId.create "commit:shared"
+        let createdAt = DateTimeOffset.UtcNow
+
+        let original =
+            RepositoryKnowledgeGraph.versionNode
+                firstRun
+                createdAt
+                GraphNodeKind.Commit
+                nodeId
+                "shared"
+                Map.empty
+                (RepositoryKnowledgeGraph.empty "repo")
+
+        let graph =
+            { RepositoryKnowledgeGraph.empty "repo" with
+                Nodes = Map [ nodeId, [ original ] ] }
+
+        let retained =
+            RepositoryKnowledgeGraph.versionNode
+                secondRun
+                (createdAt.AddMinutes 1.0)
+                GraphNodeKind.Commit
+                nodeId
+                "shared"
+                Map.empty
+                graph
+
+        let changed =
+            RepositoryKnowledgeGraph.versionNode
+                secondRun
+                (createdAt.AddMinutes 2.0)
+                GraphNodeKind.Commit
+                nodeId
+                "shared"
+                (Map [ "verified", "true" ])
+                graph
+
+        Assert.Equal(original, retained)
+        Assert.Equal(2, changed.Version)
+        Assert.Equal(secondRun, changed.OriginRunId)
+        Assert.Equal("true", changed.Attributes["verified"])
+
+    [<Fact>]
     let ``artifact provenance invariants and exact aliases are enforced`` () =
         let runId = RunId.create ()
 

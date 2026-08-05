@@ -341,6 +341,26 @@ module RepositoryKnowledgeGraph =
     let currentNodes (graph: RepositoryKnowledgeGraph) : Map<GraphNodeId, RepositoryGraphNode> =
         graph.Nodes |> Map.map (fun _ versions -> versions |> List.maxBy _.Version)
 
+    let versionNode originRunId createdAt kind id canonicalName attributes graph =
+        let create version =
+            { Id = id
+              Kind = kind
+              CanonicalName = canonicalName
+              Attributes = attributes
+              Version = version
+              OriginRunId = originRunId
+              CreatedAt = createdAt }
+
+        match currentNodes graph |> Map.tryFind id with
+        | Some current when
+            current.Kind = kind
+            && current.CanonicalName = canonicalName
+            && current.Attributes = attributes
+            ->
+            current
+        | Some current -> create (current.Version + 1)
+        | None -> create 1
+
     let private validateNode (node: RepositoryGraphNode) =
         if String.IsNullOrWhiteSpace(GraphNodeId.value node.Id) then
             Error "Graph nodes require stable identifiers."
