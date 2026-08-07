@@ -7,13 +7,16 @@ open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open FsHarness.Infrastructure
+open Microsoft.Data.Sqlite
 
 type HeadlessCampaignStatus =
     { ConfigPath: string
       DataRoot: string
       IsRunning: bool
+      IsManagedProcess: bool
       ProcessId: int option
       StartedAt: DateTimeOffset option
+      ControlPath: string option
       ActivityLogPath: string option
       SummaryPath: string option }
 
@@ -27,6 +30,8 @@ type private CampaignProcessRecord =
       ControlPath: string
       ActivityLogPath: string
       SummaryPath: string }
+
+type private DurableCampaignRun = { CreatedAt: DateTimeOffset }
 
 [<RequireQualifiedAccess>]
 module HeadlessCampaign =
@@ -48,10 +53,63 @@ module HeadlessCampaign =
         { ConfigPath = Path.GetFullPath configPath
           DataRoot = Path.GetFullPath dataRoot
           IsRunning = false
+          IsManagedProcess = false
           ProcessId = None
           StartedAt = None
+          ControlPath = None
           ActivityLogPath = None
           SummaryPath = None }
+
+    let private tryReadActiveDurableRun dataRoot =
+        let databasePath = Path.Combine(Path.GetFullPath dataRoot, "fsharness.db")
+
+        if not (File.Exists databasePath) then
+            None
+        else
+            try
+                let connectionString = $"Data Source={databasePath};Mode=ReadOnly;Default Timeout=1"
+
+                use connection = new SqliteConnection(connectionString)
+                connection.Open()
+
+                use command = connection.CreateCommand()
+                command.CommandTimeout <- 1
+
+                command.CommandText <-
+                    """
+                    SELECT created_at
+                    FROM runs
+                    WHERE status IN ('Running', 'PauseAfterCurrent', 'Stopping')
+                    ORDER BY updated_at DESC
+                    LIMIT 1;
+                    """
+
+                use reader = command.ExecuteReader()
+
+                if reader.Read() then
+                    Some { CreatedAt = DateTimeOffset.Parse(reader.GetString 0) }
+                else
+                    None
+            with _ ->
+                // The campaign owns this database. A transient writer lock is
+                // not a monitor failure and must not alter campaign state.
+                None
+
+    let private tryFindExternalControl dataRoot =
+        let launches = Path.Combine(Path.GetFullPath dataRoot, "launches")
+
+        try
+            if not (Directory.Exists launches) then
+                None
+            else
+                Directory.EnumerateFiles(launches, "activity.log", SearchOption.AllDirectories)
+                |> Seq.sortByDescending File.GetLastWriteTimeUtc
+                |> Seq.tryHead
+                |> Option.map (fun activityPath ->
+                    let directory = Path.GetDirectoryName activityPath
+                    Path.Combine(directory, "stop.request"), activityPath)
+        with _ ->
+            None
 
     let private processMatches (record: CampaignProcessRecord) =
         try
@@ -90,21 +148,44 @@ module HeadlessCampaign =
     let status configPath dataRoot =
         try
             match readRecord dataRoot configPath with
-            | None -> emptyStatus configPath dataRoot
+            | None ->
+                match tryReadActiveDurableRun dataRoot with
+                | None -> emptyStatus configPath dataRoot
+                | Some durableRun ->
+                    let controlPath, activityLogPath =
+                        tryFindExternalControl dataRoot
+                        |> Option.map (fun (control, activity) -> Some control, Some activity)
+                        |> Option.defaultValue (None, None)
+
+                    { ConfigPath = Path.GetFullPath configPath
+                      DataRoot = Path.GetFullPath dataRoot
+                      IsRunning = true
+                      IsManagedProcess = false
+                      ProcessId = None
+                      StartedAt = Some durableRun.CreatedAt
+                      ControlPath = controlPath
+                      ActivityLogPath = activityLogPath
+                      SummaryPath = None }
             | Some record ->
+                let isRunning = processMatches record
+
                 { ConfigPath = record.ConfigPath
                   DataRoot = record.DataRoot
-                  IsRunning = processMatches record
+                  IsRunning = isRunning
+                  IsManagedProcess = isRunning
                   ProcessId = Some record.ProcessId
                   StartedAt = Some record.StartedAt
+                  ControlPath = Some record.ControlPath
                   ActivityLogPath = Some record.ActivityLogPath
                   SummaryPath = Some record.SummaryPath }
         with _ ->
             { ConfigPath = configPath
               DataRoot = dataRoot
               IsRunning = false
+              IsManagedProcess = false
               ProcessId = None
               StartedAt = None
+              ControlPath = None
               ActivityLogPath = None
               SummaryPath = None }
 
@@ -241,12 +322,16 @@ module HeadlessCampaign =
                     Error $"Unable to launch the headless campaign: {exceptionValue.Message}"
 
     let requestStop configPath dataRoot =
-        match readRecord dataRoot configPath with
-        | None -> Error "No headless process record exists for the loaded campaign."
-        | Some record when not (processMatches record) -> Error "The loaded campaign is not currently running."
-        | Some record ->
+        let current = status configPath dataRoot
+
+        match current.IsRunning, current.ControlPath with
+        | false, _ -> Error "The loaded campaign is not currently running."
+        | true, None ->
+            Error
+                "The loaded campaign is active, but no control file was discovered. Stop it from the external host or restart it through the UI."
+        | true, Some controlPath ->
             try
-                AtomicFile.writeAllText record.ControlPath $"stop requested at {DateTimeOffset.UtcNow:o}"
+                AtomicFile.writeAllText controlPath $"stop requested at {DateTimeOffset.UtcNow:o}"
                 Ok()
             with exceptionValue ->
                 Error $"Unable to request campaign stop: {exceptionValue.Message}"

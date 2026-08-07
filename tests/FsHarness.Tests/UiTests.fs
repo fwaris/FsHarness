@@ -16,6 +16,7 @@ open Elmish
 open FsHarness.App
 open FsHarness.Core
 open FsHarness.Infrastructure
+open Microsoft.Data.Sqlite
 open Xunit
 
 type HeadlessAppBuilder =
@@ -107,6 +108,60 @@ module UiTests =
                 finally
                     Environment.SetEnvironmentVariable("FSHARNESS_CLI_PATH", previous)
                     Directory.Delete(directory, true))
+
+    [<Fact>]
+    let ``headless campaign detects an active external durable run and its control file`` () =
+        let directory =
+            Path.Combine(Path.GetTempPath(), $"fsharness-external-{Guid.NewGuid():N}")
+
+        let configPath = Path.Combine(directory, "campaign.json")
+        let dataRoot = Path.Combine(directory, "data")
+        let databasePath = Path.Combine(dataRoot, "fsharness.db")
+        let activityDirectory = Path.Combine(dataRoot, "launches", "manual")
+
+        Directory.CreateDirectory activityDirectory |> ignore
+        File.WriteAllText(configPath, "{}")
+        File.WriteAllText(Path.Combine(activityDirectory, "activity.log"), "run started")
+
+        use database = new SqliteConnection($"Data Source={databasePath}")
+        database.Open()
+
+        use create = database.CreateCommand()
+
+        create.CommandText <-
+            """
+            CREATE TABLE runs(
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+
+        create.ExecuteNonQuery() |> ignore
+
+        let now = DateTimeOffset.UtcNow
+        use insert = database.CreateCommand()
+
+        insert.CommandText <-
+            "INSERT INTO runs(id, status, created_at, updated_at) VALUES ('run', 'Running', $created, $updated);"
+
+        insert.Parameters.AddWithValue("$created", now.ToString("O")) |> ignore
+        insert.Parameters.AddWithValue("$updated", now.ToString("O")) |> ignore
+        insert.ExecuteNonQuery() |> ignore
+        database.Close()
+
+        try
+            let status = HeadlessCampaign.status configPath dataRoot
+
+            Assert.True(status.IsRunning)
+            Assert.False(status.IsManagedProcess)
+            Assert.Equal(None, status.ProcessId)
+            Assert.Equal(Some(Path.Combine(activityDirectory, "stop.request")), status.ControlPath)
+            Assert.Equal(Ok(), HeadlessCampaign.requestStop configPath dataRoot)
+            Assert.True(File.Exists(Path.Combine(activityDirectory, "stop.request")))
+        finally
+            Directory.Delete(directory, true)
 
     [<Fact>]
     let ``evolution monitor polling leaves the manual graph model unchanged`` () =

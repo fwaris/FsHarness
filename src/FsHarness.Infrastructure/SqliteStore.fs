@@ -160,10 +160,6 @@ module SqliteStore =
                         let backupBuilder = SqliteConnectionStringBuilder()
                         backupBuilder.DataSource <- backupPath
                         backupBuilder.Mode <- SqliteOpenMode.ReadWriteCreate
-                        // The backup connection is scoped to this migration. Do not
-                        // return it to the process-wide pool while the temp database
-                        // directory may be removed immediately after initialization.
-                        backupBuilder.Pooling <- false
                         use backup = new SqliteConnection(backupBuilder.ToString())
                         backup.Open()
                         database.BackupDatabase backup

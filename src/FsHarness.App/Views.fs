@@ -422,11 +422,13 @@ module Views =
                                     muted
                                         "Token usage is reported at turn completion; the active turn can overshoot the remaining budget."
                                     match model.Campaign with
-                                    | Some campaign when campaign.IsRunning ->
+                                    | Some campaign when campaign.IsRunning && campaign.IsManagedProcess ->
                                         let processId =
                                             campaign.ProcessId |> Option.map string |> Option.defaultValue "unknown"
 
                                         text $"● Headless campaign running · PID {processId}" 13.0 Theme.accent
+                                    | Some campaign when campaign.IsRunning ->
+                                        text "● Headless campaign active · external host" 13.0 Theme.accent
                                     | Some campaign when campaign.ProcessId.IsSome ->
                                         muted "The last headless process for this campaign is no longer running."
                                     | _ -> muted "No headless process is associated with the loaded campaign."
@@ -478,7 +480,13 @@ module Views =
                         primaryButton "Open setup" true (Navigate Setup) dispatch ] ]
         | Some configPath, campaign ->
             let isRunning = campaign |> Option.exists _.IsRunning
-            let processLabel = if isRunning then "● RUNNING" else "○ NOT RUNNING"
+
+            let processLabel =
+                match campaign with
+                | Some value when value.IsRunning && value.IsManagedProcess -> "● RUNNING"
+                | Some value when value.IsRunning -> "● ACTIVE · EXTERNAL HOST"
+                | _ -> "○ NOT RUNNING"
+
             let processBrush = if isRunning then Theme.accent else Theme.muted
 
             ScrollViewer.create
@@ -506,10 +514,16 @@ module Views =
                                   card
                                       [ overline "HEADLESS PROCESS"
                                         muted $"Campaign: {configPath}"
-                                        campaign
-                                        |> Option.bind _.ProcessId
-                                        |> Option.map (fun pid -> muted $"Process ID: {pid}")
-                                        |> Option.defaultValue (muted "No process has been launched for this campaign.")
+                                        match campaign with
+                                        | Some value when value.IsRunning && not value.IsManagedProcess ->
+                                            muted "The durable run is active and is hosted outside the UI."
+                                        | _ ->
+                                            campaign
+                                            |> Option.bind _.ProcessId
+                                            |> Option.map (fun pid -> muted $"Process ID: {pid}")
+                                            |> Option.defaultValue (
+                                                muted "No process has been launched for this campaign."
+                                            )
                                         campaign
                                         |> Option.bind _.ActivityLogPath
                                         |> Option.map (fun path -> muted $"Activity log: {path}")

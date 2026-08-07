@@ -3259,10 +3259,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             { Id = stored.Id
                               SourcePath = stored.SourcePath
                               Status =
-                                if
-                                    stored.Status = "Running"
-                                    && not (isRunLive stored)
-                                then
+                                if stored.Status = "Running" && not (isRunLive stored) then
                                     "Interrupted"
                                 else
                                     stored.Status
