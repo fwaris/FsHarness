@@ -119,6 +119,14 @@ Based on Microsoft F# style guidance and common community conventions:
 - Start Windows FsHarness campaigns with a short data root outside the source checkout, for example `E:\fsh\r12` or `C:\fsh\r12`.
 - Never use a nested source path such as `<repository>\.fsharness\runs-...` as `--data-root`: native ONNX Runtime provider DLLs can exceed Windows path limits and fail with Error 206.
 - Keep run directory names compact, and verify the effective data root before starting a GPU benchmark.
+
+## FsHarness Codex CLI
+
+- Before launching a campaign, resolve the newest VS Code or VS Code Insiders OpenAI extension CLI for the current OS and architecture, then run `<path> --version` successfully.
+- Pass that verified full path through `--codex` or `FSHARNESS_CODEX_PATH`; record its path and version in the campaign launch log.
+- Never use a Codex executable below `C:\Program Files\WindowsApps\OpenAI.Codex...`; it is a desktop-app payload and cannot be relied on as a headless CLI.
+- Fall back to a standalone CLI only when no verified VS Code CLI is available. Do not rely on an unverified `PATH` entry.
+
 ## Parallelization
 For parallel processing, if feasible use FSharp.Control.AsyncSeq as in:
 ```fsharp

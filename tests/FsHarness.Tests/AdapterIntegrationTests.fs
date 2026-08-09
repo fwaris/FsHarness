@@ -83,7 +83,7 @@ module AdapterIntegrationTests =
         Assert.Single(writeSwitches readOnlyArguments) |> ignore
 
     [<Fact>]
-    let ``Codex discovery falls back to the newest VS Code extension`` () =
+    let ``Codex discovery identifies the newest VS Code extension before PATH`` () =
         let root = AdapterFixture.temporaryDirectory ()
 
         try
@@ -115,7 +115,7 @@ module AdapterIntegrationTests =
             Directory.Delete(root, true)
 
     [<Fact>]
-    let ``Codex discovery preserves override and PATH precedence`` () =
+    let ``Codex discovery preserves explicit override and prefers VS Code over PATH`` () =
         let root = AdapterFixture.temporaryDirectory ()
 
         try
@@ -139,17 +139,66 @@ module AdapterIntegrationTests =
             File.WriteAllText(pathExecutable, "path")
             File.WriteAllText(extensionExecutable, "extension")
 
-            let fromPath = CliDiscovery.resolveFrom None (Some pathDirectory) root
+            let fromVisualStudioCode = CliDiscovery.resolveFrom None (Some pathDirectory) root
+
+            let fromPathOnly =
+                CliDiscovery.resolveFrom None (Some pathDirectory) (Path.Combine(root, "no-vscode"))
 
             let configured =
                 CliDiscovery.resolveFrom (Some "/configured/codex") (Some pathDirectory) root
 
-            Assert.Equal(pathExecutable, fromPath.Executable)
-            Assert.Equal(CodexExecutableSource.PathEnvironment, fromPath.Source)
+            Assert.Equal(extensionExecutable, fromVisualStudioCode.Executable)
+            Assert.Equal(CodexExecutableSource.VisualStudioCodeExtension, fromVisualStudioCode.Source)
+            Assert.Equal(pathExecutable, fromPathOnly.Executable)
+            Assert.Equal(CodexExecutableSource.PathEnvironment, fromPathOnly.Source)
             Assert.Equal("/configured/codex", configured.Executable)
             Assert.Equal(CodexExecutableSource.EnvironmentOverride, configured.Source)
         finally
             Directory.Delete(root, true)
+
+    [<Fact>]
+    let ``Codex discovery skips an unusable newer VS Code CLI before PATH`` () =
+        let newer =
+            { Executable = "vscode-newer"
+              Source = CodexExecutableSource.VisualStudioCodeExtension }
+
+        let older =
+            { Executable = "vscode-older"
+              Source = CodexExecutableSource.VisualStudioCodeExtension }
+
+        let fromPath =
+            { Executable = "path-codex"
+              Source = CodexExecutableSource.PathEnvironment }
+
+        let selected =
+            [ newer; older; fromPath ]
+            |> CliDiscovery.selectFirstUsable (fun executable -> executable <> newer.Executable)
+
+        Assert.Equal(Some older, selected)
+
+    [<Fact>]
+    let ``WindowsApps desktop Codex payload is rejected before launch`` () =
+        if OperatingSystem.IsWindows() then
+            let desktopPayload =
+                "C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0.0_x64__example\\app\\resources\\codex.exe"
+
+            match CliDiscovery.tryProbeVersion desktopPayload with
+            | Ok _ -> Assert.Fail "WindowsApps desktop payload must not be accepted as a headless Codex CLI."
+            | Error detail ->
+                Assert.Contains("WindowsApps", detail, StringComparison.OrdinalIgnoreCase)
+
+    [<Fact>]
+    let ``Codex version probe accepts a usable explicit CLI`` () =
+        let executable =
+            AdapterFixture.executable "FsHarness.FakeCodex" "FsHarness.FakeCodex"
+
+        let resolution = CliDiscovery.resolveFrom (Some executable) None (Path.GetTempPath())
+
+        Assert.Equal(CodexExecutableSource.EnvironmentOverride, resolution.Source)
+
+        match CliDiscovery.tryProbeVersion resolution.Executable with
+        | Ok version -> Assert.Equal("codex-cli 0.fake", version)
+        | Error detail -> Assert.Fail detail
 
     [<Fact>]
     let ``fake Codex exercises preflight JSONL structured output and usage`` () =

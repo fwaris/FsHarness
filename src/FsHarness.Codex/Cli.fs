@@ -43,15 +43,17 @@ module CliDiscovery =
         | :? ArgumentException
         | :? NotSupportedException -> None
 
-    let private tryFindOnPath pathValue =
+    let private findOnPath pathValue =
         pathValue
         |> Option.bind nonBlank
-        |> Option.bind (fun value ->
+        |> Option.map (fun value ->
             value.Split([| Path.PathSeparator |], StringSplitOptions.RemoveEmptyEntries)
             |> Seq.map (fun entry -> entry.Trim().Trim('"'))
             |> Seq.filter (String.IsNullOrWhiteSpace >> not)
             |> Seq.choose (fun directory -> tryCombine directory executableName)
-            |> Seq.tryFind File.Exists)
+            |> Seq.filter File.Exists
+            |> Seq.toArray)
+        |> Option.defaultValue Array.empty
 
     let private extensionVersion (extensionDirectory: string) =
         let name = DirectoryInfo(extensionDirectory).Name
@@ -142,22 +144,74 @@ module CliDiscovery =
 
         operatingSystemScore + architectureScore
 
-    let private tryFindInExtensionRoot extensionRoot =
-        enumerateDirectories extensionRoot $"{extensionPrefix}*"
-        |> Array.sortWith compareExtensionDirectories
-        |> Array.tryPick (fun extensionDirectory ->
-            Path.Combine(extensionDirectory, "bin")
-            |> enumerateExecutables
-            |> Array.sortByDescending (fun path -> platformScore path, path)
-            |> Array.tryHead)
-
-    let private tryFindVisualStudioCodeExecutable userProfile =
+    let private findVisualStudioCodeExecutables userProfile =
         if String.IsNullOrWhiteSpace userProfile then
-            None
+            Array.empty
         else
             [ Path.Combine(userProfile, ".vscode", "extensions")
               Path.Combine(userProfile, ".vscode-insiders", "extensions") ]
-            |> List.tryPick tryFindInExtensionRoot
+            |> List.collect (fun extensionRoot ->
+                enumerateDirectories extensionRoot $"{extensionPrefix}*" |> Array.toList)
+            |> List.sortWith compareExtensionDirectories
+            |> List.collect (fun extensionDirectory ->
+                Path.Combine(extensionDirectory, "bin")
+                |> enumerateExecutables
+                |> Array.sortByDescending (fun path -> platformScore path, path)
+                |> Array.toList)
+            |> List.toArray
+
+    let private isDesktopWindowsAppsPayload executable =
+        if not (OperatingSystem.IsWindows()) then
+            false
+        else
+            try
+                let normalized = Path.GetFullPath(executable).Replace('/', '\\')
+                normalized.Contains("\\windowsapps\\openai.codex_", StringComparison.OrdinalIgnoreCase)
+            with
+            | :? ArgumentException
+            | :? NotSupportedException -> false
+
+    let tryProbeVersion executable =
+        if isDesktopWindowsAppsPayload executable then
+            Error(
+                "The WindowsApps desktop Codex payload is not a usable headless CLI. "
+                + "Use the Codex executable bundled with the VS Code OpenAI extension instead."
+            )
+        else
+            try
+                let startInfo = ProcessStartInfo()
+                startInfo.FileName <- executable
+                startInfo.UseShellExecute <- false
+                startInfo.RedirectStandardOutput <- true
+                startInfo.RedirectStandardError <- true
+                startInfo.CreateNoWindow <- true
+                startInfo.ArgumentList.Add "--version"
+
+                use processValue = new Process(StartInfo = startInfo)
+
+                if not (processValue.Start()) then
+                    Error $"Codex executable did not start: {executable}"
+                else
+                    let stdoutTask = processValue.StandardOutput.ReadToEndAsync()
+                    let stderrTask = processValue.StandardError.ReadToEndAsync()
+
+                    if processValue.WaitForExit(5_000) then
+                        let stdout = stdoutTask.GetAwaiter().GetResult().Trim()
+                        let stderr = stderrTask.GetAwaiter().GetResult().Trim()
+
+                        if processValue.ExitCode = 0 then
+                            Ok(if String.IsNullOrWhiteSpace stdout then stderr else stdout)
+                        else
+                            Error $"Codex --version exited {processValue.ExitCode}: {stderr}"
+                    else
+                        try
+                            processValue.Kill(true)
+                        with _ ->
+                            ()
+
+                        Error $"Codex --version timed out: {executable}"
+            with error ->
+                Error $"Codex --version could not start '{executable}': {error.Message}"
 
     let resolveFrom configuredPath pathValue userProfile =
         match configuredPath |> Option.bind nonBlank with
@@ -165,60 +219,63 @@ module CliDiscovery =
             { Executable = executable
               Source = CodexExecutableSource.EnvironmentOverride }
         | None ->
-            match tryFindOnPath pathValue with
+            match findVisualStudioCodeExecutables userProfile |> Array.tryHead with
             | Some executable ->
                 { Executable = executable
-                  Source = CodexExecutableSource.PathEnvironment }
+                  Source = CodexExecutableSource.VisualStudioCodeExtension }
             | None ->
-                match tryFindVisualStudioCodeExecutable userProfile with
+                match findOnPath pathValue |> Array.tryHead with
                 | Some executable ->
                     { Executable = executable
-                      Source = CodexExecutableSource.VisualStudioCodeExtension }
+                      Source = CodexExecutableSource.PathEnvironment }
                 | None ->
                     { Executable = executableName
                       Source = CodexExecutableSource.ProcessLookup }
 
-    let preferUsable primary fallback canRun =
-        if canRun primary.Executable then primary
-        elif canRun fallback.Executable then fallback
-        else primary
+    let selectFirstUsable canRun candidates =
+        candidates |> Seq.tryFind (fun candidate -> canRun candidate.Executable)
 
-    let private canLaunchVersion executable =
-        try
-            let startInfo = ProcessStartInfo()
-            startInfo.FileName <- executable
-            startInfo.UseShellExecute <- false
-            startInfo.RedirectStandardOutput <- true
-            startInfo.RedirectStandardError <- true
-            startInfo.CreateNoWindow <- true
-            startInfo.ArgumentList.Add "--version"
-
-            use processValue = new Process(StartInfo = startInfo)
-
-            if not (processValue.Start()) then
-                false
-            elif processValue.WaitForExit(5_000) then
-                processValue.ExitCode = 0
-            else
-                try
-                    processValue.Kill(true)
-                with _ ->
-                    ()
-
-                false
-        with _ ->
-            false
+    let sourceLabel source =
+        match source with
+        | CodexExecutableSource.EnvironmentOverride -> "explicit override"
+        | CodexExecutableSource.VisualStudioCodeExtension -> "VS Code extension"
+        | CodexExecutableSource.PathEnvironment -> "PATH"
+        | CodexExecutableSource.ProcessLookup -> "process lookup"
 
     let resolve configuredPath =
+        let configuredPath =
+            configuredPath
+            |> Option.bind nonBlank
+            |> Option.orElseWith (fun () ->
+                Environment.GetEnvironmentVariable("FSHARNESS_CODEX_PATH") |> nonBlank)
         let pathValue = Environment.GetEnvironmentVariable("PATH") |> Option.ofObj
         let userProfile = Environment.GetFolderPath Environment.SpecialFolder.UserProfile
-        let primary = resolveFrom configuredPath pathValue userProfile
 
         match configuredPath with
-        | Some _ -> primary
+        | Some executable ->
+            { Executable = executable
+              Source = CodexExecutableSource.EnvironmentOverride }
         | None ->
-            let extensionFallback = resolveFrom None None userProfile
-            preferUsable primary extensionFallback canLaunchVersion
+            let visualStudioCodeCandidates =
+                findVisualStudioCodeExecutables userProfile
+                |> Array.map (fun executable ->
+                    { Executable = executable
+                      Source = CodexExecutableSource.VisualStudioCodeExtension })
+
+            let pathCandidates =
+                findOnPath pathValue
+                |> Array.map (fun executable ->
+                    { Executable = executable
+                      Source = CodexExecutableSource.PathEnvironment })
+
+            let processLookup =
+                { Executable = executableName
+                  Source = CodexExecutableSource.ProcessLookup }
+
+            Array.append visualStudioCodeCandidates pathCandidates
+            |> Array.append [| processLookup |]
+            |> selectFirstUsable (tryProbeVersion >> Result.isOk)
+            |> Option.defaultValue processLookup
 
 [<RequireQualifiedAccess>]
 module Cli =
