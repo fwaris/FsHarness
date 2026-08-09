@@ -1,6 +1,6 @@
 # FsHarness: Turning the Karpathy Loop into Durable Graph Search
 
-What happens when a coding agent can make a change, measure the result, learn from it, and try again - for hours rather than for one prompt?
+What happens when a coding agent can make a change, measure the result, learn from it, and try again—for hours rather than for one prompt?
 
 That is the problem behind [FsHarness](https://github.com/fwaris/FsHarness), an F#/.NET system for running measured, reversible Codex engineering experiments.
 
@@ -11,7 +11,7 @@ Coding agents are good at producing plausible changes. The harder problem is run
 - Did the change actually improve the target metric?
 - Can we reproduce or reverse it?
 - What did earlier failures teach us?
-- What dead / redundant code still remains?
+- What dead or redundant code still remains?
 
 A chat transcript is not an experiment database. We need an explicit objective, a protected code zone, a trusted evaluator, resource budgets, persisted lineage, and specific rules for deciding what happens next.
 
@@ -41,40 +41,58 @@ The paper included with FsHarness, [*Graph Engineering: The Karpathy Loop, Impro
 
 The central idea is that agents should retrieve the small, relevant part of the graph for their task instead of replaying every previous transcript. The commit DAG answers *what changed and what descended from it*; the knowledge graph answers *what we know, how facts relate, and what evidence supports them*.
 
+The implementation has two complementary SQLite-backed views: a run-scoped claim index for lexical search and a repository-scoped, versioned graph for cross-run context. The complete write path, schema, provenance rules, and retrieval behavior are described in [**How the FsHarness SQLite knowledge base works**](https://github.com/fwaris/FsHarness/blob/main/docs/sqlite-knowledge-base.md).
+
 FsHarness applies that idea to Codex experiments. It keeps a global champion plus a bounded beam of independently expandable heads. A new candidate can derive from one head while still being evaluated against the champion. Constraint-valid non-winners remain available for later exploration, and eligible ideas from incomparable heads can be synthesized into a real two-parent Git commit.
 
 The surrounding machinery is deliberately durable: private Git worktrees isolate experiments from the source checkout; SQLite stores events, metrics, plans, graph state, and recovery data; evaluator results follow a typed protocol; and token, time, failure, and experiment budgets bound the campaign. The repository also exposes typed dependency plans and bounded multi-agent execution for custom orchestration.
 
-## Set up and run FsHarness0
+## Set up and run FsHarness
 
-The core experiment is defined in a `campaign` json file. It includes
-- the experiment prompt and optimization objective
-- the codex model to use (e.g. luna, terra, etc.)
-- token budget
-- other required parameters
+The core experiment is defined in a `campaign` JSON file. It includes:
 
-There are two ways to get started. In **manual mode**, launch FsHarness with `dotnet`; use the desktop editor to configure and run the campaign. In **Codex mode**, clone FsHarness, open it in Codex, and ask Codex to create, validate, launch, monitor, and recover a campaign for your objective.
+- The experiment prompt and optimization objective.
+- The Codex model to use (for example, `luna` or `terra`).
+- A token budget.
+- Other required parameters.
+
+There are two ways to get started. In **manual mode**, launch FsHarness with `dotnet`; use the desktop editor to configure and run the campaign. In **Codex mode**, clone FsHarness, add it to a Codex *project*, and ask Codex to create, validate, launch, monitor, and recover a campaign for your particular repo and objective.
 
 The complete prerequisites, commands, campaign fields, evaluator contract, Windows path guidance, and a ready-to-use Codex prompt are in [**Set up and run FsHarness**](https://github.com/fwaris/FsHarness/blob/main/docs/setup-and-run.md).
 
 ## Codex `/goal` as the meta-loop
 
-There is a useful second layer above FsHarness. Codex's [`/goal`](https://learn.chatgpt.com/use-cases/follow-goals) command gives Codex a durable objective with a verifiable stopping condition across multiple turns. That makes it a natural **meta-loop** for operating a long FsHarness campaign:
+Codex has a [`/goal`](https://learn.chatgpt.com/use-cases/follow-goals) command. It can be used to autonomously drive Codex toward a goal. Codex iterates for a long time to try to achieve the goal (or until a stopping condition is met).
 
-```text
-/goal Run the FsHarness campaign in experiment.json using data root E:\fsh\r12.
-Verify the configured Codex CLI, launch the campaign, monitor status and health,
-resume the preserved run after recoverable interruptions, and stop when the metric
-target is reached or a configured budget ends the campaign. Report the champion
-commit, metric, token usage, and evaluator evidence. Do not broaden editable paths
-or change the evaluator contract.
-```
+This provides a useful second layer above FsHarness and a natural **meta-loop** for operating a long FsHarness campaign.
 
-The separation matters. `/goal` is not an FsHarness CLI option, and FsHarness explicitly disables goals, apps, hooks, subagents, and remote plugins inside each experiment worker. Inner workers stay ephemeral, isolated, and focused on one measured change. The outer Codex goal manages the campaign lifecycle: launch, observe, recover, and summarize.
+When using the Codex CLI internally, FsHarness explicitly disables goals, apps, hooks, subagents, and remote plugins inside each experiment worker. Inner workers stay ephemeral, isolated, and focused on one measured change. The outer Codex goal manages the campaign lifecycle: launch, observe, recover, and summarize.
 
 So the system has two feedback loops:
 
-1. **FsHarness** searches the code graph for a better measured candidate.
-2. **Codex `/goal`** keeps the overall campaign moving toward its operational stopping condition.
+1. **FsHarness** searches for a better measured candidate.
+2. **Codex `/goal`** watches the campaign runs and revises the campaign for subsequent runs, enabling more intelligent autonomous exploration.
 
-That is the larger promise of graph engineering: not simply more autonomous code generation, but experiments whose objectives, ancestry, evidence, decisions, and resource use remain inspectable from beginning to end.
+## Aid to Tokenmaxers
+
+Many companies are imposing monthly caps on token usage. To extract the most value from the available budget, FsHarness can be configured to do the bulk of the exploration with lower-cost models — for example, `luna` or `terra`— thereby freeing valuable token capacity for deeper analysis and planning-type work.
+
+By querying the rich knowledge graph before generating new candidates, FsHarness can give even lower-cost models enough context to reliably drive the solution search forward.
+
+## Screenshots
+
+The FsHarness repo contains a desktop GUI app. It can be used to manually define and run a campaign or to monitor a campaign launched either manually or through Codex.
+
+The top banner of this post depicts the evolution graph; other views are shown below:
+
+### Setup
+
+![settings](/images/setup.png)
+
+### History Log
+
+![history log](/images/log.png)
+
+### Knowledge Entries
+
+![knowledge entries](/images/knowlege_graph.png)

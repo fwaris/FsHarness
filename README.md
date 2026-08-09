@@ -6,6 +6,8 @@ The core and infrastructure layers also expose typed dependency plans and bounde
 
 The application never initializes, commits, checks out, merges, pushes, or otherwise changes the selected source repository. A dirty source worktree is allowed, but its uncommitted state is excluded from the pinned baseline.
 
+Also see this [write-up](/docs/fsharness-linkedin-article.md)
+
 ## Run the app
 
 Prerequisites:
