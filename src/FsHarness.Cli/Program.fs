@@ -244,11 +244,13 @@ module Program =
             let deadline =
                 DateTimeOffset.UtcNow + config.Budgets.MaxDuration + TimeSpan.FromMinutes 2.0
 
-            while runtime.State |> Option.exists isTerminal |> not
-                  && DateTimeOffset.UtcNow < deadline do
+            let isCompletelyFinished () =
+                runtime.State |> Option.exists isTerminal && not runtime.IsWorkerActive
+
+            while not (isCompletelyFinished ()) && DateTimeOffset.UtcNow < deadline do
                 Thread.Sleep 250
 
-            let completed = runtime.State |> Option.exists isTerminal
+            let completed = isCompletelyFinished ()
 
             if not completed then
                 runtime.StopNow()
@@ -316,6 +318,19 @@ module Program =
             TimeSpan.FromMilliseconds 250.0
         )
 
+    let private resolveVerifiedCodex configuredPath =
+        let resolution = CliDiscovery.resolve configuredPath
+
+        CliDiscovery.tryProbeVersion resolution.Executable
+        |> Result.map (fun version ->
+            eprintfn
+                "Codex CLI: %s (source: %s; version: %s)"
+                resolution.Executable
+                (CliDiscovery.sourceLabel resolution.Source)
+                version
+
+            resolution)
+
     let private runNew options =
         match options.ConfigPath |> Option.map ConfigFile.read with
         | None -> 2
@@ -323,62 +338,69 @@ module Program =
             errors |> List.iter (eprintfn "Configuration: %s")
             2
         | Some(Ok config) ->
-            let codexResolution = CliDiscovery.resolve options.CodexPath
+            match resolveVerifiedCodex options.CodexPath with
+            | Error detail ->
+                eprintfn "Codex CLI resolution failed: %s" detail
+                2
+            | Ok codexResolution ->
+                let configuredDataRoot =
+                    options.ConfigPath
+                    |> Option.bind (fun path ->
+                        match ConfigFile.readDataRoot path with
+                        | Ok value -> value
+                        | Error _ -> None)
 
-            let configuredDataRoot =
-                options.ConfigPath
-                |> Option.bind (fun path ->
-                    match ConfigFile.readDataRoot path with
-                    | Ok value -> value
-                    | Error _ -> None)
+                let dataRoot =
+                    options.DataRoot
+                    |> Option.orElseWith DataPaths.environmentRoot
+                    |> Option.orElse configuredDataRoot
+                    |> Option.defaultValue (DataPaths.root ())
 
-            let dataRoot =
-                options.DataRoot
-                |> Option.orElseWith DataPaths.environmentRoot
-                |> Option.orElse configuredDataRoot
-                |> Option.defaultValue (DataPaths.root ())
+                use runtime = new HarnessRuntime(dataRoot, codexResolution.Executable)
+                use _activity = subscribeActivity options runtime
+                use operationCancellation = new CancellationTokenSource()
+                use _control = monitorControlFile options runtime operationCancellation
 
+                match runtime.Prepare(config, operationCancellation.Token) |> Async.RunSynchronously with
+                | Error error ->
+                    eprintfn "%s" (describeError error)
+                    3
+                | Ok report ->
+                    eprintfn
+                        "Prepared run %s at score %M (Codex write policy: %s)."
+                        (RunId.text report.RunId)
+                        report.BaselineScore
+                        (CodexWritePolicy.label report.Codex.WritePolicy)
+
+                    executePrepared options runtime report config
+
+    let private resume options =
+        match resolveVerifiedCodex options.CodexPath with
+        | Error detail ->
+            eprintfn "Codex CLI resolution failed: %s" detail
+            2
+        | Ok codexResolution ->
+            let dataRoot = options.DataRoot |> Option.defaultValue (DataPaths.root ())
             use runtime = new HarnessRuntime(dataRoot, codexResolution.Executable)
             use _activity = subscribeActivity options runtime
             use operationCancellation = new CancellationTokenSource()
             use _control = monitorControlFile options runtime operationCancellation
 
-            match runtime.Prepare(config, operationCancellation.Token) |> Async.RunSynchronously with
+            match
+                runtime.Recover(options.RunId.Value, operationCancellation.Token)
+                |> Async.RunSynchronously
+            with
             | Error error ->
                 eprintfn "%s" (describeError error)
                 3
             | Ok report ->
                 eprintfn
-                    "Prepared run %s at score %M (Codex write policy: %s)."
+                    "Recovered run %s at score %M (Codex write policy: %s)."
                     (RunId.text report.RunId)
                     report.BaselineScore
                     (CodexWritePolicy.label report.Codex.WritePolicy)
 
-                executePrepared options runtime report config
-
-    let private resume options =
-        let codexResolution = CliDiscovery.resolve options.CodexPath
-        let dataRoot = options.DataRoot |> Option.defaultValue (DataPaths.root ())
-        use runtime = new HarnessRuntime(dataRoot, codexResolution.Executable)
-        use _activity = subscribeActivity options runtime
-        use operationCancellation = new CancellationTokenSource()
-        use _control = monitorControlFile options runtime operationCancellation
-
-        match
-            runtime.Recover(options.RunId.Value, operationCancellation.Token)
-            |> Async.RunSynchronously
-        with
-        | Error error ->
-            eprintfn "%s" (describeError error)
-            3
-        | Ok report ->
-            eprintfn
-                "Recovered run %s at score %M (Codex write policy: %s)."
-                (RunId.text report.RunId)
-                report.BaselineScore
-                (CodexWritePolicy.label report.Codex.WritePolicy)
-
-            executePrepared options runtime report runtime.State.Value.Config
+                executePrepared options runtime report runtime.State.Value.Config
 
     let private status options =
         let dataRoot = options.DataRoot |> Option.defaultValue (DataPaths.root ())

@@ -3172,9 +3172,50 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             |> Async.Ignore
                     | None -> ()
 
-                    match! SqliteStore.updateWorkPlanStatus sqlite workPlan.Id planStatus CancellationToken.None with
+                    let! workPlanStatusResult =
+                        SqliteStore.updateWorkPlanStatus sqlite workPlan.Id planStatus CancellationToken.None
+
+                    match workPlanStatusResult with
                     | Ok() -> ()
                     | Error error -> enterRecovery error (Some experimentId)
+
+                    let persistedCandidate =
+                        match SqliteStore.loadExperiments sqlite startedState.Id with
+                        | Ok experiments ->
+                            experiments
+                            |> List.exists (fun experiment ->
+                                experiment.Id = experimentId && experiment.Candidate.IsSome)
+                        | Error error ->
+                            publish $"Terminal worktree cleanup warning: {error.Summary}" (Some experimentId)
+                            false
+
+                    if
+                        planStatus = "finished"
+                        && Result.isOk workPlanStatusResult
+                        && persistedCandidate
+                    then
+                        match! git.ReleaseExperimentWorktrees startedState.Id experimentId CancellationToken.None with
+                        | Ok removed when removed > 0 ->
+                            do!
+                                journalEvent
+                                    startedState.Id
+                                    (Some experimentId)
+                                    "ExperimentWorktreesReleased"
+                                    (string removed)
+                                    CancellationToken.None
+
+                            publish $"Released {removed} terminal experiment worktree(s)." (Some experimentId)
+                        | Ok _ -> ()
+                        | Error error ->
+                            do!
+                                journalEvent
+                                    startedState.Id
+                                    (Some experimentId)
+                                    "ExperimentWorktreeCleanupFailed"
+                                    error.Summary
+                                    CancellationToken.None
+
+                            publish $"Terminal worktree cleanup warning: {error.Summary}" (Some experimentId)
 
                 | Some _ -> ()
 
@@ -3206,6 +3247,10 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
     new(codexExecutable: string) = new HarnessRuntime(DataPaths.root (), codexExecutable)
 
     member _.State = tryCurrent ()
+
+    member _.IsWorkerActive =
+        lock stateGate (fun () -> worker |> Option.exists (fun task -> not task.IsCompleted))
+
     member _.StateChanged = stateChanged.Publish
     member _.Activity = activity.Publish
     member _.EvolutionChanged = evolutionChanged.Publish

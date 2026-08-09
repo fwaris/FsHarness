@@ -6,6 +6,8 @@ The core and infrastructure layers also expose typed dependency plans and bounde
 
 The application never initializes, commits, checks out, merges, pushes, or otherwise changes the selected source repository. A dirty source worktree is allowed, but its uncommitted state is excluded from the pinned baseline.
 
+Also see this [write-up](/docs/fsharness-linkedin-article.md)
+
 ## Run the app
 
 Prerequisites:
@@ -21,7 +23,7 @@ dotnet restore FsHarness.slnx
 dotnet run --project src/FsHarness.App/FsHarness.App.fsproj
 ```
 
-Codex discovery checks `FSHARNESS_CODEX_PATH` first, then `PATH`, then the newest installed OpenAI Codex extension under `~/.vscode/extensions` or `~/.vscode-insiders/extensions`. This lets the macOS desktop app use the CLI bundled with VS Code even when it starts with a reduced GUI `PATH`. Set `FSHARNESS_CLI_PATH` when the desktop app cannot discover the headless FsHarness CLI executable or DLL. Set `FSHARNESS_DATA_DIR` to override the platform-local application data directory.
+Codex discovery checks an explicit `--codex` or `FSHARNESS_CODEX_PATH` first, then the newest usable OpenAI Codex CLI bundled with VS Code or VS Code Insiders, then a usable `codex` on `PATH`. Every automatic candidate must pass `--version`; WindowsApps desktop-app payloads are rejected because they are not usable headless CLIs. On Windows, prefer `~\.vscode\extensions\openai.chatgpt-*\bin\windows-x86_64\codex.exe`. Set `FSHARNESS_CLI_PATH` when the desktop app cannot discover the headless FsHarness CLI executable or DLL. Set `FSHARNESS_DATA_DIR` to override the platform-local application data directory.
 
 Setup performs source inspection and optional Codex preflight checks for the campaign editor. Launch starts `FsHarness.Cli` as a separate process; private Git import, baseline evaluation, generation, and candidate evaluation all run there. Stop uses a file-based control request that the CLI converts to `StopNow`, including during preparation. The default model request is `gpt-5.6-luna` with reasoning effort `max`; unsupported model/effort pairs fail closed.
 
@@ -49,6 +51,8 @@ fsharness health --run-id <guid>
 ```
 
 Use `--data-root <dir>` when the run is outside the platform-default data directory. On Windows, use a short root outside the source checkout—such as `E:\fsh\r12`—and keep the run folder name short. Do not place private worktrees below `<repository>\.fsharness\runs-*`: native ONNX Runtime provider DLLs can otherwise exceed the Windows path limit (Error 206). The desktop Setup page also shows the data root for the next run and lets you edit it or choose a folder; the selected root takes effect when you prepare the private run and cannot replace an active or prepared run. `FSHARNESS_DATA_DIR` can set the initial desktop root. `resume` verifies the source and Codex preflight, reconciles pending promotion and evaluator leases, checks artifact hashes, restores the champion, active heads, usage, and attempt counters, and refuses to exceed an already-consumed budget.
+
+FsHarness enables MSBuild hard links for Codex workers and deterministic evaluators. On a single filesystem, large copy-local native dependencies share physical storage with the package cache while retaining normal worktree paths. Terminal experiment worktrees are removed after durable results and lineage are recorded; active, awaiting-review, and recovery worktrees are retained.
 
 ## Evaluator protocol
 

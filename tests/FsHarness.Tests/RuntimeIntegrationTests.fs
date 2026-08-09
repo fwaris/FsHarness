@@ -350,6 +350,19 @@ module RuntimeIntegrationTests =
             Assert.Equal("1", File.ReadAllText(Path.Combine(source, "src", "score.txt")))
             Assert.Equal(sourceHead, runGit source [ "rev-parse"; "HEAD" ])
 
+            let worktreesReleased =
+                SpinWait.SpinUntil(
+                    (fun () ->
+                        runtime.History 100
+                        |> getResult
+                        |> List.exists (fun event -> event.Kind = "ExperimentWorktreesReleased")
+                        && not runtime.IsWorkerActive),
+                    TimeSpan.FromSeconds 5.0
+                )
+
+            Assert.True(worktreesReleased, "Terminal experiment worktrees were not released in time.")
+            Assert.False(runtime.IsWorkerActive)
+
             let history = runtime.History 100 |> getResult |> List.rev
             Assert.Contains(history, fun event -> event.Kind = "EvaluatorRetryScheduled")
             Assert.Equal("0", File.ReadAllText evaluatorAvailability)
