@@ -148,6 +148,68 @@ module GitStoreTests =
             Assert.Equal(Some(snapshot.Commit, Some inspection.Head), lineage.Candidates |> Map.tryFind experimentId))
 
     [<Fact>]
+    let ``released experiment worktrees preserve private candidate lineage`` () =
+        withTempDirectory (fun directory ->
+            let source = createRepository directory
+            let dataRoot = Path.Combine(directory, "data")
+            let store = GitStore.create dataRoot
+            let port = GitStore.port store
+
+            let inspection =
+                port.InspectSource source CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let runId = RunId.create ()
+
+            port.CreateRun runId inspection CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            let experimentId = ExperimentId.create ()
+
+            let workspace =
+                port.PrepareCandidate
+                    runId
+                    experimentId
+                    [ { Commit = inspection.Head
+                        Role = ExperimentParentRole.Primary } ]
+                    inspection.Head
+                    CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            File.WriteAllText(Path.Combine(workspace.GenerationPath, "src", "score.txt"), "2")
+
+            let snapshot =
+                port.CaptureCandidate runId workspace [ "src/**" ] CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            File.WriteAllText(Path.Combine(snapshot.EvaluationPath, "ignored-build-output.bin"), "build output")
+
+            let removed =
+                port.ReleaseExperimentWorktrees runId experimentId CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.Equal(4, removed)
+            Assert.False(Directory.Exists workspace.GenerationPath)
+            Assert.False(Directory.Exists snapshot.EvaluationPath)
+            Assert.False(Directory.Exists snapshot.ParentEvaluationPath)
+            Assert.False(Directory.Exists snapshot.ChampionEvaluationPath)
+
+            let privateRepo = DataPaths.repository dataRoot runId
+
+            let candidateRef =
+                $"refs/fsharness/runs/{RunId.text runId}/candidates/{ExperimentId.text experimentId}"
+
+            Assert.Equal(
+                CommitOid.value snapshot.Commit,
+                runGit directory [ "--git-dir"; privateRepo; "rev-parse"; candidateRef ]
+            ))
+
+    [<Fact>]
     let ``frontier update is compare and swap`` () =
         withTempDirectory (fun directory ->
             let source = createRepository directory

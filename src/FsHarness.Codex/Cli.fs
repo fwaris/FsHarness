@@ -246,8 +246,8 @@ module CliDiscovery =
         let configuredPath =
             configuredPath
             |> Option.bind nonBlank
-            |> Option.orElseWith (fun () ->
-                Environment.GetEnvironmentVariable("FSHARNESS_CODEX_PATH") |> nonBlank)
+            |> Option.orElseWith (fun () -> Environment.GetEnvironmentVariable("FSHARNESS_CODEX_PATH") |> nonBlank)
+
         let pathValue = Environment.GetEnvironmentVariable("PATH") |> Option.ofObj
         let userProfile = Environment.GetFolderPath Environment.SpecialFolder.UserProfile
 
@@ -474,6 +474,10 @@ module Cli =
           "allow_login_shell=false"
           "-c"
           "shell_environment_policy.inherit=\"core\""
+          "-c"
+          "shell_environment_policy.set.CreateHardLinksForCopyLocalIfPossible=\"true\""
+          "-c"
+          "shell_environment_policy.set.CreateHardLinksForCopyFilesToOutputDirectoryIfPossible=\"true\""
           "-c"
           "mcp_servers={}"
           "-" ]

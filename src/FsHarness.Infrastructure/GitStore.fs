@@ -955,6 +955,54 @@ module GitStore =
             | _, Error error -> return Error error
         }
 
+    let releaseExperimentWorktrees store runId experimentId cancellationToken =
+        async {
+            let repository = repoPath store runId
+            let experimentRoot = DataPaths.experiment store.Root runId experimentId
+
+            let worktreePaths =
+                [ "assembly"
+                  "champion-evaluation"
+                  "evaluation"
+                  "generation"
+                  "parent-evaluation" ]
+                |> List.map (fun name -> Path.Combine(experimentRoot, name))
+
+            let mutable removed = 0
+            let mutable failure = None
+
+            for path in worktreePaths do
+                if Directory.Exists path && failure.IsNone then
+                    let! result =
+                        requireSuccess
+                            store
+                            "release_experiment_worktree"
+                            None
+                            [ "--git-dir"; repository; "worktree"; "remove"; "--force"; path ]
+                            None
+                            Map.empty
+                            cancellationToken
+
+                    match result with
+                    | Ok _ -> removed <- removed + 1
+                    | Error error -> failure <- Some error
+
+            match failure with
+            | Some error -> return Error error
+            | None ->
+                let! pruned =
+                    requireSuccess
+                        store
+                        "prune_released_worktrees"
+                        None
+                        [ "--git-dir"; repository; "worktree"; "prune" ]
+                        None
+                        Map.empty
+                        cancellationToken
+
+                return pruned |> Result.map (fun _ -> removed)
+        }
+
     let advanceFrontier store runId expectedParent candidate cancellationToken =
         async {
             let! result =
@@ -1080,5 +1128,6 @@ module GitStore =
           AnalyzeSynthesis = analyzeSynthesis store
           ApplySeedPatch = applySeedPatch store
           CaptureCandidate = captureCandidate store
+          ReleaseExperimentWorktrees = releaseExperimentWorktrees store
           AdvanceFrontier = advanceFrontier store
           ExportPatch = exportPatch store }

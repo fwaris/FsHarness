@@ -38,6 +38,9 @@ module SanitizedEnvironmentTests =
     let ``Windows dotnet profile paths survive evaluator sanitization`` () =
         let environment = SanitizedEnvironment.core ()
 
+        Assert.Equal("true", environment["CreateHardLinksForCopyLocalIfPossible"])
+        Assert.Equal("true", environment["CreateHardLinksForCopyFilesToOutputDirectoryIfPossible"])
+
         if OperatingSystem.IsWindows() then
             Assert.Equal(Environment.GetEnvironmentVariable("APPDATA"), environment["APPDATA"])
             Assert.Equal(Environment.GetEnvironmentVariable("LOCALAPPDATA"), environment["LOCALAPPDATA"])
@@ -67,6 +70,17 @@ module AdapterIntegrationTests =
         Assert.Contains("--dangerously-bypass-approvals-and-sandbox", arguments)
         Assert.DoesNotContain("--sandbox", arguments)
         Assert.Single(writeSwitches arguments) |> ignore
+
+    [<Fact>]
+    let ``Codex workers set MSBuild hard-link properties`` () =
+        let arguments = Cli.argumentsFor CodexWritePolicy.Unrestricted request
+
+        Assert.Contains("shell_environment_policy.set.CreateHardLinksForCopyLocalIfPossible=\"true\"", arguments)
+
+        Assert.Contains(
+            "shell_environment_policy.set.CreateHardLinksForCopyFilesToOutputDirectoryIfPossible=\"true\"",
+            arguments
+        )
 
     [<Fact>]
     let ``workspace and read-only policies remain explicit opt-ins`` () =
@@ -184,15 +198,15 @@ module AdapterIntegrationTests =
 
             match CliDiscovery.tryProbeVersion desktopPayload with
             | Ok _ -> Assert.Fail "WindowsApps desktop payload must not be accepted as a headless Codex CLI."
-            | Error detail ->
-                Assert.Contains("WindowsApps", detail, StringComparison.OrdinalIgnoreCase)
+            | Error detail -> Assert.Contains("WindowsApps", detail, StringComparison.OrdinalIgnoreCase)
 
     [<Fact>]
     let ``Codex version probe accepts a usable explicit CLI`` () =
         let executable =
             AdapterFixture.executable "FsHarness.FakeCodex" "FsHarness.FakeCodex"
 
-        let resolution = CliDiscovery.resolveFrom (Some executable) None (Path.GetTempPath())
+        let resolution =
+            CliDiscovery.resolveFrom (Some executable) None (Path.GetTempPath())
 
         Assert.Equal(CodexExecutableSource.EnvironmentOverride, resolution.Source)
 

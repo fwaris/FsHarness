@@ -244,11 +244,13 @@ module Program =
             let deadline =
                 DateTimeOffset.UtcNow + config.Budgets.MaxDuration + TimeSpan.FromMinutes 2.0
 
-            while runtime.State |> Option.exists isTerminal |> not
-                  && DateTimeOffset.UtcNow < deadline do
+            let isCompletelyFinished () =
+                runtime.State |> Option.exists isTerminal && not runtime.IsWorkerActive
+
+            while not (isCompletelyFinished ()) && DateTimeOffset.UtcNow < deadline do
                 Thread.Sleep 250
 
-            let completed = runtime.State |> Option.exists isTerminal
+            let completed = isCompletelyFinished ()
 
             if not completed then
                 runtime.StopNow()

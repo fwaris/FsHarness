@@ -24,6 +24,10 @@ type ProcessResult =
 
 [<RequireQualifiedAccess>]
 module SanitizedEnvironment =
+    let private msbuildHardLinkSettings =
+        [ "CreateHardLinksForCopyLocalIfPossible", "true"
+          "CreateHardLinksForCopyFilesToOutputDirectoryIfPossible", "true" ]
+
     let core () =
         [ "PATH"
           "HOME"
@@ -50,6 +54,7 @@ module SanitizedEnvironment =
             match Environment.GetEnvironmentVariable name with
             | value when not (String.IsNullOrWhiteSpace value) -> Some(name, value)
             | _ -> None)
+        |> List.append msbuildHardLinkSettings
         |> Map.ofList
 
 [<RequireQualifiedAccess>]
