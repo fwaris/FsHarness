@@ -390,38 +390,43 @@ module Cli =
                 match requireSuccess "login status" login with
                 | Error error -> return Error error
                 | Ok loginText ->
+                    // `doctor` is useful launch diagnostics, but it is not a capability
+                    // required to execute a campaign.  Some VS Code-bundled CLI builds can
+                    // return a transient non-zero doctor status while `exec` is healthy.
                     let! doctor =
                         runCapture executable [ "doctor"; "--json" ] timeout cancellationToken
                         |> Async.AwaitTask
 
-                    match requireSuccess "doctor --json" doctor with
-                    | Error error -> return Error error
-                    | Ok doctorJson ->
-                        let! catalog =
-                            runCapture executable [ "debug"; "models"; "--bundled" ] timeout cancellationToken
-                            |> Async.AwaitTask
+                    let doctorJson =
+                        match doctor with
+                        | Ok value when value.ExitCode = 0 -> value.Stdout
+                        | _ -> "{\"status\":\"unavailable\"}"
 
-                        match requireSuccess "debug models --bundled" catalog with
-                        | Error error -> return Error error
-                        | Ok catalogJson ->
-                            match Protocol.parseModelCatalog catalogJson with
-                            | Error detail ->
-                                return
-                                    Error(
-                                        processError
-                                            "codex.model_catalog_invalid"
-                                            "Codex returned an invalid model catalog."
-                                            detail
-                                            false
-                                    )
-                            | Ok models ->
-                                return
-                                    Ok
-                                        { Version = versionText.Trim()
-                                          LoginStatus = loginText.Trim()
-                                          DoctorJson = doctorJson
-                                          Models = models
-                                          WritePolicy = policy }
+                    let! catalog =
+                        runCapture executable [ "debug"; "models"; "--bundled" ] timeout cancellationToken
+                        |> Async.AwaitTask
+
+                    match requireSuccess "debug models --bundled" catalog with
+                    | Error error -> return Error error
+                    | Ok catalogJson ->
+                        match Protocol.parseModelCatalog catalogJson with
+                        | Error detail ->
+                            return
+                                Error(
+                                    processError
+                                        "codex.model_catalog_invalid"
+                                        "Codex returned an invalid model catalog."
+                                        detail
+                                        false
+                                )
+                        | Ok models ->
+                            return
+                                Ok
+                                    { Version = versionText.Trim()
+                                      LoginStatus = loginText.Trim()
+                                      DoctorJson = doctorJson
+                                      Models = models
+                                      WritePolicy = policy }
         }
 
     let preflight (executable: string) (cancellationToken: CancellationToken) =
