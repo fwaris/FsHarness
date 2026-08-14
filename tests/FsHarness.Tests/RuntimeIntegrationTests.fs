@@ -377,6 +377,10 @@ module RuntimeIntegrationTests =
 
             let listed = Assert.Single runs
             Assert.Equal(runtime.State.Value.Id, listed.Id)
+            Assert.Equal(1, listed.AttemptCount)
+            Assert.Equal(1, listed.AcceptedCount)
+            Assert.Equal(1M, listed.BaselineScore.Value)
+            Assert.Equal(2M, listed.FrontierScore.Value)
 
             let snapshot =
                 runtime.LoadEvolution(listed.Id, CancellationToken.None)

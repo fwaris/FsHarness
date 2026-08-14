@@ -3296,39 +3296,16 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                 match SqliteStore.loadRuns sqlite with
                 | Error error -> return Error error
                 | Ok runs ->
-                    let summaries =
-                        runs
-                        |> List.map (fun stored ->
-                            let metricName, direction, _ = parseRunConfig stored.ConfigJson
+                    let rec loadSummaries remaining accumulated =
+                        async {
+                            match remaining with
+                            | [] -> return List.rev accumulated
+                            | stored :: tail ->
+                                let! snapshot = loadEvolutionSnapshot stored cancellationToken
+                                return! loadSummaries tail (snapshot.Run :: accumulated)
+                        }
 
-                            { Id = stored.Id
-                              SourcePath = stored.SourcePath
-                              Status =
-                                if stored.Status = "Running" && not (isRunLive stored) then
-                                    "Interrupted"
-                                else
-                                    stored.Status
-                              CreatedAt = stored.CreatedAt
-                              UpdatedAt = stored.UpdatedAt
-                              MetricName = metricName
-                              Direction = direction
-                              BaselineCommit =
-                                stored.ConfigJson
-                                |> Option.bind (fun json ->
-                                    try
-                                        use document = JsonDocument.Parse json
-
-                                        Some(
-                                            CommitOid.create (
-                                                document.RootElement.GetProperty("baseCommit").GetString()
-                                            )
-                                        )
-                                    with _ ->
-                                        None)
-                              BaselineScore = None
-                              FrontierScore = None
-                              AttemptCount = 0
-                              AcceptedCount = 0 })
+                    let! summaries = loadSummaries runs []
 
                     return Ok summaries
         }
