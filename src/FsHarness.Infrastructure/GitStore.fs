@@ -657,6 +657,157 @@ module GitStore =
         | Error error, _
         | _, Error error -> Error error
 
+    let private fingerprintText (lines: string list) =
+        lines
+        |> List.sort
+        |> String.concat "\n"
+        |> Encoding.UTF8.GetBytes
+        |> SHA256.HashData
+        |> Convert.ToHexString
+
+    let private workspaceEditableFingerprint
+        (store: GitStore)
+        (workspace: CandidateWorkspace)
+        (editableGlobs: string list)
+        cancellationToken
+        =
+        async {
+            let! filesResult =
+                requireSuccess
+                    store
+                    "editable_tree_files"
+                    (Some workspace.GenerationPath)
+                    [ "ls-files"; "--cached"; "--others"; "--exclude-standard"; "-z" ]
+                    None
+                    Map.empty
+                    cancellationToken
+
+            match filesResult with
+            | Error error -> return Error error
+            | Ok filesText ->
+                let paths =
+                    nulValues filesText
+                    |> List.map PathPolicy.normalize
+                    |> List.distinct
+                    |> List.filter (PathPolicy.isEditable editableGlobs)
+                    |> List.filter (fun relativePath ->
+                        File.Exists(Path.Combine(workspace.GenerationPath, relativePath)))
+
+                let mutable error = None
+                let lines = ResizeArray<string>()
+
+                for relativePath in paths do
+                    if error.IsNone then
+                        let fullPath = Path.Combine(workspace.GenerationPath, relativePath)
+                        let attributes = File.GetAttributes fullPath
+
+                        if attributes.HasFlag FileAttributes.ReparsePoint then
+                            error <-
+                                Some(
+                                    HarnessError.create
+                                        "git.editable_tree_reparse_point"
+                                        HarnessErrorCategory.Git
+                                        "Editable tree fingerprinting rejected a reparse point."
+                                    |> HarnessError.withDetail relativePath
+                                )
+                        else
+                            let! blobResult =
+                                requireSuccess
+                                    store
+                                    "editable_tree_blob"
+                                    (Some workspace.GenerationPath)
+                                    [ "hash-object"; "--no-filters"; fullPath ]
+                                    None
+                                    Map.empty
+                                    cancellationToken
+
+                            match blobResult with
+                            | Error value -> error <- Some value
+                            | Ok blob -> lines.Add($"{executableMode fullPath}|{blob.Trim()}|{relativePath}")
+
+                match error with
+                | Some value -> return Error value
+                | None -> return Ok(fingerprintText (List.ofSeq lines))
+        }
+
+    let private commitEditableFingerprint store runId commit editableGlobs cancellationToken =
+        async {
+            let! treeResult =
+                requireSuccess
+                    store
+                    "editable_commit_tree"
+                    None
+                    [ "--git-dir"
+                      repoPath store runId
+                      "ls-tree"
+                      "-r"
+                      "-z"
+                      CommitOid.value commit ]
+                    None
+                    Map.empty
+                    cancellationToken
+
+            match treeResult with
+            | Error error -> return Error error
+            | Ok treeText ->
+                let lines =
+                    nulValues treeText
+                    |> List.choose (fun entry ->
+                        let separator = entry.IndexOf('\t')
+
+                        if separator <= 0 then
+                            None
+                        else
+                            let metadata =
+                                entry.Substring(0, separator).Split(' ', StringSplitOptions.RemoveEmptyEntries)
+
+                            let path = entry.Substring(separator + 1) |> PathPolicy.normalize
+
+                            if
+                                metadata.Length = 3
+                                && metadata.[1] = "blob"
+                                && PathPolicy.isEditable editableGlobs path
+                            then
+                                Some($"{metadata.[0]}|{metadata.[2]}|{path}")
+                            else
+                                None)
+
+                return Ok(fingerprintText lines)
+        }
+
+    let checkEditableTree store runId workspace editableGlobs cancellationToken =
+        async {
+            match! workspaceEditableFingerprint store workspace editableGlobs cancellationToken with
+            | Error error -> return Error error
+            | Ok fingerprint ->
+                match! loadLineage store runId cancellationToken with
+                | Error error -> return Error error
+                | Ok lineage ->
+                    let candidates =
+                        lineage.Candidates
+                        |> Map.toList
+                        |> List.filter (fun (experimentId, _) -> experimentId <> workspace.ExperimentId)
+
+                    let mutable matchValue = None
+                    let mutable error = None
+
+                    for experimentId, (commit, _) in candidates do
+                        if matchValue.IsNone && error.IsNone then
+                            match! commitEditableFingerprint store runId commit editableGlobs cancellationToken with
+                            | Error value -> error <- Some value
+                            | Ok candidateFingerprint when candidateFingerprint = fingerprint ->
+                                matchValue <- Some experimentId
+                            | Ok _ -> ()
+
+                    match error with
+                    | Some value -> return Error value
+                    | None ->
+                        return
+                            Ok
+                                { Fingerprint = fingerprint
+                                  MatchingExperiment = matchValue }
+        }
+
     let captureCandidate
         (store: GitStore)
         (runId: RunId)
@@ -1128,6 +1279,7 @@ module GitStore =
           AnalyzeSynthesis = analyzeSynthesis store
           ApplySeedPatch = applySeedPatch store
           CaptureCandidate = captureCandidate store
+          CheckEditableTree = checkEditableTree store
           ReleaseExperimentWorktrees = releaseExperimentWorktrees store
           AdvanceFrontier = advanceFrontier store
           ExportPatch = exportPatch store }

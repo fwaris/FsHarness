@@ -74,6 +74,11 @@ type RunEvent =
         DateTimeOffset
     | WorktreePrepared of ExperimentId
     | GenerationCompleted of ExperimentId * threadId: string * usage: TokenUsage option * summary: ExperimentSummary
+    | DuplicateCandidateSkipped of
+        ExperimentId *
+        fingerprint: string *
+        matchingExperiment: ExperimentId *
+        usage: TokenUsage option
     | CandidateCaptured of ExperimentId * CommitOid
     | ProtectedPathDetected of ExperimentId * string list
     | EvaluationCompleted of ExperimentId * EvaluationResult
@@ -230,6 +235,38 @@ module RunState =
             [ PublishState ]
         | _, _, None -> { nextState with Status = Ready }, [ PublishState; ScheduleNext ]
 
+    let private skipDuplicate now usage state =
+        let nextUsage, usageKnown =
+            match usage with
+            | Some value -> TokenUsage.add state.Usage value, state.UsageKnown
+            | None -> state.Usage, false
+
+        let nextState =
+            { state with
+                Current = None
+                Attempted = max 0 (state.Attempted - 1)
+                Usage = nextUsage
+                UsageKnown = usageKnown }
+
+        match state.Status, usage, budgetStopReason now nextState with
+        | Stopping, _, _ ->
+            { nextState with
+                Status = Completed "Stopped by user." },
+            [ PublishState ]
+        | PauseAfterCurrent, _, _ ->
+            { nextState with
+                Status = Paused "Pause requested." },
+            [ PublishState ]
+        | _, None, _ ->
+            { nextState with
+                Status = Paused "Terminal token usage is unavailable." },
+            [ PublishState ]
+        | _, _, Some reason ->
+            { nextState with
+                Status = Completed reason },
+            [ PublishState ]
+        | _ -> { nextState with Status = Ready }, [ PublishState; ScheduleNext ]
+
     let rec transition now event state =
         match event, state.Status, state.Current with
         | StartRequested(experimentId, startedAt), Ready, None ->
@@ -277,6 +314,10 @@ module RunState =
             { state with
                 Current = Some { active with Phase = Generating } },
             [ LaunchCodex active.Id; PublishState ]
+        | DuplicateCandidateSkipped(experimentId, _, _, usage), (Running | PauseAfterCurrent | Stopping), Some active when
+            active.Id = experimentId && active.Phase = Generating
+            ->
+            skipDuplicate now usage state
         | GenerationCompleted(experimentId, threadId, usage, summary), (Running | PauseAfterCurrent), Some active when
             active.Id = experimentId && active.Phase = Generating
             ->

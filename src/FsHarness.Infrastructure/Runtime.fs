@@ -223,6 +223,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         | "ProtectedPathRejected" -> Some $"RejectedProtected: {payload}"
         | "EvaluationInconclusive" -> Some $"Inconclusive: {payload}"
         | "SeedInconclusive" -> Some $"Inconclusive: {payload}"
+        | "DuplicateCandidateSkipped" -> Some $"Duplicate: {payload}"
         | "Cancelled" -> Some $"Cancelled: {payload}"
         | "PrepareFailed"
         | "SeedPrepareFailed"
@@ -1686,6 +1687,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
             | "SeedProtectedRejected" -> Some(EvolutionOutcome.Rejected event.Payload)
             | "EvaluationInconclusive"
             | "SeedInconclusive" -> Some(EvolutionOutcome.Inconclusive event.Payload)
+            | "DuplicateCandidateSkipped" -> Some(EvolutionOutcome.Rejected $"Duplicate: {event.Payload}")
             | "Cancelled" -> Some EvolutionOutcome.Cancelled
             | "PrepareFailed"
             | "SeedPrepareFailed"
@@ -1937,7 +1939,12 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
 
             let attemptCount =
                 nodes
-                |> List.filter (fun node -> node.Kind = EvolutionNodeKind.Candidate)
+                |> List.filter (fun node ->
+                    node.Kind = EvolutionNodeKind.Candidate
+                    && (match node.Outcome with
+                        | EvolutionOutcome.Rejected reason ->
+                            not (reason.StartsWith("Duplicate:", StringComparison.Ordinal))
+                        | _ -> true))
                 |> List.length
 
             let live = isRunLive storedRun
@@ -2742,6 +2749,109 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                       StderrPath = Path.Combine(artifactRoot, "codex.stderr.log") }
                                     cancellationToken
 
+                        let combineUsage first second =
+                            match first, second with
+                            | Some left, Some right -> Some(TokenUsage.add left right)
+                            | _ -> None
+
+                        let! codexResult, duplicateCheck =
+                            async {
+                                match codexResult, cleanSynthesis with
+                                | Ok first, false ->
+                                    match!
+                                        git.CheckEditableTree
+                                            startedState.Id
+                                            workspace
+                                            startedState.Config.EditablePaths
+                                            cancellationToken
+                                    with
+                                    | Error error -> return Error error, None
+                                    | Ok check when check.MatchingExperiment.IsSome ->
+                                        let matching = check.MatchingExperiment.Value
+                                        let matchingText = ExperimentId.text matching
+
+                                        do!
+                                            journalEvent
+                                                startedState.Id
+                                                (Some experimentId)
+                                                "DuplicateTreeDetected"
+                                                $"fingerprint={check.Fingerprint};matchingExperiment={matchingText}"
+                                                CancellationToken.None
+
+                                        let retryPrompt =
+                                            prompt
+                                            + "\n\nThe editable tree you produced is an exact duplicate of experiment "
+                                            + matchingText
+                                            + " (fingerprint "
+                                            + check.Fingerprint
+                                            + "). Regenerate once: choose a materially different, still single-change hypothesis. Do not repeat this fingerprint.\n"
+
+                                        let retryPromptPath = Path.Combine(artifactRoot, "prompt-regeneration.md")
+                                        AtomicFile.writeAllText retryPromptPath retryPrompt
+
+                                        do!
+                                            recordArtifact
+                                                startedState.Id
+                                                (Some experimentId)
+                                                "duplicate-regeneration-prompt"
+                                                retryPromptPath
+                                                CancellationToken.None
+
+                                        publish
+                                            $"Duplicate editable tree matched experiment {matchingText}; allowing one regeneration attempt."
+                                            (Some experimentId)
+
+                                        let! retry =
+                                            codex.Run
+                                                { Executable = codexExecutable
+                                                  WorkingDirectory = workspace.GenerationPath
+                                                  Model = startedState.Config.Model
+                                                  Prompt = retryPrompt
+                                                  OutputSchemaPath = schemaPath
+                                                  Timeout = startedState.Config.Budgets.CodexTimeout
+                                                  JsonlPath = Path.Combine(artifactRoot, "codex-regeneration.jsonl")
+                                                  StderrPath =
+                                                    Path.Combine(artifactRoot, "codex-regeneration.stderr.log") }
+                                                cancellationToken
+
+                                        do!
+                                            recordArtifact
+                                                startedState.Id
+                                                (Some experimentId)
+                                                "codex-regeneration-jsonl"
+                                                (Path.Combine(artifactRoot, "codex-regeneration.jsonl"))
+                                                CancellationToken.None
+
+                                        do!
+                                            recordArtifact
+                                                startedState.Id
+                                                (Some experimentId)
+                                                "codex-regeneration-stderr"
+                                                (Path.Combine(artifactRoot, "codex-regeneration.stderr.log"))
+                                                CancellationToken.None
+
+                                        match retry with
+                                        | Error error -> return Error error, None
+                                        | Ok regenerated ->
+                                            let combined =
+                                                { regenerated with
+                                                    Usage = combineUsage first.Usage regenerated.Usage }
+
+                                            match!
+                                                git.CheckEditableTree
+                                                    startedState.Id
+                                                    workspace
+                                                    startedState.Config.EditablePaths
+                                                    cancellationToken
+                                            with
+                                            | Error error -> return Error error, None
+                                            | Ok second when second.MatchingExperiment.IsSome ->
+                                                return Ok combined, Some second
+                                            | Ok _ -> return Ok combined, None
+                                    | Ok _ -> return Ok first, None
+                                | value, _ -> return value, None
+                            }
+
                         if not cleanSynthesis then
                             do!
                                 recordArtifact
@@ -2759,11 +2869,34 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                     (Path.Combine(artifactRoot, "codex.stderr.log"))
                                     CancellationToken.None
 
-                        match codexResult with
-                        | Error error ->
+                        match duplicateCheck, codexResult with
+                        | Some duplicate, Ok result ->
+                            let matching = duplicate.MatchingExperiment.Value
+
+                            dispatch (
+                                DuplicateCandidateSkipped(experimentId, duplicate.Fingerprint, matching, result.Usage)
+                            )
+                            |> ignore
+
+                            do!
+                                journal.SaveUsage startedState.Id experimentId result.Usage CancellationToken.None
+                                |> Async.Ignore
+
+                            do!
+                                journalEvent
+                                    startedState.Id
+                                    (Some experimentId)
+                                    "DuplicateCandidateSkipped"
+                                    $"fingerprint={duplicate.Fingerprint};matchingExperiment={ExperimentId.text matching}"
+                                    CancellationToken.None
+
+                            publish
+                                $"Skipped duplicate tree {duplicate.Fingerprint}; it does not consume an experiment or non-improvement slot."
+                                (Some experimentId)
+                        | None, Error error ->
                             do! captureAfterFailure startedState workspace CancellationToken.None
                             do! handleExperimentError startedState.Id experimentId "CodexFailed" error
-                        | Ok result ->
+                        | None, Ok result ->
                             do!
                                 journal.SaveUsage startedState.Id experimentId result.Usage CancellationToken.None
                                 |> Async.Ignore
@@ -3147,6 +3280,9 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             CancellationToken.None
                                         |> Async.Ignore
                                 | _ -> ()
+
+                        | Some _, Error error ->
+                            do! handleExperimentError startedState.Id experimentId "CodexFailed" error
 
                     let planStatus =
                         match tryCurrent () |> Option.bind _.Current with

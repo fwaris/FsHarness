@@ -505,6 +505,41 @@ module StateMachineTests =
         Assert.DoesNotContain(ScheduleNext, effects)
 
     [<Fact>]
+    let ``duplicate candidate does not consume experiment or stagnation slots`` () =
+        let now = DateTimeOffset.UtcNow
+        let runId = RunId.create ()
+        let experimentId = ExperimentId.create ()
+        let matchingId = ExperimentId.create ()
+
+        let initial =
+            RunState.create runId Fixtures.config Fixtures.config.BaseCommit 10M now
+
+        let preparing, _ =
+            RunState.transition now (StartRequested(experimentId, now)) initial
+
+        let generating, _ =
+            RunState.transition now (WorktreePrepared experimentId) preparing
+
+        let usage =
+            { TokenUsage.zero with
+                InputTokens = 100L
+                OutputTokens = 20L }
+
+        let skipped, effects =
+            RunState.transition
+                now
+                (DuplicateCandidateSkipped(experimentId, "ABC123", matchingId, Some usage))
+                generating
+
+        Assert.Equal(0, skipped.Attempted)
+        Assert.Equal(0, skipped.ConsecutiveNonImprovements)
+        Assert.Equal(0, skipped.ConsecutiveFailures)
+        Assert.Equal(usage, skipped.Usage)
+        Assert.True(skipped.Current.IsNone)
+        Assert.Equal(Ready, skipped.Status)
+        Assert.Contains(ScheduleNext, effects)
+
+    [<Fact>]
     let ``stagnation allows one synthesis boundary but stops after synthesis`` () =
         let now = DateTimeOffset.UtcNow
 

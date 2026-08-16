@@ -148,6 +148,73 @@ module GitStoreTests =
             Assert.Equal(Some(snapshot.Commit, Some inspection.Head), lineage.Candidates |> Map.tryFind experimentId))
 
     [<Fact>]
+    let ``editable tree check finds exact prior candidate before capture`` () =
+        withTempDirectory (fun directory ->
+            let source = createRepository directory
+            let dataRoot = Path.Combine(directory, "data")
+            let port = GitStore.create dataRoot |> GitStore.port
+
+            let inspection =
+                port.InspectSource source CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let runId = RunId.create ()
+
+            port.CreateRun runId inspection CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+
+            let firstId = ExperimentId.create ()
+
+            let prepare experimentId =
+                port.PrepareCandidate
+                    runId
+                    experimentId
+                    [ { Commit = inspection.Head
+                        Role = ExperimentParentRole.Primary } ]
+                    inspection.Head
+                    CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            let first = prepare firstId
+            File.WriteAllText(Path.Combine(first.GenerationPath, "src", "score.txt"), "2")
+
+            let initialCheck =
+                port.CheckEditableTree runId first [ "src/**" ] CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.True initialCheck.MatchingExperiment.IsNone
+
+            port.CaptureCandidate runId first [ "src/**" ] CancellationToken.None
+            |> Async.RunSynchronously
+            |> getResult
+            |> ignore
+
+            let second = prepare (ExperimentId.create ())
+            File.WriteAllText(Path.Combine(second.GenerationPath, "src", "score.txt"), "2")
+
+            let duplicate =
+                port.CheckEditableTree runId second [ "src/**" ] CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.Equal(initialCheck.Fingerprint, duplicate.Fingerprint)
+            Assert.Equal(Some firstId, duplicate.MatchingExperiment)
+
+            File.WriteAllText(Path.Combine(second.GenerationPath, "src", "score.txt"), "3")
+
+            let changed =
+                port.CheckEditableTree runId second [ "src/**" ] CancellationToken.None
+                |> Async.RunSynchronously
+                |> getResult
+
+            Assert.False(String.Equals(duplicate.Fingerprint, changed.Fingerprint, StringComparison.Ordinal))
+            Assert.True changed.MatchingExperiment.IsNone)
+
+    [<Fact>]
     let ``released experiment worktrees preserve private candidate lineage`` () =
         withTempDirectory (fun directory ->
             let source = createRepository directory

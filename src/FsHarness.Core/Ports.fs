@@ -83,6 +83,10 @@ type CandidateSnapshot =
       ParentEvaluationPath: string
       ChampionEvaluationPath: string }
 
+type EditableTreeCheck =
+    { Fingerprint: string
+      MatchingExperiment: ExperimentId option }
+
 type SynthesisConflict =
     { Files: string list
       ConflictText: string }
@@ -134,6 +138,12 @@ type GitPort =
               -> string list
               -> CancellationToken
               -> Async<Result<CandidateSnapshot, HarnessError>>
+      CheckEditableTree:
+          RunId
+              -> CandidateWorkspace
+              -> string list
+              -> CancellationToken
+              -> Async<Result<EditableTreeCheck, HarnessError>>
       ReleaseExperimentWorktrees: RunId -> ExperimentId -> CancellationToken -> Async<Result<int, HarnessError>>
       AdvanceFrontier: RunId -> CommitOid -> CommitOid -> CancellationToken -> Async<Result<unit, HarnessError>>
       ExportPatch: RunId -> CommitOid -> string -> CancellationToken -> Async<Result<string, HarnessError>> }
