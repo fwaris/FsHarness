@@ -997,10 +997,30 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
             None
 
     let evaluateSeedPatches runId (config: HarnessConfig) initialFrontier initialScore cancellationToken =
-        let rec loop index frontier score remaining =
+        let initialParents = expansionParents initialFrontier
+
+        let rankedHeads heads =
+            let compareHeads (leftScore, leftCommit) (rightScore, rightCommit) =
+                let scoreOrder =
+                    match config.Metric.Direction with
+                    | Maximize -> compare rightScore leftScore
+                    | Minimize -> compare leftScore rightScore
+
+                if scoreOrder <> 0 then
+                    scoreOrder
+                else
+                    StringComparer.Ordinal.Compare(CommitOid.value leftCommit, CommitOid.value rightCommit)
+
+            heads
+            |> List.sortWith compareHeads
+            |> List.truncate (max 1 config.GraphSearch.BeamWidth)
+            |> List.map snd
+            |> Set.ofList
+
+        let rec loop index frontier score validHeads remaining =
             async {
                 match remaining with
-                | [] -> return Ok(frontier, score)
+                | [] -> return Ok(frontier, score, rankedHeads validHeads)
                 | patchPath :: rest ->
                     let experimentId = ExperimentId.create ()
 
@@ -1010,8 +1030,8 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             experimentId
                             (index + 1)
                             ExperimentKind.Expansion
-                            (expansionParents frontier)
-                            frontier
+                            initialParents
+                            initialFrontier
                             "SeedActive"
                             cancellationToken
 
@@ -1019,9 +1039,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         $"Evaluating protected seed candidate '{patchPath}' at zero Codex-token cost."
                         (Some experimentId)
 
-                    match!
-                        git.PrepareCandidate runId experimentId (expansionParents frontier) frontier cancellationToken
-                    with
+                    match! git.PrepareCandidate runId experimentId initialParents initialFrontier cancellationToken with
                     | Error error ->
                         do! journalEvent runId (Some experimentId) "SeedPrepareFailed" error.Summary cancellationToken
                         return Error error
@@ -1124,8 +1142,28 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                 patchPath
                                                 cancellationToken
 
-                                        return! loop (index + 1) frontier score rest
+                                        return! loop (index + 1) frontier score validHeads rest
                                     | EvaluationStatus.Complete ->
+                                        let isValidSeed =
+                                            Evaluation.decide
+                                                config.Metric
+                                                config.Evaluator.RequiredConstraints
+                                                initialScore
+                                                evaluation
+
+                                            |> function
+                                                | StrictImprovement _
+                                                | CandidateDecision.Rejected(NotStrictlyBetter _) -> true
+                                                | CandidateDecision.Rejected _ -> false
+
+                                        let validHeads =
+                                            if isValidSeed then
+                                                match evaluation.Metrics |> Map.tryFind config.Metric.Name with
+                                                | Some candidateScore -> (candidateScore, snapshot.Commit) :: validHeads
+                                                | None -> validHeads
+                                            else
+                                                validHeads
+
                                         match
                                             Evaluation.decide
                                                 config.Metric
@@ -1142,7 +1180,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                     (string reason)
                                                     cancellationToken
 
-                                            return! loop (index + 1) frontier score rest
+                                            return! loop (index + 1) frontier score validHeads rest
                                         | StrictImprovement candidateScore ->
                                             match!
                                                 git.AdvanceFrontier runId frontier snapshot.Commit cancellationToken
@@ -1161,10 +1199,10 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                     $"Accepted protected seed candidate at score {candidateScore}."
                                                     (Some experimentId)
 
-                                                return! loop (index + 1) snapshot.Commit candidateScore rest
+                                                return! loop (index + 1) snapshot.Commit candidateScore validHeads rest
             }
 
-        loop 0 initialFrontier initialScore config.SeedPatches
+        loop 0 initialFrontier initialScore [] config.SeedPatches
 
     let parseRunConfig (configJson: string option) =
         match configJson with
@@ -2183,22 +2221,25 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             |> List.sortBy _.Sequence
 
                         if ordinaryNodes.Length < current.Config.GraphSearch.InitialFanOut then
+                            let seedHeads =
+                                snapshot.ActiveHeads
+                                |> Set.toList
+                                |> List.filter (fun head ->
+                                    match Map.tryFind head graph.Nodes with
+                                    | Some node -> node.Validity = EvaluationValidity.Valid
+                                    | None -> false)
+
                             let bootstrapRoot =
-                                ordinaryNodes
-                                |> List.tryHead
-                                |> Option.bind (fun first ->
-                                    first.Commit
-                                    |> Option.bind (fun child ->
-                                        snapshot.Edges
-                                        |> List.tryFind (fun edge ->
-                                            edge.Child = child && edge.Role = ExperimentParentRole.Primary)
-                                        |> Option.map _.Parent)
-                                    |> Option.orElse first.Parent)
-                                |> Option.defaultValue graph.Champion
+                                match seedHeads with
+                                | [] -> graph.Champion
+                                | heads -> heads[ordinaryNodes.Length % heads.Length]
 
                             let heads =
-                                GraphSearch.selectActiveHeads current.Config.GraphSearch.BeamWidth graph
-                                |> Set.ofList
+                                if List.isEmpty seedHeads then
+                                    GraphSearch.selectActiveHeads current.Config.GraphSearch.BeamWidth graph
+                                    |> Set.ofList
+                                else
+                                    Set.ofList seedHeads
 
                             return
                                 Ok
@@ -4280,7 +4321,18 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                     | Error error ->
                                                         releaseRunLock ()
                                                         return Error error
-                                                    | Ok(frontier, frontierScore) ->
+                                                    | Ok(frontier, frontierScore, seedHeads) ->
+                                                        match!
+                                                            SqliteStore.replaceActiveHeads
+                                                                sqlite
+                                                                runId
+                                                                -1
+                                                                seedHeads
+                                                                cancellationToken
+                                                        with
+                                                        | Error error -> abortPersistence error
+                                                        | Ok() -> ()
+
                                                         match!
                                                             SqliteStore.updateRunStatus
                                                                 sqlite
@@ -4302,11 +4354,12 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                         prepared <- Some report
 
                                                         setState (
-                                                            RunState.create
+                                                            RunState.createWithHeads
                                                                 runId
                                                                 validated
                                                                 frontier
                                                                 frontierScore
+                                                                seedHeads
                                                                 DateTimeOffset.UtcNow
                                                         )
 

@@ -106,13 +106,17 @@ type RunEffect =
 
 [<RequireQualifiedAccess>]
 module RunState =
-    let create runId config champion championScore startedAt =
+    let createWithHeads runId config champion championScore activeHeads startedAt =
         { Id = runId
           Config = config
           Status = Ready
           Champion = champion
           ChampionScore = championScore
-          ActiveHeads = Set.singleton champion
+          ActiveHeads =
+            if Set.isEmpty activeHeads then
+                Set.singleton champion
+            else
+                activeHeads
           Current = None
           Attempted = 0
           AcceptedCount = 0
@@ -124,6 +128,9 @@ module RunState =
           PreviousEvaluation = None
           LastExperimentKind = None
           StartedAt = startedAt }
+
+    let create runId config champion championScore startedAt =
+        createWithHeads runId config champion championScore Set.empty startedAt
 
     let private budgetStopReason now state =
         if state.Attempted >= state.Config.Budgets.MaxExperiments then

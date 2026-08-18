@@ -267,6 +267,22 @@ module PromptTests =
 
 module StateMachineTests =
     [<Fact>]
+    let ``explicit active heads are retained when a run is initialized`` () =
+        let champion = CommitOid.create (String('a', 40))
+        let alternate = CommitOid.create (String('b', 40))
+
+        let state =
+            RunState.createWithHeads
+                (RunId.create ())
+                Fixtures.config
+                champion
+                10M
+                (Set.ofList [ champion; alternate ])
+                DateTimeOffset.UtcNow
+
+        Assert.True(state.ActiveHeads = Set.ofList [ champion; alternate ])
+
+    [<Fact>]
     let ``accepted candidate advances only after frontier confirmation`` () =
         let runId = RunId.create ()
         let parent = CommitOid.create (String('a', 40))
