@@ -1181,16 +1181,20 @@ module GitStore =
             let fullPatchPath =
                 Path.GetFullPath(Path.Combine(workspace.GenerationPath, normalized))
 
-            let seedRoot =
-                Path.GetFullPath(Path.Combine(workspace.GenerationPath, ".fsharness", "seeds"))
+            let workspaceRoot = Path.GetFullPath workspace.GenerationPath
+
+            let isNestedSeedPath =
+                normalized.StartsWith(".fsharness/seeds/", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("/.fsharness/seeds/", StringComparison.OrdinalIgnoreCase)
 
             if
                 not (
                     fullPatchPath.StartsWith(
-                        seedRoot + string Path.DirectorySeparatorChar,
+                        workspaceRoot + string Path.DirectorySeparatorChar,
                         StringComparison.OrdinalIgnoreCase
                     )
                 )
+                || not isNestedSeedPath
                 || not (File.Exists fullPatchPath)
             then
                 return
@@ -1198,7 +1202,7 @@ module GitStore =
                         HarnessError.create
                             "git.seed_patch_missing"
                             HarnessErrorCategory.Git
-                            "Protected seed patch was not found below .fsharness/seeds/."
+                            "Protected seed patch was not found below an in-worktree .fsharness/seeds directory."
                         |> HarnessError.withDetail normalized
                     )
             else
