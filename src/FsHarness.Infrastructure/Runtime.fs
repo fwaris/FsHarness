@@ -1020,7 +1020,19 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         let rec loop index frontier score validHeads remaining =
             async {
                 match remaining with
-                | [] -> return Ok(frontier, score, rankedHeads validHeads)
+                | [] ->
+                    let heads = rankedHeads validHeads
+
+                    if not (List.isEmpty config.SeedPatches) && Set.isEmpty heads then
+                        return
+                            Error(
+                                HarnessError.create
+                                    "runtime.seed_no_valid_heads"
+                                    HarnessErrorCategory.Evaluation
+                                    "No protected seed candidate satisfied the required constraints; ordinary expansion cannot begin without a valid seed head."
+                            )
+                    else
+                        return Ok(frontier, score, heads)
                 | patchPath :: rest ->
                     let experimentId = ExperimentId.create ()
 
