@@ -87,6 +87,24 @@ module ConfigTests =
             File.Delete path
 
     [<Fact>]
+    let ``schema accepts a protected seed below a nested source directory`` () =
+        let path =
+            writeConfig
+                2
+                ", \"comparison\": { \"evaluationMetric\": \"frontier_speed_index\" }"
+                0
+                "[\"tmp/experiment/.fsharness/seeds/seed.patch\"]"
+                ""
+
+        try
+            match ConfigFile.read path with
+            | Error errors -> Assert.Fail(String.concat " " errors)
+            | Ok config ->
+                Assert.Equal<string list>([ "tmp/experiment/.fsharness/seeds/seed.patch" ], config.SeedPatches)
+        finally
+            File.Delete path
+
+    [<Fact>]
     let ``prompt profile reads compact memory and evaluator limits`` () =
         let path =
             writeConfig

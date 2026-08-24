@@ -128,12 +128,16 @@ module HarnessConfig =
     let private validateSeedPatch (path: string) =
         let normalized = path.Replace('\\', '/')
 
+        let isSeedPath =
+            normalized.StartsWith(".fsharness/seeds/", StringComparison.Ordinal)
+            || normalized.Contains("/.fsharness/seeds/", StringComparison.Ordinal)
+
         if String.IsNullOrWhiteSpace normalized then
             Error "Seed patch paths cannot be empty."
         elif Path.IsPathRooted normalized || normalized.Split('/') |> Array.contains ".." then
             Error $"Seed patch '{path}' must be a repository-relative path."
-        elif not (normalized.StartsWith(".fsharness/seeds/", StringComparison.Ordinal)) then
-            Error $"Seed patch '{path}' must be stored below .fsharness/seeds/."
+        elif not isSeedPath then
+            Error $"Seed patch '{path}' must be stored below an in-repository .fsharness/seeds directory."
         elif not (normalized.EndsWith(".patch", StringComparison.OrdinalIgnoreCase)) then
             Error $"Seed patch '{path}' must use the .patch extension."
         else

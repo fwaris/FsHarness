@@ -83,6 +83,10 @@ type CandidateSnapshot =
       ParentEvaluationPath: string
       ChampionEvaluationPath: string }
 
+type EditableTreeCheck =
+    { Fingerprint: string
+      MatchingExperiment: ExperimentId option }
+
 type SynthesisConflict =
     { Files: string list
       ConflictText: string }
