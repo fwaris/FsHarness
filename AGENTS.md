@@ -154,3 +154,6 @@ For desktop ui use Avalonia + FuncUI
 For mobile use Fabulous + MAUI
 
 For high rate changes by pass the Elmish loop and use direct visual references - e.g. ViewRef in Maui. For regular, low-frequency updates use Elmish messages. Use the Elmish model for state management.
+
+## Scripting Guidance
+To the extent feasible, use .fsx script file for scripting over powershell as the scripts can be typed checked before running.

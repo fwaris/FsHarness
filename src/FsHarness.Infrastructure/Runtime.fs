@@ -996,8 +996,19 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
         with _ ->
             None
 
-    let evaluateSeedPatches runId (config: HarnessConfig) initialFrontier initialScore cancellationToken =
-        let initialParents = expansionParents initialFrontier
+    let evaluateSeedPatchesFrom
+        runId
+        (config: HarnessConfig)
+        candidateBase
+        baselineScore
+        startIndex
+        initialFrontier
+        initialScore
+        initialValidHeads
+        remainingPatches
+        cancellationToken
+        =
+        let initialParents = expansionParents candidateBase
 
         let rankedHeads heads =
             let compareHeads (leftScore, leftCommit) (rightScore, rightCommit) =
@@ -1043,7 +1054,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                             (index + 1)
                             ExperimentKind.Expansion
                             initialParents
-                            initialFrontier
+                            candidateBase
                             "SeedActive"
                             cancellationToken
 
@@ -1051,7 +1062,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                         $"Evaluating protected seed candidate '{patchPath}' at zero Codex-token cost."
                         (Some experimentId)
 
-                    match! git.PrepareCandidate runId experimentId initialParents initialFrontier cancellationToken with
+                    match! git.PrepareCandidate runId experimentId initialParents candidateBase cancellationToken with
                     | Error error ->
                         do! journalEvent runId (Some experimentId) "SeedPrepareFailed" error.Summary cancellationToken
                         return Error error
@@ -1160,7 +1171,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                             Evaluation.decide
                                                 config.Metric
                                                 config.Evaluator.RequiredConstraints
-                                                initialScore
+                                                baselineScore
                                                 evaluation
 
                                             |> function
@@ -1214,7 +1225,80 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                 return! loop (index + 1) snapshot.Commit candidateScore validHeads rest
             }
 
-        loop 0 initialFrontier initialScore [] config.SeedPatches
+        loop startIndex initialFrontier initialScore initialValidHeads remainingPatches
+
+    let evaluateSeedPatches runId (config: HarnessConfig) initialFrontier initialScore cancellationToken =
+        evaluateSeedPatchesFrom
+            runId
+            config
+            initialFrontier
+            initialScore
+            0
+            initialFrontier
+            initialScore
+            []
+            config.SeedPatches
+            cancellationToken
+
+    let restoreSeedProgress
+        (config: HarnessConfig)
+        baselineCommit
+        baselineScore
+        (experiments: StoredExperiment list)
+        (evaluations: (ExperimentId * EvaluationResult) list)
+        =
+        let evaluationByExperiment = evaluations |> Map.ofList
+
+        let completed =
+            experiments
+            |> List.filter (fun experiment ->
+                experiment.Sequence > 0
+                && experiment.Sequence <= config.SeedPatches.Length)
+            |> List.sortBy _.Sequence
+            |> List.choose (fun experiment ->
+                match experiment.Candidate, evaluationByExperiment |> Map.tryFind experiment.Id with
+                | Some candidate, Some evaluation -> Some(experiment, candidate, evaluation)
+                | _ -> None)
+            |> List.indexed
+            |> List.takeWhile (fun (index, (experiment, _, _)) -> experiment.Sequence = index + 1)
+            |> List.map snd
+
+        let frontier, score, validHeads =
+            completed
+            |> List.fold
+                (fun (frontier, score, validHeads) (_, candidate, evaluation) ->
+                    let isValidSeed =
+                        match
+                            Evaluation.decide
+                                config.Metric
+                                config.Evaluator.RequiredConstraints
+                                baselineScore
+                                evaluation
+                        with
+                        | StrictImprovement _
+                        | CandidateDecision.Rejected(NotStrictlyBetter _) -> true
+                        | CandidateDecision.Rejected _ -> false
+
+                    let validHeads =
+                        if isValidSeed then
+                            match evaluation.Metrics |> Map.tryFind config.Metric.Name with
+                            | Some candidateScore -> (candidateScore, candidate) :: validHeads
+                            | None -> validHeads
+                        else
+                            validHeads
+
+                    match
+                        Evaluation.decide
+                            config.Metric
+                            config.Evaluator.RequiredConstraints
+                            score
+                            evaluation
+                    with
+                    | StrictImprovement candidateScore -> candidate, candidateScore, validHeads
+                    | CandidateDecision.Rejected _ -> frontier, score, validHeads)
+                (baselineCommit, baselineScore, [])
+
+        completed.Length, frontier, score, validHeads
 
     let parseRunConfig (configJson: string option) =
         match configJson with
@@ -3933,6 +4017,7 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                 for experiment in beforeRecovery do
                                                     if
                                                         experiment.Outcome = "Active"
+                                                        || experiment.Outcome = "SeedActive"
                                                         || experiment.Outcome = "AwaitingReview"
                                                     then
                                                         do!
@@ -4053,49 +4138,146 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                                     |> List.tryLast
                                                                     |> Option.map snd
 
-                                                                let restoredState =
-                                                                    { RunState.create
-                                                                          runId
-                                                                          config
-                                                                          champion
-                                                                          championScore
-                                                                          DateTimeOffset.UtcNow with
-                                                                        Status = Ready
-                                                                        Attempted = snapshot.Run.AttemptCount
-                                                                        AcceptedCount = snapshot.Run.AcceptedCount
-                                                                        Usage = usage
-                                                                        UsageKnown = usageKnown
-                                                                        PreviousEvaluation = previousEvaluation
-                                                                        ActiveHeads =
-                                                                            if Set.isEmpty snapshot.ActiveHeads then
-                                                                                Set.singleton champion
-                                                                            else
-                                                                                snapshot.ActiveHeads }
+                                                                let! recovered =
+                                                                    if storedRun.Status = "PreparingBaseline" then
+                                                                        async {
+                                                                            let (
+                                                                                completedSeedCount,
+                                                                                restoredFrontier,
+                                                                                restoredScore,
+                                                                                restoredValidHeads
+                                                                            ) =
+                                                                                restoreSeedProgress
+                                                                                    config
+                                                                                    config.BaseCommit
+                                                                                    baselineScore
+                                                                                    experiments
+                                                                                    parsedEvaluations
 
-                                                                let report =
-                                                                    { RunId = runId
-                                                                      Repository = repository
-                                                                      Codex = codexReport
-                                                                      Baseline = baselineEvaluation
-                                                                      BaselineScore = baselineScore
-                                                                      DataDirectory = DataPaths.runRoot root runId }
+                                                                            let remainingPatches =
+                                                                                config.SeedPatches
+                                                                                |> List.skip completedSeedCount
 
-                                                                prepared <- Some report
-                                                                setState restoredState
+                                                                            publish
+                                                                                $"Resuming protected seed preparation at profile {completedSeedCount + 1}/{config.SeedPatches.Length}."
+                                                                                None
 
-                                                                do!
-                                                                    journalEvent
-                                                                        runId
+                                                                            match!
+                                                                                evaluateSeedPatchesFrom
+                                                                                    runId
+                                                                                    config
+                                                                                    config.BaseCommit
+                                                                                    baselineScore
+                                                                                    completedSeedCount
+                                                                                    restoredFrontier
+                                                                                    restoredScore
+                                                                                    restoredValidHeads
+                                                                                    remainingPatches
+                                                                                    cancellationToken
+                                                                            with
+                                                                            | Error error -> return Error error
+                                                                            | Ok(frontier, frontierScore, seedHeads) ->
+                                                                                match!
+                                                                                    SqliteStore.replaceActiveHeads
+                                                                                        sqlite
+                                                                                        runId
+                                                                                        -1
+                                                                                        seedHeads
+                                                                                        cancellationToken
+                                                                                with
+                                                                                | Error error -> return Error error
+                                                                                | Ok() ->
+                                                                                    match!
+                                                                                        SqliteStore.updateRunStatus
+                                                                                            sqlite
+                                                                                            runId
+                                                                                            "Ready"
+                                                                                            cancellationToken
+                                                                                    with
+                                                                                    | Error error -> return Error error
+                                                                                    | Ok() ->
+                                                                                        do!
+                                                                                            journalEvent
+                                                                                                runId
+                                                                                                None
+                                                                                                "SeedPreparationRecovered"
+                                                                                                $"Completed protected seed preparation after resuming at profile {completedSeedCount + 1}."
+                                                                                                cancellationToken
+
+                                                                                        return
+                                                                                            Ok(
+                                                                                                frontier,
+                                                                                                frontierScore,
+                                                                                                seedHeads,
+                                                                                                frontierScore
+                                                                                            )
+                                                                        }
+                                                                    else
+                                                                        async {
+                                                                            let activeHeads =
+                                                                                if Set.isEmpty snapshot.ActiveHeads then
+                                                                                    Set.singleton champion
+                                                                                else
+                                                                                    snapshot.ActiveHeads
+
+                                                                            return
+                                                                                Ok(
+                                                                                    champion,
+                                                                                    championScore,
+                                                                                    activeHeads,
+                                                                                    baselineScore
+                                                                                )
+                                                                        }
+
+                                                                match recovered with
+                                                                | Error error ->
+                                                                    releaseRunLock ()
+                                                                    return Error error
+                                                                | Ok(
+                                                                    recoveredChampion,
+                                                                    recoveredScore,
+                                                                    recoveredHeads,
+                                                                    reportBaselineScore
+                                                                  ) ->
+                                                                    let restoredState =
+                                                                        { RunState.create
+                                                                              runId
+                                                                              config
+                                                                              recoveredChampion
+                                                                              recoveredScore
+                                                                              DateTimeOffset.UtcNow with
+                                                                            Status = Ready
+                                                                            Attempted = snapshot.Run.AttemptCount
+                                                                            AcceptedCount = snapshot.Run.AcceptedCount
+                                                                            Usage = usage
+                                                                            UsageKnown = usageKnown
+                                                                            PreviousEvaluation = previousEvaluation
+                                                                            ActiveHeads = recoveredHeads }
+
+                                                                    let report =
+                                                                        { RunId = runId
+                                                                          Repository = repository
+                                                                          Codex = codexReport
+                                                                          Baseline = baselineEvaluation
+                                                                          BaselineScore = reportBaselineScore
+                                                                          DataDirectory = DataPaths.runRoot root runId }
+
+                                                                    prepared <- Some report
+                                                                    setState restoredState
+
+                                                                    do!
+                                                                        journalEvent
+                                                                            runId
+                                                                            None
+                                                                            "RunRecovered"
+                                                                            (CommitOid.value recoveredChampion)
+                                                                            cancellationToken
+
+                                                                    publish
+                                                                        "Recovered persisted run from its verified champion and active heads."
                                                                         None
-                                                                        "RunRecovered"
-                                                                        (CommitOid.value champion)
-                                                                        cancellationToken
 
-                                                                publish
-                                                                    "Recovered persisted run from its verified champion and active heads."
-                                                                    None
-
-                                                                return Ok report
+                                                                    return Ok report
                                                         | _ ->
                                                             releaseRunLock ()
 
@@ -4193,6 +4375,14 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         | Error error -> abortPersistence error
                                         | Ok() -> ()
 
+                                        do!
+                                            journalEvent
+                                                runId
+                                                None
+                                                "RunPreparing"
+                                                "Created durable run; preparing the pinned baseline."
+                                                cancellationToken
+
                                         let manifest = reproducibilityManifest runId validated repository codexReport
 
                                         match!
@@ -4230,6 +4420,14 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                         | Error error -> abortPersistence error
                                         | Ok() -> notifyEvolution runId
 
+                                        do!
+                                            journalEvent
+                                                runId
+                                                (Some baselineExperiment)
+                                                "BaselinePreparing"
+                                                "Preparing the pinned baseline workspace."
+                                                cancellationToken
+
                                         match!
                                             git.PrepareCandidate
                                                 runId
@@ -4248,6 +4446,14 @@ type HarnessRuntime(dataRoot: string, codexExecutable: string) =
                                                     "baseline",
                                                     "evaluation.json"
                                                 )
+
+                                            do!
+                                                journalEvent
+                                                    runId
+                                                    (Some baselineExperiment)
+                                                    "BaselineEvaluating"
+                                                    "Evaluating the pinned baseline."
+                                                    cancellationToken
 
                                             match!
                                                 runEvaluatorWithRetries

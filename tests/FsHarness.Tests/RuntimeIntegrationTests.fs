@@ -327,6 +327,12 @@ module RuntimeIntegrationTests =
             |> getResult
             |> ignore
 
+            let preparationHistory = runtime.History 100 |> getResult |> List.rev
+
+            Assert.Contains(preparationHistory, fun event -> event.Kind = "RunPreparing")
+            Assert.Contains(preparationHistory, fun event -> event.Kind = "BaselinePreparing")
+            Assert.Contains(preparationHistory, fun event -> event.Kind = "BaselineEvaluating")
+
             runtime.Start() |> getResult |> ignore
 
             let completed =
