@@ -1283,7 +1283,6 @@ module GitStore =
           AnalyzeSynthesis = analyzeSynthesis store
           ApplySeedPatch = applySeedPatch store
           CaptureCandidate = captureCandidate store
-          CheckEditableTree = checkEditableTree store
           ReleaseExperimentWorktrees = releaseExperimentWorktrees store
           AdvanceFrontier = advanceFrontier store
           ExportPatch = exportPatch store }
